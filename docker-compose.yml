@@ -17,7 +17,9 @@ services:
       retries: 20
 
   backend:
-    build: ./backend
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
     environment:
       DATABASE_URL: ${DATABASE_URL:-mysql+pymysql://contestant:contestant@mariadb:3306/simple_contester}
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
@@ -59,6 +61,20 @@ services:
       JUDGER_ID: ${JUDGER_ID:-docker-judger}
       POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-1}
       STOP_ON_FIRST_FAILED_TEST: ${STOP_ON_FIRST_FAILED_TEST:-1}
+      OUTPUT_LIMIT_BYTES: ${OUTPUT_LIMIT_BYTES:-1048576}
+      PROCESS_LIMIT: ${PROCESS_LIMIT:-256}
+      FILE_SIZE_LIMIT_BYTES: ${FILE_SIZE_LIMIT_BYTES:-16777216}
+      COMPILE_MEMORY_LIMIT_MB: ${COMPILE_MEMORY_LIMIT_MB:-4096}
+      COMPILE_PROCESS_LIMIT: ${COMPILE_PROCESS_LIMIT:-256}
+      COMPILE_FILE_SIZE_LIMIT_BYTES: ${COMPILE_FILE_SIZE_LIMIT_BYTES:-268435456}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=512m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
     depends_on:
       mariadb:
         condition: service_healthy

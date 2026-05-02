@@ -5,6 +5,9 @@ import os
 import resource
 import signal
 import subprocess
+import selectors
+import shutil
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +23,13 @@ VERDICT_INTERNAL_ERROR = "internal_error"
 
 COMPILE_TIMEOUT_SECONDS = int(os.getenv("COMPILE_TIMEOUT_SECONDS", "20"))
 OUTPUT_LIMIT_BYTES = int(os.getenv("OUTPUT_LIMIT_BYTES", str(1024 * 1024)))
+OUTPUT_TRUNCATION_MESSAGE = "\n[judger] output limit exceeded\n"
+PROCESS_LIMIT = int(os.getenv("PROCESS_LIMIT", "256"))
+FILE_SIZE_LIMIT_BYTES = int(os.getenv("FILE_SIZE_LIMIT_BYTES", str(16 * 1024 * 1024)))
+COMPILE_MEMORY_LIMIT_MB = int(os.getenv("COMPILE_MEMORY_LIMIT_MB", "4096"))
+COMPILE_PROCESS_LIMIT = int(os.getenv("COMPILE_PROCESS_LIMIT", "256"))
+COMPILE_FILE_SIZE_LIMIT_BYTES = int(os.getenv("COMPILE_FILE_SIZE_LIMIT_BYTES", str(256 * 1024 * 1024)))
+PIPE_READ_CHUNK_BYTES = 8192
 
 
 @dataclass(frozen=True)
@@ -53,6 +63,7 @@ class RunResult:
     time_ms: int
     stdout: str = ""
     stderr: str = ""
+    output_truncated: bool = False
 
 
 class Runner:
@@ -243,7 +254,18 @@ class JavaRunner(Runner):
     def compile(self) -> CompileResult:
         source = self.workdir / self.source_name
         source.write_text(self.source_code, encoding="utf-8")
-        completed = run_compile(["javac", "Main.java"], cwd=self.workdir, env=self.compile_env())
+        completed = run_compile(
+            [
+                "javac",
+                "-J-Xmx512m",
+                "-J-Xss256k",
+                "-J-XX:ActiveProcessorCount=1",
+                "-J-XX:ReservedCodeCacheSize=32m",
+                "Main.java",
+            ],
+            cwd=self.workdir,
+            env=self.compile_env(),
+        )
         if completed.returncode != 0:
             return CompileResult(
                 command=None,
@@ -253,7 +275,16 @@ class JavaRunner(Runner):
         return CompileResult(command=self.command())
 
     def command(self) -> list[str]:
-        return ["java", f"-Xmx{self.limits.memory_limit_mb}m", "-cp", ".", "Main"]
+        return [
+            "java",
+            f"-Xmx{self.limits.memory_limit_mb}m",
+            "-Xss256k",
+            "-XX:ActiveProcessorCount=1",
+            "-XX:ReservedCodeCacheSize=32m",
+            "-cp",
+            ".",
+            "Main",
+        ]
 
     def address_space_limit_bytes(self) -> int | None:
         return None
@@ -283,22 +314,37 @@ def create_runner(language: str, workdir: Path, source_code: str, limits: Limits
 
 
 def run_compile(command: list[str], cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    try:
-        return subprocess.run(
-            command,
-            cwd=cwd,
-            env=env,
-            text=True,
-            capture_output=True,
-            timeout=COMPILE_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return subprocess.CompletedProcess(
-            command,
-            returncode=-signal.SIGXCPU,
-            stdout=exc.stdout or "",
-            stderr=(exc.stderr or "") + "\nCompilation timed out",
-        )
+    result = run_bounded_process(
+        command,
+        input_data="",
+        cwd=cwd,
+        env=env,
+        timeout_seconds=COMPILE_TIMEOUT_SECONDS,
+        preexec_fn=apply_compile_resource_limits,
+    )
+    stderr = result.stderr
+    if result.timed_out:
+        stderr = append_message(stderr, "Compilation timed out")
+    if result.output_truncated:
+        stderr = append_message(stderr, "Compilation output limit exceeded")
+    return subprocess.CompletedProcess(
+        command,
+        returncode=result.returncode,
+        stdout=result.stdout,
+        stderr=stderr,
+    )
+
+
+def copy_run_workspace(build_dir: Path) -> tempfile.TemporaryDirectory[str]:
+    run_tmp = tempfile.TemporaryDirectory(prefix="simple-contester-run-")
+    run_dir = Path(run_tmp.name)
+    for child in build_dir.iterdir():
+        target = run_dir / child.name
+        if child.is_dir():
+            shutil.copytree(child, target, symlinks=False)
+        else:
+            shutil.copy2(child, target, follow_symlinks=True)
+    return run_tmp
 
 
 def run_program(
@@ -310,30 +356,28 @@ def run_program(
     address_space_limit_bytes: int | None = None,
 ) -> RunResult:
     started = time.monotonic()
-    try:
-        completed = subprocess.run(
-            command,
-            input=input_data,
-            cwd=cwd,
-            env=env,
-            text=True,
-            capture_output=True,
-            timeout=limits.timeout_seconds,
-            preexec_fn=lambda: apply_resource_limits(limits, address_space_limit_bytes),
-            start_new_session=True,
-        )
-    except subprocess.TimeoutExpired as exc:
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-        return RunResult(
-            verdict=VERDICT_TIME_LIMIT,
-            time_ms=elapsed_ms,
-            stdout=exc.stdout or "",
-            stderr=exc.stderr or "",
-        )
+    completed = run_bounded_process(
+        command,
+        input_data=input_data,
+        cwd=cwd,
+        env=env,
+        timeout_seconds=limits.timeout_seconds,
+        preexec_fn=lambda: apply_resource_limits(limits, address_space_limit_bytes),
+    )
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
     stdout = completed.stdout or ""
     stderr = completed.stderr or ""
+    if completed.output_truncated:
+        return RunResult(
+            verdict=VERDICT_RUNTIME_ERROR,
+            time_ms=elapsed_ms,
+            stdout=stdout,
+            stderr=append_message(stderr, "Output limit exceeded"),
+            output_truncated=True,
+        )
+    if completed.timed_out:
+        return RunResult(verdict=VERDICT_TIME_LIMIT, time_ms=elapsed_ms, stdout=stdout, stderr=stderr)
     if completed.returncode == 0:
         return RunResult(verdict=VERDICT_ACCEPTED, time_ms=elapsed_ms, stdout=stdout, stderr=stderr)
 
@@ -349,8 +393,22 @@ def apply_resource_limits(limits: Limits, address_space_limit_bytes: int | None)
     resource.setrlimit(resource.RLIMIT_CPU, (limits.cpu_limit_seconds, limits.cpu_limit_seconds + 1))
     if address_space_limit_bytes is not None:
         resource.setrlimit(resource.RLIMIT_AS, (address_space_limit_bytes, address_space_limit_bytes))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (OUTPUT_LIMIT_BYTES, OUTPUT_LIMIT_BYTES))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (FILE_SIZE_LIMIT_BYTES, FILE_SIZE_LIMIT_BYTES))
     resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    if hasattr(resource, "RLIMIT_NPROC"):
+        resource.setrlimit(resource.RLIMIT_NPROC, (PROCESS_LIMIT, PROCESS_LIMIT))
+
+
+def apply_compile_resource_limits() -> None:
+    memory_bytes = max(256, COMPILE_MEMORY_LIMIT_MB) * 1024 * 1024
+    resource.setrlimit(resource.RLIMIT_CPU, (COMPILE_TIMEOUT_SECONDS + 1, COMPILE_TIMEOUT_SECONDS + 2))
+    resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (COMPILE_FILE_SIZE_LIMIT_BYTES, COMPILE_FILE_SIZE_LIMIT_BYTES))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    if hasattr(resource, "RLIMIT_NPROC"):
+        resource.setrlimit(resource.RLIMIT_NPROC, (COMPILE_PROCESS_LIMIT, COMPILE_PROCESS_LIMIT))
 
 
 def isolated_env(workdir: Path) -> dict[str, str]:
@@ -363,6 +421,13 @@ def isolated_env(workdir: Path) -> dict[str, str]:
         "PYTHONUNBUFFERED": "1",
         "NODE_OPTIONS": "--no-warnings",
     }
+
+
+def env_for_workdir(env: dict[str, str], workdir: Path) -> dict[str, str]:
+    adjusted = dict(env)
+    adjusted["HOME"] = str(workdir)
+    adjusted["TMPDIR"] = str(workdir)
+    return adjusted
 
 
 def classify_failure(returncode: int, stdout: str, stderr: str) -> str:
@@ -386,3 +451,135 @@ def classify_failure(returncode: int, stdout: str, stderr: str) -> str:
 
 def combine_output(stdout: str | None, stderr: str | None) -> str:
     return "\n".join(part for part in ((stdout or "").strip(), (stderr or "").strip()) if part)
+
+
+@dataclass(frozen=True)
+class BoundedProcessResult:
+    returncode: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+    output_truncated: bool = False
+
+
+def run_bounded_process(
+    command: list[str],
+    input_data: str,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_seconds: float,
+    preexec_fn,
+) -> BoundedProcessResult:
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+        start_new_session=True,
+        preexec_fn=preexec_fn,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    stdout = bytearray()
+    stderr = bytearray()
+    input_bytes = input_data.encode("utf-8")
+    input_offset = 0
+    total_output = 0
+    truncated = False
+    timed_out = False
+    deadline = time.monotonic() + timeout_seconds
+
+    try:
+        selector = selectors.DefaultSelector()
+        os.set_blocking(process.stdin.fileno(), False)
+        os.set_blocking(process.stdout.fileno(), False)
+        os.set_blocking(process.stderr.fileno(), False)
+        selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+        selector.register(process.stdout, selectors.EVENT_READ, stdout)
+        selector.register(process.stderr, selectors.EVENT_READ, stderr)
+
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                terminate_process_group(process)
+                break
+            for key, _ in selector.select(timeout=min(0.05, remaining)):
+                if key.data == "stdin":
+                    if input_offset >= len(input_bytes):
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+                        continue
+                    try:
+                        written = key.fileobj.write(input_bytes[input_offset : input_offset + PIPE_READ_CHUNK_BYTES])
+                    except (BrokenPipeError, OSError):
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+                        continue
+                    if written is None:
+                        written = 0
+                    input_offset += written
+                    if input_offset >= len(input_bytes):
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+                    continue
+
+                chunk = key.fileobj.read(PIPE_READ_CHUNK_BYTES)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                available = max(0, OUTPUT_LIMIT_BYTES - total_output)
+                if available:
+                    key.data.extend(chunk[:available])
+                total_output += len(chunk)
+                if total_output > OUTPUT_LIMIT_BYTES:
+                    truncated = True
+                    key.data.extend(OUTPUT_TRUNCATION_MESSAGE.encode("utf-8"))
+                    terminate_process_group(process)
+                    selector.unregister(key.fileobj)
+                    break
+            if truncated:
+                break
+
+        try:
+            returncode = process.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            terminate_process_group(process)
+            returncode = process.wait()
+    finally:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    if timed_out and returncode == 0:
+        returncode = -signal.SIGXCPU
+    if truncated and returncode == 0:
+        returncode = -signal.SIGXFSZ
+    return BoundedProcessResult(
+        returncode=returncode,
+        stdout=decode_output(bytes(stdout)),
+        stderr=decode_output(bytes(stderr)),
+        timed_out=timed_out,
+        output_truncated=truncated,
+    )
+
+
+def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def decode_output(value: bytes) -> str:
+    return value.decode("utf-8", errors="replace")
+
+
+def append_message(output: str, message: str) -> str:
+    return "\n".join(part for part in (output.strip(), message) if part)

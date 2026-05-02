@@ -22,5 +22,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY worker.py runners.py .
+RUN useradd --create-home --shell /usr/sbin/nologin judge \
+    && chown -R judge:judge /judger
+
+USER judge
 
 CMD ["python", "worker.py"]

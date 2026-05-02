@@ -15,7 +15,9 @@ from runners import (
     VERDICT_RUNTIME_ERROR,
     VERDICT_TIME_LIMIT,
     VERDICT_WRONG_ANSWER,
+    copy_run_workspace,
     create_runner,
+    env_for_workdir,
     run_program,
 )
 
@@ -175,14 +177,16 @@ def judge(submission: dict) -> None:
         final_verdict = VERDICT_ACCEPTED
         accepted_count = 0
         for case in tests:
-            run_result = run_program(
-                compiled.command,
-                case["input_data"],
-                cwd=workdir,
-                limits=limits,
-                env=runner.run_env(),
-                address_space_limit_bytes=runner.address_space_limit_bytes(),
-            )
+            with copy_run_workspace(workdir) as run_tmp:
+                run_workdir = Path(run_tmp)
+                run_result = run_program(
+                    compiled.command,
+                    case["input_data"],
+                    cwd=run_workdir,
+                    limits=limits,
+                    env=env_for_workdir(runner.run_env(), run_workdir),
+                    address_space_limit_bytes=runner.address_space_limit_bytes(),
+                )
             if run_result.verdict != VERDICT_ACCEPTED:
                 verdict = run_result.verdict
             elif normalize_output(run_result.stdout) != normalize_output(case["output_data"]):

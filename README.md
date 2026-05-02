@@ -54,6 +54,38 @@ docker compose down
 docker compose down -v
 ```
 
+## Database Migrations
+
+Schema changes are managed with Alembic. The backend Docker entrypoint waits for
+the database, stamps an existing pre-Alembic schema when needed, runs
+`alembic upgrade head`, and then starts Uvicorn. This keeps
+`docker compose up --build` working for both fresh databases and current local
+MariaDB volumes.
+
+Manual migration commands:
+
+```bash
+# From the repository root, with backend dependencies installed.
+PYTHONPATH=backend alembic upgrade head
+
+# Create a new migration after changing backend/app/models.py.
+PYTHONPATH=backend alembic revision --autogenerate -m "Describe schema change"
+
+# Inspect current migration state.
+PYTHONPATH=backend alembic current
+PYTHONPATH=backend alembic history
+```
+
+For Docker-only environments:
+
+```bash
+docker compose run --rm backend python -m app.migrate upgrade
+```
+
+The FastAPI startup no longer creates tables. It still keeps the admin bootstrap
+and a small MariaDB compatibility pass for local volumes that were created
+before migrations existed.
+
 ## Configuration
 
 Compose reads `.env` automatically. Start from `.env.example`; the defaults keep `docker compose up --build` working without a local `.env`.
@@ -76,6 +108,13 @@ Compose reads `.env` automatically. Start from `.env.example`; the defaults keep
 | `JUDGER_ID` | `docker-judger` | Worker ID written to claimed submissions. |
 | `POLL_INTERVAL_SECONDS` | `1` | Judger polling interval. |
 | `STOP_ON_FIRST_FAILED_TEST` | `1` | Set to `0` to run all tests after a failed test. |
+| `OUTPUT_LIMIT_BYTES` | `1048576` | Maximum combined stdout/stderr captured from a compile or run before the process is killed and reported as a runtime error. |
+| `PROCESS_LIMIT` | `256` | Per-run process limit applied with `RLIMIT_NPROC` where the host kernel enforces it. |
+| `FILE_SIZE_LIMIT_BYTES` | `16777216` | Maximum file size a submitted program can create in subprocess mode. |
+| `COMPILE_TIMEOUT_SECONDS` | `20` | Compiler wall-clock timeout. |
+| `COMPILE_MEMORY_LIMIT_MB` | `4096` | Compiler address-space limit. |
+| `COMPILE_PROCESS_LIMIT` | `256` | Compiler process limit. |
+| `COMPILE_FILE_SIZE_LIMIT_BYTES` | `268435456` | Maximum compiler output/artifact file size. |
 
 ## Healthchecks
 
@@ -97,6 +136,27 @@ docker compose up --build --scale judger=3
 ```
 
 Do not publish ports on `judger`; scaling works because it is an internal worker service.
+
+## Judger Sandbox Boundaries
+
+The default judger is still a simple Python worker, but each compile and test run now executes in an isolated temporary working directory with a restricted environment. For every test case, the compiled artifacts are copied into a fresh temp directory, so files created by one run do not persist into the next run.
+
+Submissions are run with:
+
+- wall-clock and CPU time limits;
+- address-space limits where compatible with the runtime;
+- process, open-file, core-dump, and file-size limits;
+- bounded stdout/stderr capture with truncation handling;
+- `HOME` and `TMPDIR` pointed at the per-run temp directory.
+
+The Docker Compose judger service also runs as a non-root user with a read-only root filesystem, writable `/tmp` tmpfs, dropped Linux capabilities, `no-new-privileges`, and a container-level `pids_limit`.
+
+Important caveats:
+
+- Subprocess mode does not provide a reliable per-submission network namespace. The judger needs database network access, so untrusted code can still attempt outbound connections from inside the judger container. For production, run submissions in a separate per-submission container, VM, or microVM with network disabled.
+- `RLIMIT_NPROC` is kernel/user dependent and is not reliably enforced for root; the Docker image runs as the non-root `judge` user to make it effective.
+- Language runtimes such as JVM, Node.js, Go, and Mono manage memory internally, so memory verdicts are best-effort and may appear as runtime errors for some failure modes.
+- This sandbox is suitable for a local MVP or trusted contests. It is not a complete hostile-code isolation boundary.
 
 ## Local Frontend Without Docker
 

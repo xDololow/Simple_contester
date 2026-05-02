@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from .auth import create_access_token, get_current_user, hash_password, require_admin, verify_password
 from .config import settings
-from .database import Base, SessionLocal, engine, get_db
+from .database import SessionLocal, engine, get_db
 from .models import (
     Contest,
     ContestTeam,
@@ -165,7 +165,8 @@ def ensure_legacy_task_links(db: Session) -> None:
 
 @app.on_event("startup")
 def startup() -> None:
-    Base.metadata.create_all(bind=engine)
+    # Migrations are the primary schema path. These MariaDB patches are kept
+    # only to tolerate existing local volumes created before Alembic existed.
     ensure_language_enum_values()
     ensure_float_score_columns()
     ensure_partial_scoring_column()
