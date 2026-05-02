@@ -294,7 +294,9 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
   const { t } = useI18n();
   const [contests, setContests] = useState<Contest[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
   const [contestTaskIds, setContestTaskIds] = useState<Record<number, number[]>>({});
+  const [contestParticipantIds, setContestParticipantIds] = useState<Record<number, number[]>>({});
   const [flash, setFlash] = useState<Flash>(emptyFlash);
   const now = new Date();
   const later = new Date(Date.now() + 3 * 60 * 60_000);
@@ -302,24 +304,34 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
     title: "",
     description: "",
     status: "draft" as ContestStatus,
+    is_public: false,
     time_mode: "fixed" as TimeMode,
     starts_at: toLocalInputValue(now.toISOString()),
     ends_at: toLocalInputValue(later.toISOString()),
     individual_duration_minutes: "180",
-    task_ids: [] as number[]
+    task_ids: [] as number[],
+    participant_ids: ""
   });
 
   const load = useCallback(async () => {
-    const [nextContests, nextTasks] = await Promise.all([api<Contest[]>("/api/contests"), api<Task[]>("/api/tasks")]);
+    const [nextContests, nextTasks, nextUsers] = await Promise.all([api<Contest[]>("/api/contests"), api<Task[]>("/api/tasks"), api<User[]>("/api/users")]);
     const nextContestTaskEntries = await Promise.all(
       nextContests.map(async (contest) => {
         const contestTasks = await api<Task[]>(`/api/contests/${contest.id}/tasks`);
         return [contest.id, contestTasks.map((task) => task.id)] as const;
       })
     );
+    const nextContestParticipantEntries = await Promise.all(
+      nextContests.map(async (contest) => {
+        const participants = await api<User[]>(`/api/contests/${contest.id}/participants`);
+        return [contest.id, participants.map((participant) => participant.id)] as const;
+      })
+    );
     setContests(nextContests);
     setTasks(nextTasks);
+    setUsers(nextUsers.filter((user) => user.role === "participant"));
     setContestTaskIds(Object.fromEntries(nextContestTaskEntries));
+    setContestParticipantIds(Object.fromEntries(nextContestParticipantEntries));
   }, [api]);
   useEffect(() => { load().catch((error) => setFlash({ kind: "error", text: errorText(error) })); }, [load]);
 
@@ -332,6 +344,7 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
         body: JSON.stringify({
           ...form,
           task_ids: undefined,
+          participant_ids: undefined,
           starts_at: fromLocalInputValue(form.starts_at),
           ends_at: fromLocalInputValue(form.ends_at),
           individual_duration_minutes: form.time_mode === "individual" ? Number(form.individual_duration_minutes) : null
@@ -340,7 +353,11 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
       if (form.task_ids.length) {
         await api<Task[]>(`/api/contests/${contest.id}/tasks`, { method: "PUT", body: JSON.stringify({ task_ids: form.task_ids }) });
       }
-      setForm({ ...form, title: "", description: "", task_ids: [] });
+      const participantIds = parseIds(form.participant_ids);
+      if (participantIds.length) {
+        await api<User[]>(`/api/contests/${contest.id}/participants`, { method: "PUT", body: JSON.stringify({ user_ids: participantIds }) });
+      }
+      setForm({ ...form, title: "", description: "", task_ids: [], participant_ids: "" });
       await load();
       onChanged();
     } catch (error) {
@@ -363,6 +380,17 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
     setFlash(emptyFlash);
     try {
       await api<Task[]>(`/api/contests/${contest.id}/tasks`, { method: "PUT", body: JSON.stringify({ task_ids: taskIds }) });
+      await load();
+      onChanged();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  async function saveContestParticipants(contest: Contest, participantIds: number[]) {
+    setFlash(emptyFlash);
+    try {
+      await api<User[]>(`/api/contests/${contest.id}/participants`, { method: "PUT", body: JSON.stringify({ user_ids: participantIds }) });
       await load();
       onChanged();
     } catch (error) {
@@ -398,6 +426,7 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
           <div className="form-grid">
             <label>{t("table.title")}<input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} required /></label>
             <label>{t("table.status")}<select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value as ContestStatus })}>{contestStatuses.map((item) => <option key={item} value={item}>{t(`status.${item}`)}</option>)}</select></label>
+            <label className="inline"><input className="check" type="checkbox" checked={form.is_public} onChange={(event) => setForm({ ...form, is_public: event.target.checked })} /> {t("contest.public")}</label>
             <label className="span-2">{t("table.description")}<textarea className="short" value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} /></label>
           </div>
         </fieldset>
@@ -416,13 +445,18 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
             <label key={task.id} className="inline"><input className="check" type="checkbox" checked={form.task_ids.includes(task.id)} onChange={() => toggleFormTask(task.id)} /> #{task.id} {task.title}</label>
           ))}</div>
         </fieldset>
+        <fieldset>
+          <legend>{t("contest.sectionAccess")}</legend>
+          <label>{t("contest.participantIds")}<input value={form.participant_ids} onChange={(event) => setForm({ ...form, participant_ids: event.target.value })} placeholder="1, 2, 3" /></label>
+          <p className="muted">{t("contest.participantsAvailable", { users: users.map((user) => `${user.id}:${user.username}`).join(" · ") || t("common.none") })}</p>
+        </fieldset>
         <button type="submit">{t("common.create")}</button>
       </form>
       <FlashMessage flash={flash} />
       <div className="table-wrap">
         <table>
-          <thead><tr><th>{t("table.id")}</th><th>{t("table.title")}</th><th>{t("table.status")}</th><th>{t("table.mode")}</th><th>{t("table.starts")}</th><th>{t("table.ends")}</th><th>{t("table.minutes")}</th><th>{t("table.tasks")}</th><th></th></tr></thead>
-          <tbody>{contests.map((contest) => <ContestRow key={contest.id} contest={contest} tasks={tasks} taskIds={contestTaskIds[contest.id] ?? []} onSave={saveContest} onSaveTasks={saveContestTasks} onDelete={deleteContest} />)}</tbody>
+          <thead><tr><th>{t("table.id")}</th><th>{t("table.title")}</th><th>{t("table.status")}</th><th>{t("table.access")}</th><th>{t("table.mode")}</th><th>{t("table.starts")}</th><th>{t("table.ends")}</th><th>{t("table.minutes")}</th><th>{t("table.tasks")}</th><th>{t("table.participants")}</th><th></th></tr></thead>
+          <tbody>{contests.map((contest) => <ContestRow key={contest.id} contest={contest} tasks={tasks} users={users} taskIds={contestTaskIds[contest.id] ?? []} participantIds={contestParticipantIds[contest.id] ?? []} onSave={saveContest} onSaveTasks={saveContestTasks} onSaveParticipants={saveContestParticipants} onDelete={deleteContest} />)}</tbody>
         </table>
       </div>
     </section>
@@ -434,16 +468,22 @@ const contestStatuses: ContestStatus[] = ["draft", "scheduled", "running", "fini
 function ContestRow({
   contest,
   tasks,
+  users,
   taskIds,
+  participantIds,
   onSave,
   onSaveTasks,
+  onSaveParticipants,
   onDelete
 }: {
   contest: Contest;
   tasks: Task[];
+  users: User[];
   taskIds: number[];
+  participantIds: number[];
   onSave: (contest: Contest, patch: Partial<Contest>) => Promise<void>;
   onSaveTasks: (contest: Contest, taskIds: number[]) => Promise<void>;
+  onSaveParticipants: (contest: Contest, participantIds: number[]) => Promise<void>;
   onDelete: (contest: Contest) => void;
 }) {
   const { t } = useI18n();
@@ -451,23 +491,27 @@ function ContestRow({
   const [draft, setDraft] = useState({
     title: contest.title,
     status: contest.status,
+    is_public: contest.is_public,
     time_mode: contest.time_mode,
     starts_at: toLocalInputValue(contest.starts_at),
     ends_at: toLocalInputValue(contest.ends_at),
     individual_duration_minutes: String(contest.individual_duration_minutes ?? ""),
     description: contest.description,
-    task_ids: taskIds
+    task_ids: taskIds,
+    participant_ids: joinIds(participantIds)
   });
   useEffect(() => setDraft({
     title: contest.title,
     status: contest.status,
+    is_public: contest.is_public,
     time_mode: contest.time_mode,
     starts_at: toLocalInputValue(contest.starts_at),
     ends_at: toLocalInputValue(contest.ends_at),
     individual_duration_minutes: String(contest.individual_duration_minutes ?? ""),
     description: contest.description,
-    task_ids: taskIds
-  }), [contest, taskIds]);
+    task_ids: taskIds,
+    participant_ids: joinIds(participantIds)
+  }), [contest, taskIds, participantIds]);
 
   function toggleDraftTask(taskId: number) {
     setDraft((current) => ({
@@ -477,11 +521,16 @@ function ContestRow({
   }
 
   if (!editing) {
+    const participantNames = participantIds
+      .map((id) => users.find((user) => user.id === id))
+      .filter(Boolean)
+      .map((user) => `${user?.id}:${user?.username}`)
+      .join(", ");
     return (
       <tr>
-        <td>{contest.id}</td><td>{contest.title}</td><td>{t(`status.${contest.status}`)}</td><td>{t(`common.${contest.time_mode}`)}</td>
+        <td>{contest.id}</td><td>{contest.title}</td><td>{t(`status.${contest.status}`)}</td><td>{contest.is_public ? t("contest.public") : t("contest.private")}</td><td>{t(`common.${contest.time_mode}`)}</td>
         <td>{formatDate(contest.starts_at)}</td><td>{formatDate(contest.ends_at)}</td><td>{contest.individual_duration_minutes ?? "-"}</td>
-        <td>{taskIds.length}</td>
+        <td>{taskIds.length}</td><td>{participantNames || t("common.none")}</td>
         <td className="row-actions"><button onClick={() => setEditing(true)}>{t("common.edit")}</button><button className="danger" onClick={() => onDelete(contest)}>{t("common.delete")}</button></td>
       </tr>
     );
@@ -493,16 +542,19 @@ function ContestRow({
         <td>{contest.id}</td>
         <td><input value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} /></td>
         <td><select value={draft.status} onChange={(event) => setDraft({ ...draft, status: event.target.value as ContestStatus })}>{contestStatuses.map((item) => <option key={item} value={item}>{t(`status.${item}`)}</option>)}</select></td>
+        <td><label className="inline"><input className="check" type="checkbox" checked={draft.is_public} onChange={(event) => setDraft({ ...draft, is_public: event.target.checked })} /> {t("contest.public")}</label></td>
         <td><select value={draft.time_mode} onChange={(event) => setDraft({ ...draft, time_mode: event.target.value as TimeMode })}><option value="fixed">{t("common.fixed")}</option><option value="individual">{t("common.individual")}</option></select></td>
         <td><input type="datetime-local" value={draft.starts_at} onChange={(event) => setDraft({ ...draft, starts_at: event.target.value })} /></td>
         <td><input type="datetime-local" value={draft.ends_at} onChange={(event) => setDraft({ ...draft, ends_at: event.target.value })} /></td>
         <td><input type="number" value={draft.individual_duration_minutes} onChange={(event) => setDraft({ ...draft, individual_duration_minutes: event.target.value })} /></td>
         <td>{draft.task_ids.length}</td>
+        <td><input value={draft.participant_ids} onChange={(event) => setDraft({ ...draft, participant_ids: event.target.value })} placeholder="1, 2, 3" /></td>
         <td className="row-actions">
           <button onClick={async () => {
             await onSave(contest, {
               title: draft.title,
               status: draft.status,
+              is_public: draft.is_public,
               time_mode: draft.time_mode,
               starts_at: fromLocalInputValue(draft.starts_at),
               ends_at: fromLocalInputValue(draft.ends_at),
@@ -510,6 +562,7 @@ function ContestRow({
               description: draft.description
             });
             await onSaveTasks(contest, draft.task_ids);
+            await onSaveParticipants(contest, parseIds(draft.participant_ids));
             setEditing(false);
           }}>{t("common.save")}</button>
           <button onClick={() => setEditing(false)}>{t("common.cancel")}</button>
@@ -517,7 +570,7 @@ function ContestRow({
       </tr>
       <tr className="editing">
         <td></td>
-        <td colSpan={8}>
+        <td colSpan={10}>
           <div className="nested-edit">
             <label>{t("table.description")}<textarea className="short" value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} /></label>
             <label>{t("table.tasks")}
@@ -525,6 +578,7 @@ function ContestRow({
                 <span key={task.id} className="inline"><input className="check" type="checkbox" checked={draft.task_ids.includes(task.id)} onChange={() => toggleDraftTask(task.id)} /> #{task.id} {task.title}</span>
               ))}</span>
             </label>
+            <p className="muted">{t("contest.participantsAvailable", { users: users.map((user) => `${user.id}:${user.username}`).join(" · ") || t("common.none") })}</p>
           </div>
         </td>
       </tr>

@@ -61,7 +61,7 @@ export function Workspace({ api, me, token }: { api: ApiClient; me: User; token:
         {view === "admin" && me.role === "admin" ? (
           <AdminDashboard api={api} token={token} reloadContests={loadContests} />
         ) : selectedContest ? (
-          <ContestView api={api} contest={selectedContest} me={me} />
+          <ContestView api={api} contest={selectedContest} me={me} token={token} />
         ) : (
           <div className="panel">{t("nav.noContests")}</div>
         )}

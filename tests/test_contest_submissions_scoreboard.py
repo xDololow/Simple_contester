@@ -8,6 +8,156 @@ from app.models import ParticipantContest, Submission, SubmissionVerdict, TaskTe
 from conftest import APIClient
 
 
+def create_running_contest(client: APIClient, admin_headers: dict[str, str], title: str, is_public: bool = False) -> dict[str, Any]:
+    now = datetime.utcnow()
+    response = client.post(
+        "/api/contests",
+        headers=admin_headers,
+        json={
+            "title": title,
+            "description": "",
+            "status": "running",
+            "is_public": is_public,
+            "time_mode": "fixed",
+            "starts_at": (now - timedelta(minutes=5)).isoformat(),
+            "ends_at": (now + timedelta(hours=1)).isoformat(),
+            "individual_duration_minutes": None,
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def create_contest_task(client: APIClient, admin_headers: dict[str, str], contest_id: int, title: str = "Echo") -> dict[str, Any]:
+    response = client.post(
+        "/api/tasks",
+        headers=admin_headers,
+        json={
+            "contest_id": contest_id,
+            "title": title,
+            "statement": "Echo input.",
+            "input_format": "",
+            "output_format": "",
+            "samples": [],
+            "time_limit_ms": 1000,
+            "memory_limit_mb": 128,
+            "points": 100,
+            "tests": [{"input_data": "x\n", "output_data": "x\n", "is_sample": True}],
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_participant_does_not_see_or_open_private_contest_without_access(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    create_user: Callable[..., dict[str, Any]],
+    auth_headers: Callable[[str, str], dict[str, str]],
+) -> None:
+    allowed = create_user(username="allowed", password="allowed-pass")
+    stranger = create_user(username="outsider", password="outsider-pass")
+    allowed_headers = auth_headers(allowed["username"], "allowed-pass")
+    stranger_headers = auth_headers(stranger["username"], "outsider-pass")
+    contest = create_running_contest(client, admin_headers, "Private")
+
+    assigned = client.put(
+        f"/api/contests/{contest['id']}/participants",
+        headers=admin_headers,
+        json={"user_ids": [allowed["id"]]},
+    )
+    assert assigned.status_code == 200, assigned.text
+
+    allowed_list = client.get("/api/contests", headers=allowed_headers)
+    assert allowed_list.status_code == 200, allowed_list.text
+    assert contest["id"] in [item["id"] for item in allowed_list.json()]
+
+    stranger_list = client.get("/api/contests", headers=stranger_headers)
+    assert stranger_list.status_code == 200, stranger_list.text
+    assert contest["id"] not in [item["id"] for item in stranger_list.json()]
+
+    stranger_open = client.get(f"/api/contests/{contest['id']}", headers=stranger_headers)
+    assert stranger_open.status_code == 403
+    assert stranger_open.json()["detail"] == "Contest is not available"
+
+
+def test_participant_with_private_contest_access_can_submit(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant: dict,
+    participant_headers: dict[str, str],
+) -> None:
+    contest = create_running_contest(client, admin_headers, "Assigned")
+    task = create_contest_task(client, admin_headers, contest["id"])
+    assigned = client.put(
+        f"/api/contests/{contest['id']}/participants",
+        headers=admin_headers,
+        json={"user_ids": [participant["id"]]},
+    )
+    assert assigned.status_code == 200, assigned.text
+
+    created = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(input())"},
+    )
+
+    assert created.status_code == 200, created.text
+    assert created.json()["contest_id"] == contest["id"]
+
+
+def test_participant_without_private_contest_access_cannot_submit_or_scoreboard(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant_headers: dict[str, str],
+) -> None:
+    contest = create_running_contest(client, admin_headers, "Locked")
+    task = create_contest_task(client, admin_headers, contest["id"])
+
+    created = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(input())"},
+    )
+    assert created.status_code == 403
+    assert created.json()["detail"] == "Contest is not available"
+
+    scoreboard = client.get(f"/api/contests/{contest['id']}/scoreboard", headers=participant_headers)
+    assert scoreboard.status_code == 403
+    assert scoreboard.json()["detail"] == "Contest is not available"
+
+
+def test_admin_can_manage_contest_participant_access(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    create_user: Callable[..., dict[str, Any]],
+) -> None:
+    alice = create_user(username="access_alice", password="alice-pass")
+    bob = create_user(username="access_bob", password="bob-pass")
+    admin_user = create_user(username="access_admin", password="admin-pass", role="admin")
+    contest = create_running_contest(client, admin_headers, "Access")
+
+    rejected = client.put(
+        f"/api/contests/{contest['id']}/participants",
+        headers=admin_headers,
+        json={"user_ids": [admin_user["id"]]},
+    )
+    assert rejected.status_code == 400
+    assert rejected.json()["detail"] == f"Non-participant user ids: [{admin_user['id']}]"
+
+    updated = client.put(
+        f"/api/contests/{contest['id']}/participants",
+        headers=admin_headers,
+        json={"user_ids": [alice["id"], bob["id"]]},
+    )
+    assert updated.status_code == 200, updated.text
+    assert [user["id"] for user in updated.json()] == [alice["id"], bob["id"]]
+
+    listed = client.get(f"/api/contests/{contest['id']}/participants", headers=admin_headers)
+    assert listed.status_code == 200, listed.text
+    assert [user["id"] for user in listed.json()] == [alice["id"], bob["id"]]
+
+
 def test_individual_deadline_blocks_submission_without_sleeping(
     client: APIClient,
     participant: dict,
@@ -247,6 +397,42 @@ def test_submission_lifecycle_and_scoreboard_after_accepted_submission(
             "solved_at_minutes": row["cells"][0]["solved_at_minutes"],
         }
     ]
+
+
+def test_contest_events_requires_token(
+    client: APIClient,
+    demo_contest: dict,
+) -> None:
+    missing = client.get(f"/api/contests/{demo_contest['id']}/events")
+    assert missing.status_code == 401
+
+    invalid = client.get(f"/api/contests/{demo_contest['id']}/events?token=not-a-token")
+    assert invalid.status_code == 401
+
+
+def test_live_snapshot_matches_submission_and_scoreboard_payloads(
+    client: APIClient,
+    participant: dict,
+    participant_headers: dict[str, str],
+    demo_contest: dict,
+    demo_task: dict,
+) -> None:
+    created = client.post(
+        f"/api/contests/{demo_contest['id']}/tasks/{demo_task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(42)"},
+    )
+    assert created.status_code == 200, created.text
+
+    snapshot = client.get(f"/api/contests/{demo_contest['id']}/live-snapshot", headers=participant_headers)
+    assert snapshot.status_code == 200, snapshot.text
+    payload = snapshot.json()
+
+    assert payload["submissions"][0]["id"] == created.json()["id"]
+    assert payload["submissions"][0]["verdict"] == "Queued"
+    row = next(item for item in payload["scoreboard"] if item["user_id"] == participant["id"])
+    assert row["score"] == 0
+    assert row["cells"][0]["attempts"] == 1
 
 
 def test_scoreboard_uses_best_partial_submission_score(

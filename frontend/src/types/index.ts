@@ -38,6 +38,7 @@ export type Contest = {
   title: string;
   description: string;
   status: ContestStatus;
+  is_public: boolean;
   time_mode: TimeMode;
   starts_at: string;
   ends_at: string;
@@ -107,6 +108,11 @@ export type ScoreboardRow = {
   score: number;
   penalty: number;
   cells: Array<{ task_id: number; attempts: number; solved: boolean; solved_at_minutes: number | null }>;
+};
+
+export type ContestLiveEvent = {
+  submissions: Submission[];
+  scoreboard: ScoreboardRow[];
 };
 
 export type ImportReport = {

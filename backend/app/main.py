@@ -1,3 +1,4 @@
+import asyncio
 import csv
 import io
 import json
@@ -6,13 +7,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
 
 import yaml
-from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import and_, select, text
+from fastapi.responses import StreamingResponse
+from sqlalchemy import and_, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from .auth import create_access_token, get_current_user, hash_password, require_admin, verify_password
+from .auth import create_access_token, get_current_user, get_user_from_token, hash_password, require_admin, verify_password
 from .config import settings
 from .database import SessionLocal, engine, get_db
 from .models import (
@@ -33,6 +36,7 @@ from .models import (
 )
 from .schemas import (
     ContestCreate,
+    ContestParticipantsUpdate,
     ContestOut,
     ContestTeamsUpdate,
     ContestTasksUpdate,
@@ -148,6 +152,17 @@ def ensure_partial_scoring_column() -> None:
             conn.execute(text("ALTER TABLE tasks ADD COLUMN partial_scoring BOOL NOT NULL DEFAULT 0"))
 
 
+def ensure_contest_access_columns() -> None:
+    if engine.dialect.name not in {"mysql", "mariadb"}:
+        return
+    with engine.begin() as conn:
+        column = conn.execute(text("SHOW COLUMNS FROM contests LIKE 'is_public'")).mappings().first()
+        if column is None:
+            conn.execute(text("ALTER TABLE contests ADD COLUMN is_public BOOL NOT NULL DEFAULT 0"))
+        conn.execute(text("ALTER TABLE participant_contests MODIFY started_at DATETIME NULL"))
+        conn.execute(text("ALTER TABLE participant_contests MODIFY deadline_at DATETIME NULL"))
+
+
 def ensure_legacy_task_links(db: Session) -> None:
     legacy_tasks = db.scalars(select(Task).where(Task.contest_id.is_not(None))).all()
     changed = False
@@ -170,6 +185,7 @@ def startup() -> None:
     ensure_language_enum_values()
     ensure_float_score_columns()
     ensure_partial_scoring_column()
+    ensure_contest_access_columns()
     with SessionLocal() as db:
         ensure_admin(db)
         ensure_legacy_task_links(db)
@@ -274,6 +290,53 @@ def replace_contest_teams(db: Session, contest: Contest, team_ids: list[int]) ->
     return list_contest_teams(contest.id, db=db)
 
 
+def participant_has_contest_access(db: Session, contest_id: int, user_id: int) -> bool:
+    return (
+        db.scalar(
+            select(ParticipantContest.id).where(
+                ParticipantContest.contest_id == contest_id,
+                ParticipantContest.user_id == user_id,
+            )
+        )
+        is not None
+    )
+
+
+def assert_contest_access(db: Session, contest: Contest, user: User) -> None:
+    if user.role == UserRole.admin:
+        return
+    if contest.is_public:
+        return
+    if participant_has_contest_access(db, contest.id, user.id):
+        return
+    raise HTTPException(status_code=403, detail="Contest is not available")
+
+
+def replace_contest_participants(db: Session, contest: Contest, user_ids: list[int]) -> list[User]:
+    unique_user_ids = list(dict.fromkeys(user_ids))
+    if unique_user_ids:
+        users = db.scalars(select(User).where(User.id.in_(unique_user_ids))).all()
+        users_by_id = {user.id: user for user in users}
+        missing = sorted(set(unique_user_ids) - set(users_by_id))
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Unknown user ids: {missing}")
+        non_participants = sorted(user_id for user_id, user in users_by_id.items() if user.role != UserRole.participant)
+        if non_participants:
+            raise HTTPException(status_code=400, detail=f"Non-participant user ids: {non_participants}")
+    existing = {
+        row.user_id: row
+        for row in db.scalars(select(ParticipantContest).where(ParticipantContest.contest_id == contest.id)).all()
+    }
+    for user_id, row in existing.items():
+        if user_id not in unique_user_ids:
+            db.delete(row)
+    for user_id in unique_user_ids:
+        if user_id not in existing:
+            db.add(ParticipantContest(contest_id=contest.id, user_id=user_id))
+    db.commit()
+    return list_contest_participants(contest.id, db=db)
+
+
 def get_or_start_participant_contest(db: Session, contest: Contest, user: User) -> ParticipantContest:
     existing = db.scalar(
         select(ParticipantContest).where(
@@ -281,7 +344,7 @@ def get_or_start_participant_contest(db: Session, contest: Contest, user: User) 
             ParticipantContest.user_id == user.id,
         )
     )
-    if existing:
+    if existing and existing.started_at is not None and existing.deadline_at is not None:
         return existing
     started_at = now_utc()
     if contest.time_mode == ContestTimeMode.individual:
@@ -290,27 +353,32 @@ def get_or_start_participant_contest(db: Session, contest: Contest, user: User) 
         deadline = min(contest.ends_at, started_at + timedelta(minutes=contest.individual_duration_minutes))
     else:
         deadline = contest.ends_at
-    participant = ParticipantContest(
-        contest_id=contest.id,
-        user_id=user.id,
-        started_at=started_at,
-        deadline_at=deadline,
-    )
-    db.add(participant)
+    participant = existing or ParticipantContest(contest_id=contest.id, user_id=user.id)
+    participant.started_at = started_at
+    participant.deadline_at = deadline
+    if existing is None:
+        db.add(participant)
     db.commit()
     db.refresh(participant)
     return participant
 
 
 def assert_contest_allows_submission(db: Session, contest: Contest, user: User) -> None:
+    assert_contest_access(db, contest, user)
     current = now_utc()
     if current < contest.starts_at or current > contest.ends_at:
         raise HTTPException(status_code=400, detail="Contest is outside the available window")
     if contest.time_mode == ContestTimeMode.individual and contest.individual_duration_minutes is None:
         raise HTTPException(status_code=400, detail="Individual duration is not configured")
     participant = get_or_start_participant_contest(db, contest, user)
-    if current > participant.deadline_at:
+    if participant.deadline_at is not None and current > participant.deadline_at:
         raise HTTPException(status_code=400, detail="Individual contest deadline has passed")
+
+
+def get_sse_user(token: str | None, db: Session) -> User:
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    return get_user_from_token(token, db)
 
 
 @app.post("/api/auth/login", response_model=TokenOut)
@@ -590,8 +658,12 @@ def delete_team(team_id: int, _: User = Depends(require_admin), db: Session = De
 
 
 @app.get("/api/contests", response_model=list[ContestOut])
-def list_contests(db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> list[Contest]:
-    return list(db.scalars(select(Contest).order_by(Contest.starts_at.desc())))
+def list_contests(db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list[Contest]:
+    stmt = select(Contest).order_by(Contest.starts_at.desc())
+    if user.role != UserRole.admin:
+        accessible_contests = select(ParticipantContest.contest_id).where(ParticipantContest.user_id == user.id)
+        stmt = stmt.where(or_(Contest.is_public.is_(True), Contest.id.in_(accessible_contests)))
+    return list(db.scalars(stmt))
 
 
 @app.post("/api/contests", response_model=ContestOut)
@@ -613,8 +685,10 @@ def create_contest(data: ContestCreate, _: User = Depends(require_admin), db: Se
 
 
 @app.get("/api/contests/{contest_id}", response_model=ContestOut)
-def get_contest(contest_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> Contest:
-    return get_contest_or_404(db, contest_id)
+def get_contest(contest_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> Contest:
+    contest = get_contest_or_404(db, contest_id)
+    assert_contest_access(db, contest, user)
+    return contest
 
 
 @app.patch("/api/contests/{contest_id}", response_model=ContestOut)
@@ -657,7 +731,36 @@ def delete_contest(contest_id: int, _: User = Depends(require_admin), db: Sessio
 @app.get("/api/contests/{contest_id}/start", response_model=ParticipantContestOut)
 def start_contest(contest_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> ParticipantContest:
     contest = get_contest_or_404(db, contest_id)
+    assert_contest_access(db, contest, user)
     return get_or_start_participant_contest(db, contest, user)
+
+
+@app.get("/api/contests/{contest_id}/participants", response_model=list[UserOut])
+def list_contest_participants(
+    contest_id: int,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> list[User]:
+    get_contest_or_404(db, contest_id)
+    return list(
+        db.scalars(
+            select(User)
+            .join(ParticipantContest, ParticipantContest.user_id == User.id)
+            .where(ParticipantContest.contest_id == contest_id)
+            .order_by(User.username)
+        )
+    )
+
+
+@app.put("/api/contests/{contest_id}/participants", response_model=list[UserOut])
+def set_contest_participants(
+    contest_id: int,
+    data: ContestParticipantsUpdate,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> list[User]:
+    contest = get_contest_or_404(db, contest_id)
+    return replace_contest_participants(db, contest, data.user_ids)
 
 
 @app.get("/api/contests/{contest_id}/teams", response_model=list[TeamOut])
@@ -689,8 +792,9 @@ def set_contest_teams(
 
 
 @app.get("/api/contests/{contest_id}/tasks", response_model=list[TaskOut])
-def list_tasks(contest_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> list[TaskOut]:
-    get_contest_or_404(db, contest_id)
+def list_tasks(contest_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list[TaskOut]:
+    contest = get_contest_or_404(db, contest_id)
+    assert_contest_access(db, contest, user)
     return list_contest_tasks(db, contest_id)
 
 
@@ -739,6 +843,13 @@ def create_task(data: TaskCreate, _: User = Depends(require_admin), db: Session 
 @app.get("/api/tasks/{task_id}", response_model=TaskDetailOut)
 def get_task(task_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> TaskDetailOut:
     task = get_task_or_404(db, task_id)
+    if user.role != UserRole.admin:
+        contest_ids = {link.contest_id for link in task.contests}
+        if task.contest_id is not None:
+            contest_ids.add(task.contest_id)
+        contests = db.scalars(select(Contest).where(Contest.id.in_(contest_ids))).all() if contest_ids else []
+        if not any(contest.is_public or participant_has_contest_access(db, contest.id, user.id) for contest in contests):
+            raise HTTPException(status_code=403, detail="Task is not available")
     return to_task_detail_out(task, include_tests=user.role == UserRole.admin)
 
 
@@ -861,10 +972,15 @@ def list_submissions(
 ) -> list[Submission]:
     stmt = select(Submission).order_by(Submission.created_at.desc()).limit(200)
     filters = []
-    if contest_id:
+    if contest_id is not None:
+        contest = get_contest_or_404(db, contest_id)
+        assert_contest_access(db, contest, user)
         filters.append(Submission.contest_id == contest_id)
     if user.role != UserRole.admin:
         filters.append(Submission.user_id == user.id)
+        accessible_contests = select(ParticipantContest.contest_id).where(ParticipantContest.user_id == user.id)
+        public_contests = select(Contest.id).where(Contest.is_public.is_(True))
+        filters.append(or_(Submission.contest_id.in_(accessible_contests), Submission.contest_id.in_(public_contests)))
     if filters:
         stmt = stmt.where(and_(*filters))
     return list(db.scalars(stmt))
@@ -877,6 +993,8 @@ def get_submission(submission_id: int, db: Session = Depends(get_db), user: User
         raise HTTPException(status_code=404, detail="Submission not found")
     if user.role != UserRole.admin and submission.user_id != user.id:
         raise HTTPException(status_code=403, detail="Submission is not available")
+    contest = get_contest_or_404(db, submission.contest_id)
+    assert_contest_access(db, contest, user)
     return submission
 
 
@@ -908,20 +1026,74 @@ def list_submission_test_results(
     return list(submission.results)
 
 
+def sse_event(event: str, data: object) -> str:
+    return f"event: {event}\ndata: {json.dumps(jsonable_encoder(data), separators=(',', ':'))}\n\n"
+
+
+def contest_events_payload(db: Session, contest_id: int, user: User) -> dict[str, object]:
+    submissions = [
+        SubmissionOut.model_validate(submission).model_dump(mode="json")
+        for submission in list_submissions(contest_id=contest_id, db=db, user=user)
+    ]
+    rows = [row.model_dump(mode="json") for row in scoreboard(contest_id=contest_id, db=db, user=user)]
+    return {"submissions": submissions, "scoreboard": rows}
+
+
+def contest_events_fingerprint(db: Session, contest_id: int) -> str:
+    stmt = (
+        select(
+            Submission.id,
+            Submission.user_id,
+            Submission.verdict,
+            Submission.score,
+            Submission.started_at,
+            Submission.finished_at,
+        )
+        .where(Submission.contest_id == contest_id)
+        .order_by(Submission.id)
+    )
+    rows = db.execute(stmt).all()
+    return json.dumps(
+        [
+            [
+                row.id,
+                row.user_id,
+                row.verdict.value if hasattr(row.verdict, "value") else row.verdict,
+                row.score,
+                row.started_at.isoformat() if row.started_at else None,
+                row.finished_at.isoformat() if row.finished_at else None,
+            ]
+            for row in rows
+        ],
+        separators=(",", ":"),
+    )
+
+
 @app.get("/api/contests/{contest_id}/scoreboard", response_model=list[ScoreboardRow])
-def scoreboard(contest_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)) -> list[ScoreboardRow]:
+def scoreboard(contest_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list[ScoreboardRow]:
+    contest = get_contest_or_404(db, contest_id)
+    assert_contest_access(db, contest, user)
     tasks = db.scalars(
         select(Task)
         .join(ContestTask, ContestTask.task_id == Task.id)
         .where(ContestTask.contest_id == contest_id)
         .order_by(ContestTask.position, Task.id)
     ).all()
-    users = db.scalars(select(User).where(User.role == UserRole.participant, User.is_active.is_(True)).order_by(User.username)).all()
     participants = {
         row.user_id: row
         for row in db.scalars(select(ParticipantContest).where(ParticipantContest.contest_id == contest_id)).all()
     }
-    submissions = db.scalars(select(Submission).where(Submission.contest_id == contest_id).order_by(Submission.created_at)).all()
+    user_stmt = select(User).where(User.role == UserRole.participant, User.is_active.is_(True)).order_by(User.username)
+    if not contest.is_public:
+        user_stmt = user_stmt.where(User.id.in_(participants))
+    users = db.scalars(user_stmt).all()
+    user_ids = [participant.id for participant in users]
+    submission_stmt = select(Submission).where(Submission.contest_id == contest_id).order_by(Submission.created_at)
+    if user_ids:
+        submission_stmt = submission_stmt.where(Submission.user_id.in_(user_ids))
+        submissions = db.scalars(submission_stmt).all()
+    else:
+        submissions = []
 
     rows: list[ScoreboardRow] = []
     for participant in users:
@@ -937,7 +1109,7 @@ def scoreboard(contest_id: int, db: Session = Depends(get_db), _: User = Depends
             solved_at_minutes = None
             score += best_score
             if accepted:
-                base = participant_window.started_at if participant_window else accepted.created_at
+                base = participant_window.started_at if participant_window and participant_window.started_at else accepted.created_at
                 solved_at_minutes = max(0, int((accepted.created_at - base).total_seconds() // 60))
                 penalty += solved_at_minutes + 20 * max(0, len(attempts_before_accept) - 1)
             cells.append(
@@ -959,3 +1131,38 @@ def scoreboard(contest_id: int, db: Session = Depends(get_db), _: User = Depends
             )
         )
     return sorted(rows, key=lambda row: (-row.score, row.penalty, row.username))
+
+
+@app.get("/api/contests/{contest_id}/live-snapshot")
+def contest_live_snapshot(contest_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> dict[str, object]:
+    return contest_events_payload(db, contest_id, user)
+
+
+@app.get("/api/contests/{contest_id}/events")
+async def contest_events(contest_id: int, request: Request, token: str | None = None) -> StreamingResponse:
+    with SessionLocal() as db:
+        user = get_sse_user(token, db)
+        contest = get_contest_or_404(db, contest_id)
+        assert_contest_access(db, contest, user)
+
+    async def stream():
+        last_fingerprint: str | None = None
+        while not await request.is_disconnected():
+            with SessionLocal() as db:
+                user = get_sse_user(token, db)
+                contest = get_contest_or_404(db, contest_id)
+                assert_contest_access(db, contest, user)
+                fingerprint = contest_events_fingerprint(db, contest_id)
+                if fingerprint != last_fingerprint:
+                    payload = contest_events_payload(db, contest_id, user)
+                    yield sse_event("contest", payload)
+                    last_fingerprint = fingerprint
+                else:
+                    yield ": heartbeat\n\n"
+            await asyncio.sleep(1)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

@@ -69,6 +69,10 @@ class ContestTeamsUpdate(BaseModel):
     team_ids: list[int] = Field(default_factory=list)
 
 
+class ContestParticipantsUpdate(BaseModel):
+    user_ids: list[int] = Field(default_factory=list)
+
+
 class ContestTasksUpdate(BaseModel):
     task_ids: list[int] = Field(default_factory=list)
 
@@ -77,6 +81,7 @@ class ContestCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     description: str = ""
     status: ContestStatus = ContestStatus.draft
+    is_public: bool = False
     time_mode: ContestTimeMode = ContestTimeMode.fixed
     starts_at: datetime
     ends_at: datetime
@@ -87,6 +92,7 @@ class ContestUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=200)
     description: str | None = None
     status: ContestStatus | None = None
+    is_public: bool | None = None
     time_mode: ContestTimeMode | None = None
     starts_at: datetime | None = None
     ends_at: datetime | None = None
@@ -106,8 +112,8 @@ class ParticipantContestOut(BaseModel):
     id: int
     contest_id: int
     user_id: int
-    started_at: datetime
-    deadline_at: datetime
+    started_at: datetime | None
+    deadline_at: datetime | None
 
 
 class TaskTestCreate(BaseModel):

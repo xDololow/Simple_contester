@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
+import { API_BASE } from "../../api/client";
 import { FlashMessage, Header, SubmissionDetailView } from "../../components/shared";
 import { useI18n } from "../../i18n";
-import type { ApiClient, Contest, Flash, Language, ScoreboardRow, Submission, SubmissionDetail, Task, User } from "../../types";
+import type { ApiClient, Contest, ContestLiveEvent, Flash, Language, ScoreboardRow, Submission, SubmissionDetail, Task, User } from "../../types";
 import { emptyFlash, errorText, formatDate, formatScore, verdictClass } from "../../utils/format";
 
 type ContestTab = "overview" | "tasks" | "submissions" | "scoreboard";
@@ -21,7 +22,7 @@ const SUBMISSION_LANGUAGES: Array<{ value: Language; label: string }> = [
   { value: "lua", label: "Lua" }
 ];
 
-export function ContestView({ api, contest, me }: { api: ApiClient; contest: Contest; me: User }) {
+export function ContestView({ api, contest, me, token }: { api: ApiClient; contest: Contest; me: User; token: string }) {
   const { t } = useI18n();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [submissions, setSubmissions] = useState<Submission[]>([]);
@@ -34,22 +35,56 @@ export function ContestView({ api, contest, me }: { api: ApiClient; contest: Con
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) || tasks[0] || null;
 
   const refresh = useCallback(async () => {
-    const [nextTasks, nextSubmissions, nextScoreboard] = await Promise.all([
+    const [nextTasks, live] = await Promise.all([
       api<Task[]>(`/api/contests/${contest.id}/tasks`),
-      api<Submission[]>(`/api/submissions?contest_id=${contest.id}`),
-      api<ScoreboardRow[]>(`/api/contests/${contest.id}/scoreboard`)
+      api<ContestLiveEvent>(`/api/contests/${contest.id}/live-snapshot`)
     ]);
     setTasks(nextTasks);
-    setSubmissions(nextSubmissions);
-    setScoreboard(nextScoreboard);
+    setSubmissions(live.submissions);
+    setScoreboard(live.scoreboard);
     setSelectedTaskId((current) => current ?? nextTasks[0]?.id ?? null);
+  }, [api, contest.id]);
+
+  const refreshLiveData = useCallback(async () => {
+    const live = await api<ContestLiveEvent>(`/api/contests/${contest.id}/live-snapshot`);
+    setSubmissions(live.submissions);
+    setScoreboard(live.scoreboard);
   }, [api, contest.id]);
 
   useEffect(() => {
     refresh().catch((error) => setFlash({ kind: "error", text: errorText(error) }));
-    const interval = window.setInterval(() => refresh().catch(console.error), 2000);
-    return () => window.clearInterval(interval);
-  }, [refresh]);
+
+    let eventSource: EventSource | null = null;
+    let fallbackInterval: number | null = null;
+    const startFallback = () => {
+      if (fallbackInterval !== null) return;
+      fallbackInterval = window.setInterval(() => refreshLiveData().catch(console.error), 5000);
+    };
+
+    if (!token || typeof EventSource === "undefined") {
+      startFallback();
+      return () => {
+        if (fallbackInterval !== null) window.clearInterval(fallbackInterval);
+      };
+    }
+
+    const eventsUrl = `${API_BASE}/api/contests/${contest.id}/events?token=${encodeURIComponent(token)}`;
+    eventSource = new EventSource(eventsUrl);
+    eventSource.addEventListener("contest", (event) => {
+      const live = JSON.parse((event as MessageEvent).data) as ContestLiveEvent;
+      setSubmissions(live.submissions);
+      setScoreboard(live.scoreboard);
+    });
+    eventSource.onerror = () => {
+      eventSource?.close();
+      startFallback();
+    };
+
+    return () => {
+      eventSource?.close();
+      if (fallbackInterval !== null) window.clearInterval(fallbackInterval);
+    };
+  }, [contest.id, refresh, refreshLiveData, token]);
 
   useEffect(() => {
     if (!selectedSubmissionId || me.role !== "admin") {
@@ -111,7 +146,7 @@ export function ContestView({ api, contest, me }: { api: ApiClient; contest: Con
                   </button>
                 ))}
               </div>
-              {selectedTask && <SubmitBox api={api} contestId={contest.id} task={selectedTask} onSubmitted={refresh} />}
+              {selectedTask && <SubmitBox api={api} contestId={contest.id} task={selectedTask} onSubmitted={refreshLiveData} />}
             </div>
           ) : (
             <EmptyState title={t("empty.tasksTitle")} text={t("empty.tasksText")} />

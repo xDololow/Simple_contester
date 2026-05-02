@@ -14,7 +14,10 @@ def test_alembic_upgrade_creates_current_schema(tmp_path, monkeypatch) -> None:
 
     engine = create_engine(db_url)
     try:
-        tables = set(inspect(engine).get_table_names())
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        contest_columns = {column["name"]: column for column in inspector.get_columns("contests")}
+        participant_columns = {column["name"]: column for column in inspector.get_columns("participant_contests")}
     finally:
         engine.dispose()
 
@@ -32,3 +35,6 @@ def test_alembic_upgrade_creates_current_schema(tmp_path, monkeypatch) -> None:
         "submissions",
         "test_results",
     }.issubset(tables)
+    assert "is_public" in contest_columns
+    assert participant_columns["started_at"]["nullable"] is True
+    assert participant_columns["deadline_at"]["nullable"] is True

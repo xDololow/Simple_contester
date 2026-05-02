@@ -100,6 +100,7 @@ class Contest(Base):
     title: Mapped[str] = mapped_column(String(200))
     description: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[ContestStatus] = mapped_column(SAEnum(ContestStatus), default=ContestStatus.draft)
+    is_public: Mapped[bool] = mapped_column(Boolean, default=False)
     time_mode: Mapped[ContestTimeMode] = mapped_column(SAEnum(ContestTimeMode), default=ContestTimeMode.fixed)
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -129,8 +130,8 @@ class ParticipantContest(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     contest_id: Mapped[int] = mapped_column(ForeignKey("contests.id", ondelete="CASCADE"))
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
-    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
-    deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ContestTask(Base):

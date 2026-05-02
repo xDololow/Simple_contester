@@ -127,6 +127,17 @@ Compose healthchecks are configured for:
 
 Use `docker compose ps` to inspect health state.
 
+## Live Updates
+
+Contest submissions and scoreboards use an authenticated Server-Sent Events MVP.
+The frontend opens `GET /api/contests/{contest_id}/events?token=...` after the
+initial contest load because browser `EventSource` cannot send an
+`Authorization` header. The backend validates the JWT token, applies the same
+contest access checks as the normal contest endpoints, and streams a compact
+`contest` event whenever submission verdicts/scores change. If the stream is
+unavailable or drops, the contest view falls back to slower polling through
+`GET /api/contests/{contest_id}/live-snapshot`.
+
 ## Scale Judgers
 
 Judger workers use row locking with `SKIP LOCKED`, so several workers can poll the same queue.
