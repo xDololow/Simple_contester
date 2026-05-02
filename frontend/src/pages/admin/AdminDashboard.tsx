@@ -1,0 +1,1025 @@
+import React, { useCallback, useEffect, useState } from "react";
+import { API_BASE } from "../../api/client";
+import { FlashMessage, Header, SubmissionDetailView } from "../../components/shared";
+import { useI18n } from "../../i18n";
+import type { ApiClient, Contest, ContestStatus, Flash, ImportReport, Role, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
+import { emptyFlash, errorText, formatDate, formatScore, fromLocalInputValue, joinIds, parseIds, toLocalInputValue, verdictClass } from "../../utils/format";
+
+export function AdminDashboard({ api, token, reloadContests }: { api: ApiClient; token: string; reloadContests: () => void }) {
+  const { t } = useI18n();
+  const [tab, setTab] = useState<"users" | "import" | "teams" | "contests" | "tasks" | "tests" | "submissions">("users");
+
+  return (
+    <div className="admin-shell">
+      <nav className="tabs">
+        {[
+          ["users", t("tab.users")],
+          ["import", t("tab.import")],
+          ["teams", t("tab.teams")],
+          ["contests", t("tab.contests")],
+          ["tasks", t("tab.tasks")],
+          ["tests", t("tab.tests")],
+          ["submissions", t("tab.submissions")]
+        ].map(([id, label]) => (
+          <button key={id} className={tab === id ? "active" : ""} onClick={() => setTab(id as typeof tab)}>
+            {label}
+          </button>
+        ))}
+      </nav>
+      {tab === "users" && <UsersAdmin api={api} />}
+      {tab === "import" && <ImportUsersAdmin token={token} />}
+      {tab === "teams" && <TeamsAdmin api={api} />}
+      {tab === "contests" && <ContestsAdmin api={api} onChanged={reloadContests} />}
+      {tab === "tasks" && <TasksAdmin api={api} />}
+      {tab === "tests" && <TestsAdmin api={api} />}
+      {tab === "submissions" && <SubmissionsAdmin api={api} />}
+    </div>
+  );
+}
+
+function UsersAdmin({ api }: { api: ApiClient }) {
+  const { t } = useI18n();
+  const [users, setUsers] = useState<User[]>([]);
+  const [flash, setFlash] = useState<Flash>(emptyFlash);
+  const [form, setForm] = useState({ username: "", password: "", display_name: "", role: "participant" as Role });
+
+  const load = useCallback(() => api<User[]>("/api/users").then(setUsers), [api]);
+
+  useEffect(() => {
+    load().catch((error) => setFlash({ kind: "error", text: errorText(error) }));
+  }, [load]);
+
+  async function createUser(event: React.FormEvent) {
+    event.preventDefault();
+    setFlash(emptyFlash);
+    try {
+      await api<User>("/api/users", {
+        method: "POST",
+        body: JSON.stringify({ ...form, display_name: form.display_name || form.username })
+      });
+      setForm({ username: "", password: "", display_name: "", role: "participant" });
+      await load();
+      setFlash({ kind: "ok", text: t("user.created") });
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  async function updateUser(user: User, patch: Partial<User> & { password?: string }) {
+    setFlash(emptyFlash);
+    try {
+      await api<User>(`/api/users/${user.id}`, { method: "PATCH", body: JSON.stringify(patch) });
+      await load();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  async function deleteUser(user: User) {
+    if (!window.confirm(t("user.deleteConfirm", { name: user.username }))) return;
+    setFlash(emptyFlash);
+    try {
+      await api<void>(`/api/users/${user.id}`, { method: "DELETE" });
+      await load();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  return (
+    <section className="panel">
+      <Header title={t("tab.users")} subtitle={t("title.usersCount", { count: users.length })} />
+      <form className="form-grid" onSubmit={createUser}>
+        <label>{t("table.username")}<input value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} required /></label>
+        <label>{t("login.password")}<input value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} required /></label>
+        <label>{t("user.displayName")}<input value={form.display_name} onChange={(event) => setForm({ ...form, display_name: event.target.value })} /></label>
+        <label>{t("table.role")}<select value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value as Role })}><option value="participant">{t("role.participant")}</option><option value="admin">{t("role.admin")}</option></select></label>
+        <button type="submit">{t("common.create")}</button>
+      </form>
+      <FlashMessage flash={flash} />
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th>ID</th><th>{t("table.username")}</th><th>{t("table.name")}</th><th>{t("table.role")}</th><th>{t("table.active")}</th><th>{t("table.created")}</th><th></th></tr></thead>
+          <tbody>{users.map((user) => <UserRow key={user.id} user={user} onSave={updateUser} onDelete={deleteUser} />)}</tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function UserRow({ user, onSave, onDelete }: { user: User; onSave: (user: User, patch: Partial<User> & { password?: string }) => void; onDelete: (user: User) => void }) {
+  const { t } = useI18n();
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState({ ...user, password: "" });
+
+  useEffect(() => setDraft({ ...user, password: "" }), [user]);
+
+  if (!editing) {
+    return (
+      <tr>
+        <td>{user.id}</td><td>{user.username}</td><td>{user.display_name}</td><td>{t(`role.${user.role}`)}</td><td>{user.is_active ? t("common.yes") : t("common.no")}</td><td>{formatDate(user.created_at)}</td>
+        <td className="row-actions"><button onClick={() => setEditing(true)}>{t("common.edit")}</button><button className="danger" onClick={() => onDelete(user)}>{t("common.delete")}</button></td>
+      </tr>
+    );
+  }
+
+  return (
+    <tr className="editing">
+      <td>{user.id}</td>
+      <td><input value={draft.username} onChange={(event) => setDraft({ ...draft, username: event.target.value })} /></td>
+      <td><input value={draft.display_name} onChange={(event) => setDraft({ ...draft, display_name: event.target.value })} /></td>
+      <td><select value={draft.role} onChange={(event) => setDraft({ ...draft, role: event.target.value as Role })}><option value="participant">{t("role.participant")}</option><option value="admin">{t("role.admin")}</option></select></td>
+      <td><input className="check" type="checkbox" checked={draft.is_active} onChange={(event) => setDraft({ ...draft, is_active: event.target.checked })} /></td>
+      <td><input placeholder={t("user.newPassword")} value={draft.password} onChange={(event) => setDraft({ ...draft, password: event.target.value })} /></td>
+      <td className="row-actions">
+        <button onClick={() => {
+          const patch: Partial<User> & { password?: string } = { username: draft.username, display_name: draft.display_name, role: draft.role, is_active: draft.is_active };
+          if (draft.password) patch.password = draft.password;
+          onSave(user, patch);
+          setEditing(false);
+        }}>{t("common.save")}</button>
+        <button onClick={() => setEditing(false)}>{t("common.cancel")}</button>
+      </td>
+    </tr>
+  );
+}
+
+function ImportUsersAdmin({ token }: { token: string }) {
+  const { t } = useI18n();
+  const [report, setReport] = useState<ImportReport | null>(null);
+  const [flash, setFlash] = useState<Flash>(emptyFlash);
+
+  async function importUsers(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setFlash(emptyFlash);
+    setReport(null);
+    const body = new FormData();
+    body.append("file", file);
+    try {
+      const response = await fetch(`${API_BASE}/api/users/import`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || t("import.importFailed"));
+      setReport(data);
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    } finally {
+      event.target.value = "";
+    }
+  }
+
+  return (
+    <section className="panel">
+      <Header title={t("tab.import")} subtitle="CSV, JSON, YAML" />
+      <label className="file-field"><input type="file" accept=".csv,.json,.yml,.yaml" onChange={importUsers} /></label>
+      <p className="muted">{t("import.expectedFields")}</p>
+      <FlashMessage flash={flash} />
+      {report && (
+        <div className="report">
+          <div className="stat"><strong>{report.created}</strong><span>{t("common.created")}</span></div>
+          <div className="stat"><strong>{report.skipped}</strong><span>{t("common.skipped")}</span></div>
+          <div className="stat"><strong>{report.errors.length}</strong><span>{t("common.errors")}</span></div>
+          <table>
+            <thead><tr><th>{t("table.status")}</th><th>{t("import.rowReport")}</th></tr></thead>
+            <tbody>
+              {report.created > 0 && <tr><td><span className="pill ok">{t("common.created")}</span></td><td>{t("import.success", { count: report.created })}</td></tr>}
+              {report.errors.map((item, index) => <tr key={index}><td><span className="pill warn">{t("common.skipped")}/{t("common.errors")}</span></td><td>{item}</td></tr>)}
+              {!report.errors.length && report.created === 0 && <tr><td><span className="pill">{t("common.empty")}</span></td><td>{t("import.acceptedNoRows")}</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function TeamsAdmin({ api }: { api: ApiClient }) {
+  const { t } = useI18n();
+  const [teams, setTeams] = useState<Team[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
+  const [flash, setFlash] = useState<Flash>(emptyFlash);
+  const [form, setForm] = useState({ name: "", user_ids: "" });
+
+  const load = useCallback(async () => {
+    const [nextTeams, nextUsers] = await Promise.all([api<Team[]>("/api/teams"), api<User[]>("/api/users")]);
+    setTeams(nextTeams);
+    setUsers(nextUsers);
+  }, [api]);
+
+  useEffect(() => { load().catch((error) => setFlash({ kind: "error", text: errorText(error) })); }, [load]);
+
+  async function createTeam(event: React.FormEvent) {
+    event.preventDefault();
+    setFlash(emptyFlash);
+    try {
+      await api<Team>("/api/teams", { method: "POST", body: JSON.stringify({ name: form.name, user_ids: parseIds(form.user_ids) }) });
+      setForm({ name: "", user_ids: "" });
+      await load();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  async function saveTeam(team: Team, patch: { name: string; user_ids: number[] }) {
+    setFlash(emptyFlash);
+    try {
+      await api<Team>(`/api/teams/${team.id}`, { method: "PATCH", body: JSON.stringify(patch) });
+      await load();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  async function deleteTeam(team: Team) {
+    if (!window.confirm(t("team.deleteConfirm", { name: team.name }))) return;
+    setFlash(emptyFlash);
+    try {
+      await api<void>(`/api/teams/${team.id}`, { method: "DELETE" });
+      await load();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  return (
+    <section className="panel">
+      <Header title={t("tab.teams")} subtitle={t("title.teamsCount", { count: teams.length })} />
+      <form className="form-grid" onSubmit={createTeam}>
+        <label>{t("table.name")}<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required /></label>
+        <label>{t("team.memberIds")}<input value={form.user_ids} onChange={(event) => setForm({ ...form, user_ids: event.target.value })} placeholder="1, 2, 3" /></label>
+        <button type="submit">{t("common.create")}</button>
+      </form>
+      <p className="muted">{t("team.users", { users: users.map((user) => `${user.id}:${user.username}`).join(" · ") || t("common.none") })}</p>
+      <FlashMessage flash={flash} />
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th>{t("table.id")}</th><th>{t("table.name")}</th><th>{t("table.members")}</th><th>{t("table.created")}</th><th></th></tr></thead>
+          <tbody>{teams.map((team) => <TeamRow key={team.id} team={team} onSave={saveTeam} onDelete={deleteTeam} />)}</tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function TeamRow({ team, onSave, onDelete }: { team: Team; onSave: (team: Team, patch: { name: string; user_ids: number[] }) => void; onDelete: (team: Team) => void }) {
+  const { t } = useI18n();
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState({ name: team.name, user_ids: joinIds(team.member_ids) });
+  useEffect(() => setDraft({ name: team.name, user_ids: joinIds(team.member_ids) }), [team]);
+
+  return (
+    <tr className={editing ? "editing" : ""}>
+      <td>{team.id}</td>
+      <td>{editing ? <input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /> : team.name}</td>
+      <td>{editing ? <input value={draft.user_ids} onChange={(event) => setDraft({ ...draft, user_ids: event.target.value })} /> : joinIds(team.member_ids) || "-"}</td>
+      <td>{formatDate(team.created_at)}</td>
+      <td className="row-actions">
+        {editing ? (
+          <>
+            <button onClick={() => { onSave(team, { name: draft.name, user_ids: parseIds(draft.user_ids) }); setEditing(false); }}>{t("common.save")}</button>
+            <button onClick={() => setEditing(false)}>{t("common.cancel")}</button>
+          </>
+        ) : (
+          <>
+            <button onClick={() => setEditing(true)}>{t("common.edit")}</button>
+            <button className="danger" onClick={() => onDelete(team)}>{t("common.delete")}</button>
+          </>
+        )}
+      </td>
+    </tr>
+  );
+}
+
+function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => void }) {
+  const { t } = useI18n();
+  const [contests, setContests] = useState<Contest[]>([]);
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [contestTaskIds, setContestTaskIds] = useState<Record<number, number[]>>({});
+  const [flash, setFlash] = useState<Flash>(emptyFlash);
+  const now = new Date();
+  const later = new Date(Date.now() + 3 * 60 * 60_000);
+  const [form, setForm] = useState({
+    title: "",
+    description: "",
+    status: "draft" as ContestStatus,
+    time_mode: "fixed" as TimeMode,
+    starts_at: toLocalInputValue(now.toISOString()),
+    ends_at: toLocalInputValue(later.toISOString()),
+    individual_duration_minutes: "180",
+    task_ids: [] as number[]
+  });
+
+  const load = useCallback(async () => {
+    const [nextContests, nextTasks] = await Promise.all([api<Contest[]>("/api/contests"), api<Task[]>("/api/tasks")]);
+    const nextContestTaskEntries = await Promise.all(
+      nextContests.map(async (contest) => {
+        const contestTasks = await api<Task[]>(`/api/contests/${contest.id}/tasks`);
+        return [contest.id, contestTasks.map((task) => task.id)] as const;
+      })
+    );
+    setContests(nextContests);
+    setTasks(nextTasks);
+    setContestTaskIds(Object.fromEntries(nextContestTaskEntries));
+  }, [api]);
+  useEffect(() => { load().catch((error) => setFlash({ kind: "error", text: errorText(error) })); }, [load]);
+
+  async function createContest(event: React.FormEvent) {
+    event.preventDefault();
+    setFlash(emptyFlash);
+    try {
+      const contest = await api<Contest>("/api/contests", {
+        method: "POST",
+        body: JSON.stringify({
+          ...form,
+          task_ids: undefined,
+          starts_at: fromLocalInputValue(form.starts_at),
+          ends_at: fromLocalInputValue(form.ends_at),
+          individual_duration_minutes: form.time_mode === "individual" ? Number(form.individual_duration_minutes) : null
+        })
+      });
+      if (form.task_ids.length) {
+        await api<Task[]>(`/api/contests/${contest.id}/tasks`, { method: "PUT", body: JSON.stringify({ task_ids: form.task_ids }) });
+      }
+      setForm({ ...form, title: "", description: "", task_ids: [] });
+      await load();
+      onChanged();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  async function saveContest(contest: Contest, patch: Partial<Contest>) {
+    setFlash(emptyFlash);
+    try {
+      await api<Contest>(`/api/contests/${contest.id}`, { method: "PATCH", body: JSON.stringify(patch) });
+      await load();
+      onChanged();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  async function saveContestTasks(contest: Contest, taskIds: number[]) {
+    setFlash(emptyFlash);
+    try {
+      await api<Task[]>(`/api/contests/${contest.id}/tasks`, { method: "PUT", body: JSON.stringify({ task_ids: taskIds }) });
+      await load();
+      onChanged();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  async function deleteContest(contest: Contest) {
+    if (!window.confirm(t("contest.deleteConfirm", { name: contest.title }))) return;
+    setFlash(emptyFlash);
+    try {
+      await api<void>(`/api/contests/${contest.id}`, { method: "DELETE" });
+      await load();
+      onChanged();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  function toggleFormTask(taskId: number) {
+    setForm((current) => ({
+      ...current,
+      task_ids: current.task_ids.includes(taskId) ? current.task_ids.filter((id) => id !== taskId) : [...current.task_ids, taskId]
+    }));
+  }
+
+  return (
+    <section className="panel">
+      <Header title={t("tab.contests")} subtitle={t("title.contestsCount", { count: contests.length })} />
+      <form className="task-form" onSubmit={createContest}>
+        <fieldset>
+          <legend>{t("contest.sectionBasic")}</legend>
+          <div className="form-grid">
+            <label>{t("table.title")}<input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} required /></label>
+            <label>{t("table.status")}<select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value as ContestStatus })}>{contestStatuses.map((item) => <option key={item} value={item}>{t(`status.${item}`)}</option>)}</select></label>
+            <label className="span-2">{t("table.description")}<textarea className="short" value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} /></label>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>{t("contest.sectionSchedule")}</legend>
+          <div className="form-grid">
+            <label>{t("table.mode")}<select value={form.time_mode} onChange={(event) => setForm({ ...form, time_mode: event.target.value as TimeMode })}><option value="fixed">{t("common.fixed")}</option><option value="individual">{t("common.individual")}</option></select></label>
+            <label>{t("table.starts")}<input type="datetime-local" value={form.starts_at} onChange={(event) => setForm({ ...form, starts_at: event.target.value })} required /></label>
+            <label>{t("table.ends")}<input type="datetime-local" value={form.ends_at} onChange={(event) => setForm({ ...form, ends_at: event.target.value })} required /></label>
+            <label>{t("table.minutes")}<input type="number" value={form.individual_duration_minutes} onChange={(event) => setForm({ ...form, individual_duration_minutes: event.target.value })} /></label>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>{t("contest.sectionTasks")}</legend>
+          <div className="checklist">{tasks.map((task) => (
+            <label key={task.id} className="inline"><input className="check" type="checkbox" checked={form.task_ids.includes(task.id)} onChange={() => toggleFormTask(task.id)} /> #{task.id} {task.title}</label>
+          ))}</div>
+        </fieldset>
+        <button type="submit">{t("common.create")}</button>
+      </form>
+      <FlashMessage flash={flash} />
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th>{t("table.id")}</th><th>{t("table.title")}</th><th>{t("table.status")}</th><th>{t("table.mode")}</th><th>{t("table.starts")}</th><th>{t("table.ends")}</th><th>{t("table.minutes")}</th><th>{t("table.tasks")}</th><th></th></tr></thead>
+          <tbody>{contests.map((contest) => <ContestRow key={contest.id} contest={contest} tasks={tasks} taskIds={contestTaskIds[contest.id] ?? []} onSave={saveContest} onSaveTasks={saveContestTasks} onDelete={deleteContest} />)}</tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+const contestStatuses: ContestStatus[] = ["draft", "scheduled", "running", "finished", "archived"];
+
+function ContestRow({
+  contest,
+  tasks,
+  taskIds,
+  onSave,
+  onSaveTasks,
+  onDelete
+}: {
+  contest: Contest;
+  tasks: Task[];
+  taskIds: number[];
+  onSave: (contest: Contest, patch: Partial<Contest>) => Promise<void>;
+  onSaveTasks: (contest: Contest, taskIds: number[]) => Promise<void>;
+  onDelete: (contest: Contest) => void;
+}) {
+  const { t } = useI18n();
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState({
+    title: contest.title,
+    status: contest.status,
+    time_mode: contest.time_mode,
+    starts_at: toLocalInputValue(contest.starts_at),
+    ends_at: toLocalInputValue(contest.ends_at),
+    individual_duration_minutes: String(contest.individual_duration_minutes ?? ""),
+    description: contest.description,
+    task_ids: taskIds
+  });
+  useEffect(() => setDraft({
+    title: contest.title,
+    status: contest.status,
+    time_mode: contest.time_mode,
+    starts_at: toLocalInputValue(contest.starts_at),
+    ends_at: toLocalInputValue(contest.ends_at),
+    individual_duration_minutes: String(contest.individual_duration_minutes ?? ""),
+    description: contest.description,
+    task_ids: taskIds
+  }), [contest, taskIds]);
+
+  function toggleDraftTask(taskId: number) {
+    setDraft((current) => ({
+      ...current,
+      task_ids: current.task_ids.includes(taskId) ? current.task_ids.filter((id) => id !== taskId) : [...current.task_ids, taskId]
+    }));
+  }
+
+  if (!editing) {
+    return (
+      <tr>
+        <td>{contest.id}</td><td>{contest.title}</td><td>{t(`status.${contest.status}`)}</td><td>{t(`common.${contest.time_mode}`)}</td>
+        <td>{formatDate(contest.starts_at)}</td><td>{formatDate(contest.ends_at)}</td><td>{contest.individual_duration_minutes ?? "-"}</td>
+        <td>{taskIds.length}</td>
+        <td className="row-actions"><button onClick={() => setEditing(true)}>{t("common.edit")}</button><button className="danger" onClick={() => onDelete(contest)}>{t("common.delete")}</button></td>
+      </tr>
+    );
+  }
+
+  return (
+    <>
+      <tr className="editing">
+        <td>{contest.id}</td>
+        <td><input value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} /></td>
+        <td><select value={draft.status} onChange={(event) => setDraft({ ...draft, status: event.target.value as ContestStatus })}>{contestStatuses.map((item) => <option key={item} value={item}>{t(`status.${item}`)}</option>)}</select></td>
+        <td><select value={draft.time_mode} onChange={(event) => setDraft({ ...draft, time_mode: event.target.value as TimeMode })}><option value="fixed">{t("common.fixed")}</option><option value="individual">{t("common.individual")}</option></select></td>
+        <td><input type="datetime-local" value={draft.starts_at} onChange={(event) => setDraft({ ...draft, starts_at: event.target.value })} /></td>
+        <td><input type="datetime-local" value={draft.ends_at} onChange={(event) => setDraft({ ...draft, ends_at: event.target.value })} /></td>
+        <td><input type="number" value={draft.individual_duration_minutes} onChange={(event) => setDraft({ ...draft, individual_duration_minutes: event.target.value })} /></td>
+        <td>{draft.task_ids.length}</td>
+        <td className="row-actions">
+          <button onClick={async () => {
+            await onSave(contest, {
+              title: draft.title,
+              status: draft.status,
+              time_mode: draft.time_mode,
+              starts_at: fromLocalInputValue(draft.starts_at),
+              ends_at: fromLocalInputValue(draft.ends_at),
+              individual_duration_minutes: draft.time_mode === "individual" ? Number(draft.individual_duration_minutes) : null,
+              description: draft.description
+            });
+            await onSaveTasks(contest, draft.task_ids);
+            setEditing(false);
+          }}>{t("common.save")}</button>
+          <button onClick={() => setEditing(false)}>{t("common.cancel")}</button>
+        </td>
+      </tr>
+      <tr className="editing">
+        <td></td>
+        <td colSpan={8}>
+          <div className="nested-edit">
+            <label>{t("table.description")}<textarea className="short" value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} /></label>
+            <label>{t("table.tasks")}
+              <span className="checklist">{tasks.map((task) => (
+                <span key={task.id} className="inline"><input className="check" type="checkbox" checked={draft.task_ids.includes(task.id)} onChange={() => toggleDraftTask(task.id)} /> #{task.id} {task.title}</span>
+              ))}</span>
+            </label>
+          </div>
+        </td>
+      </tr>
+    </>
+  );
+}
+
+function TasksAdmin({ api }: { api: ApiClient }) {
+  const { t } = useI18n();
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [flash, setFlash] = useState<Flash>(emptyFlash);
+  const [previewMode, setPreviewMode] = useState<"edit" | "preview">("edit");
+  const [form, setForm] = useState({
+    title: "",
+    statement: "",
+    input_format: "",
+    output_format: "",
+    samples: "[]",
+    time_limit_ms: "2000",
+    memory_limit_mb: "256",
+    points: "100",
+    partial_scoring: false,
+    test_input: "",
+    test_output: "",
+    test_is_sample: true
+  });
+
+  const load = useCallback(async () => {
+    setTasks(await api<Task[]>("/api/tasks"));
+  }, [api]);
+
+  useEffect(() => { load().catch((error) => setFlash({ kind: "error", text: errorText(error) })); }, [load]);
+
+  async function createTask(event: React.FormEvent) {
+    event.preventDefault();
+    setFlash(emptyFlash);
+    try {
+      const tests = form.test_input || form.test_output ? [{ input_data: form.test_input, output_data: form.test_output, is_sample: form.test_is_sample }] : [];
+      await api<Task>("/api/tasks", {
+        method: "POST",
+        body: JSON.stringify({
+          title: form.title,
+          statement: form.statement,
+          input_format: form.input_format,
+          output_format: form.output_format,
+          samples: JSON.parse(form.samples || "[]"),
+          time_limit_ms: Number(form.time_limit_ms),
+          memory_limit_mb: Number(form.memory_limit_mb),
+          points: Number(form.points),
+          partial_scoring: form.partial_scoring,
+          tests
+        })
+      });
+      setForm({ ...form, title: "", statement: "", input_format: "", output_format: "", samples: "[]", partial_scoring: false, test_input: "", test_output: "" });
+      await load();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  async function saveTask(task: Task, patch: Partial<Task>) {
+    setFlash(emptyFlash);
+    try {
+      await api<Task>(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify(patch) });
+      await load();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  async function deleteTask(task: Task) {
+    if (!window.confirm(t("task.deleteConfirm", { name: task.title }))) return;
+    setFlash(emptyFlash);
+    try {
+      await api<void>(`/api/tasks/${task.id}`, { method: "DELETE" });
+      await load();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  return (
+    <section className="panel">
+      <Header title={t("tab.tasks")} subtitle={t("title.tasksLibrary", { count: tasks.length })} />
+      <form className="task-form" onSubmit={createTask}>
+        <fieldset>
+          <legend>{t("task.sectionBasic")}</legend>
+          <div className="form-grid">
+            <label>{t("table.title")}<input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} required /></label>
+            <label>{t("table.points")}<input type="number" step="0.01" value={form.points} onChange={(event) => setForm({ ...form, points: event.target.value })} /></label>
+            <label>{t("task.timeLimitMs")}<input type="number" value={form.time_limit_ms} onChange={(event) => setForm({ ...form, time_limit_ms: event.target.value })} /></label>
+            <label>{t("task.memoryMb")}<input type="number" value={form.memory_limit_mb} onChange={(event) => setForm({ ...form, memory_limit_mb: event.target.value })} /></label>
+            <label className="inline"><input className="check" type="checkbox" checked={form.partial_scoring} onChange={(event) => setForm({ ...form, partial_scoring: event.target.checked })} /> {t("task.partialScoring")}</label>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>{t("task.sectionStatement")}</legend>
+          <div className="segmented">
+            <button type="button" className={previewMode === "edit" ? "active" : ""} onClick={() => setPreviewMode("edit")}>{t("task.editMarkdown")}</button>
+            <button type="button" className={previewMode === "preview" ? "active" : ""} onClick={() => setPreviewMode("preview")}>{t("task.previewMarkdown")}</button>
+          </div>
+          {previewMode === "edit" ? (
+            <label>{t("task.statement")}<textarea value={form.statement} onChange={(event) => setForm({ ...form, statement: event.target.value })} required /></label>
+          ) : (
+            <MarkdownPreview value={form.statement} />
+          )}
+        </fieldset>
+        <fieldset>
+          <legend>{t("task.sectionFormats")}</legend>
+          <div className="form-grid">
+            <label>{t("task.inputFormat")}<textarea className="short" value={form.input_format} onChange={(event) => setForm({ ...form, input_format: event.target.value })} /></label>
+            <label>{t("task.outputFormat")}<textarea className="short" value={form.output_format} onChange={(event) => setForm({ ...form, output_format: event.target.value })} /></label>
+            <label className="span-2">{t("task.samplesJson")}<textarea className="short code" value={form.samples} onChange={(event) => setForm({ ...form, samples: event.target.value })} /></label>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>{t("task.sectionFirstTest")}</legend>
+          <div className="form-grid">
+            <label>{t("task.firstInput")}<textarea className="short code" value={form.test_input} onChange={(event) => setForm({ ...form, test_input: event.target.value })} /></label>
+            <label>{t("task.firstOutput")}<textarea className="short code" value={form.test_output} onChange={(event) => setForm({ ...form, test_output: event.target.value })} /></label>
+            <label className="inline"><input className="check" type="checkbox" checked={form.test_is_sample} onChange={(event) => setForm({ ...form, test_is_sample: event.target.checked })} /> {t("task.sampleTest")}</label>
+          </div>
+        </fieldset>
+        <button type="submit">{t("common.create")}</button>
+      </form>
+      <FlashMessage flash={flash} />
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th>{t("table.id")}</th><th>{t("table.title")}</th><th>{t("table.limits")}</th><th>{t("table.points")}</th><th>{t("table.tests")}</th><th></th></tr></thead>
+          <tbody>{tasks.map((task) => <TaskRow key={task.id} task={task} onSave={saveTask} onDelete={deleteTask} />)}</tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function TaskRow({ task, onSave, onDelete }: { task: Task; onSave: (task: Task, patch: Partial<Task>) => void; onDelete: (task: Task) => void }) {
+  const { t } = useI18n();
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState({
+    title: task.title,
+    statement: task.statement,
+    input_format: task.input_format,
+    output_format: task.output_format,
+    samples: JSON.stringify(task.samples, null, 2),
+    time_limit_ms: String(task.time_limit_ms),
+    memory_limit_mb: String(task.memory_limit_mb),
+    points: String(task.points),
+    partial_scoring: task.partial_scoring
+  });
+  useEffect(() => setDraft({
+    title: task.title,
+    statement: task.statement,
+    input_format: task.input_format,
+    output_format: task.output_format,
+    samples: JSON.stringify(task.samples, null, 2),
+    time_limit_ms: String(task.time_limit_ms),
+    memory_limit_mb: String(task.memory_limit_mb),
+    points: String(task.points),
+    partial_scoring: task.partial_scoring
+  }), [task]);
+
+  return (
+    <>
+      <tr className={editing ? "editing" : ""}>
+        <td>{task.id}</td>
+        <td>{editing ? <input value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} /> : task.title}</td>
+        <td>{editing ? <><input type="number" value={draft.time_limit_ms} onChange={(event) => setDraft({ ...draft, time_limit_ms: event.target.value })} /><input type="number" value={draft.memory_limit_mb} onChange={(event) => setDraft({ ...draft, memory_limit_mb: event.target.value })} /></> : `${task.time_limit_ms} ms / ${task.memory_limit_mb} MB`}</td>
+        <td>{editing ? <input type="number" step="0.01" value={draft.points} onChange={(event) => setDraft({ ...draft, points: event.target.value })} /> : formatScore(task.points)}</td>
+        <td>{task.test_count}{task.partial_scoring ? ` · ${t("task.partialScoring")}` : ""}</td>
+        <td className="row-actions">
+          {editing ? (
+            <>
+              <button onClick={() => {
+                onSave(task, {
+                  title: draft.title,
+                  statement: draft.statement,
+                  input_format: draft.input_format,
+                  output_format: draft.output_format,
+                  samples: JSON.parse(draft.samples || "[]") as Task["samples"],
+                  time_limit_ms: Number(draft.time_limit_ms),
+                  memory_limit_mb: Number(draft.memory_limit_mb),
+                  points: Number(draft.points),
+                  partial_scoring: draft.partial_scoring
+                });
+                setEditing(false);
+              }}>{t("common.save")}</button>
+              <button onClick={() => setEditing(false)}>{t("common.cancel")}</button>
+            </>
+          ) : (
+            <>
+              <button onClick={() => setEditing(true)}>{t("common.edit")}</button>
+              <button className="danger" onClick={() => onDelete(task)}>{t("common.delete")}</button>
+            </>
+          )}
+        </td>
+      </tr>
+      {editing && (
+        <tr className="editing">
+          <td></td>
+          <td colSpan={5}>
+            <div className="nested-edit">
+              <label>{t("task.statement")}<textarea value={draft.statement} onChange={(event) => setDraft({ ...draft, statement: event.target.value })} /></label>
+              <label>{t("task.inputFormat")}<textarea className="short" value={draft.input_format} onChange={(event) => setDraft({ ...draft, input_format: event.target.value })} /></label>
+              <label>{t("task.outputFormat")}<textarea className="short" value={draft.output_format} onChange={(event) => setDraft({ ...draft, output_format: event.target.value })} /></label>
+              <label>{t("task.samplesJson")}<textarea className="short code" value={draft.samples} onChange={(event) => setDraft({ ...draft, samples: event.target.value })} /></label>
+              <label className="inline"><input className="check" type="checkbox" checked={draft.partial_scoring} onChange={(event) => setDraft({ ...draft, partial_scoring: event.target.checked })} /> {t("task.partialScoring")}</label>
+            </div>
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+function renderInlineMarkdown(text: string): React.ReactNode[] {
+  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g).filter(Boolean);
+  return parts.map((part, index) => {
+    if (part.startsWith("`") && part.endsWith("`")) return <code key={index}>{part.slice(1, -1)}</code>;
+    if (part.startsWith("**") && part.endsWith("**")) return <strong key={index}>{part.slice(2, -2)}</strong>;
+    if (part.startsWith("*") && part.endsWith("*")) return <em key={index}>{part.slice(1, -1)}</em>;
+    return <React.Fragment key={index}>{part}</React.Fragment>;
+  });
+}
+
+function MarkdownPreview({ value }: { value: string }) {
+  const blocks: React.ReactNode[] = [];
+  const lines = value.split(/\r?\n/);
+  let paragraph: string[] = [];
+  let list: string[] = [];
+  let code: string[] | null = null;
+
+  function flushParagraph() {
+    if (paragraph.length) {
+      blocks.push(<p key={blocks.length}>{renderInlineMarkdown(paragraph.join(" "))}</p>);
+      paragraph = [];
+    }
+  }
+
+  function flushList() {
+    if (list.length) {
+      blocks.push(<ul key={blocks.length}>{list.map((item, index) => <li key={index}>{renderInlineMarkdown(item)}</li>)}</ul>);
+      list = [];
+    }
+  }
+
+  for (const line of lines) {
+    if (line.startsWith("```")) {
+      flushParagraph();
+      flushList();
+      if (code === null) {
+        code = [];
+      } else {
+        blocks.push(<pre key={blocks.length}><code>{code.join("\n")}</code></pre>);
+        code = null;
+      }
+      continue;
+    }
+    if (code !== null) {
+      code.push(line);
+      continue;
+    }
+    if (!line.trim()) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+    const heading = /^(#{1,3})\s+(.+)$/.exec(line);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      const level = heading[1].length;
+      const children = renderInlineMarkdown(heading[2]);
+      blocks.push(level === 1 ? <h1 key={blocks.length}>{children}</h1> : level === 2 ? <h2 key={blocks.length}>{children}</h2> : <h3 key={blocks.length}>{children}</h3>);
+      continue;
+    }
+    const bullet = /^\s*[-*]\s+(.+)$/.exec(line);
+    if (bullet) {
+      flushParagraph();
+      list.push(bullet[1]);
+      continue;
+    }
+    flushList();
+    paragraph.push(line.trim());
+  }
+  flushParagraph();
+  flushList();
+  if (code !== null) blocks.push(<pre key={blocks.length}><code>{code.join("\n")}</code></pre>);
+  return <div className="markdown-preview">{blocks.length ? blocks : <p className="muted">Markdown</p>}</div>;
+}
+
+function TestsAdmin({ api }: { api: ApiClient }) {
+  const { t } = useI18n();
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [tests, setTests] = useState<TaskTest[]>([]);
+  const [selectedTaskId, setSelectedTaskId] = useState<number | null>(null);
+  const [archiveReport, setArchiveReport] = useState<TestArchiveImportReport | null>(null);
+  const [flash, setFlash] = useState<Flash>(emptyFlash);
+  const [form, setForm] = useState({ input_data: "", output_data: "", is_sample: false });
+
+  const loadTasks = useCallback(async () => {
+    const next = await api<Task[]>("/api/tasks");
+    setTasks(next);
+    setSelectedTaskId((current) => current && next.some((task) => task.id === current) ? current : next[0]?.id ?? null);
+  }, [api]);
+  const loadTests = useCallback(async (taskId: number | null) => {
+    if (!taskId) {
+      setTests([]);
+      return;
+    }
+    setTests(await api<TaskTest[]>(`/api/tasks/${taskId}/tests`));
+  }, [api]);
+
+  useEffect(() => { loadTasks().catch((error) => setFlash({ kind: "error", text: errorText(error) })); }, [loadTasks]);
+  useEffect(() => { loadTests(selectedTaskId).catch((error) => setFlash({ kind: "error", text: errorText(error) })); }, [loadTests, selectedTaskId]);
+
+  async function createTest(event: React.FormEvent) {
+    event.preventDefault();
+    if (!selectedTaskId) return;
+    setFlash(emptyFlash);
+    try {
+      await api<TaskTest>(`/api/tasks/${selectedTaskId}/tests`, { method: "POST", body: JSON.stringify(form) });
+      setForm({ input_data: "", output_data: "", is_sample: false });
+      await loadTests(selectedTaskId);
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  async function saveTest(test: TaskTest, patch: Partial<TaskTest>) {
+    setFlash(emptyFlash);
+    try {
+      await api<TaskTest>(`/api/tests/${test.id}`, { method: "PATCH", body: JSON.stringify(patch) });
+      await loadTests(selectedTaskId);
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  async function deleteTest(test: TaskTest) {
+    if (!window.confirm(t("test.deleteConfirm", { id: test.id }))) return;
+    setFlash(emptyFlash);
+    try {
+      await api<void>(`/api/tests/${test.id}`, { method: "DELETE" });
+      await loadTests(selectedTaskId);
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  async function importArchive(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file || !selectedTaskId) return;
+    setFlash(emptyFlash);
+    setArchiveReport(null);
+    const body = new FormData();
+    body.append("file", file);
+    try {
+      const report = await api<TestArchiveImportReport>(`/api/tasks/${selectedTaskId}/tests/import-archive`, { method: "POST", body });
+      setArchiveReport(report);
+      await loadTests(selectedTaskId);
+      await loadTasks();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    } finally {
+      event.target.value = "";
+    }
+  }
+
+  return (
+    <section className="panel">
+      <Header title={t("tab.tests")} subtitle={t("title.testsInTask", { count: tests.length })} />
+      <div className="form-grid">
+        <label>{t("table.task")}<select value={selectedTaskId ?? ""} onChange={(event) => setSelectedTaskId(Number(event.target.value) || null)}>{tasks.map((task) => <option key={task.id} value={task.id}>{task.id}: {task.title}</option>)}</select></label>
+        <label>{t("test.archiveUpload")}<input type="file" accept=".zip" disabled={!selectedTaskId} onChange={importArchive} /></label>
+      </div>
+      <form className="form-grid" onSubmit={createTest}>
+        <label>{t("table.input")}<textarea className="short code" value={form.input_data} onChange={(event) => setForm({ ...form, input_data: event.target.value })} /></label>
+        <label>{t("table.output")}<textarea className="short code" value={form.output_data} onChange={(event) => setForm({ ...form, output_data: event.target.value })} /></label>
+        <label className="inline"><input className="check" type="checkbox" checked={form.is_sample} onChange={(event) => setForm({ ...form, is_sample: event.target.checked })} /> {t("task.sample")}</label>
+        <button type="submit" disabled={!selectedTaskId}>{t("common.create")}</button>
+      </form>
+      <FlashMessage flash={flash} />
+      {archiveReport && (
+        <div className="report">
+          <div className="stat"><strong>{archiveReport.created}</strong><span>{t("common.created")}</span></div>
+          <div className="stat"><strong>{archiveReport.skipped.length}</strong><span>{t("common.skipped")}</span></div>
+          <div className="stat"><strong>{archiveReport.errors.length}</strong><span>{t("common.errors")}</span></div>
+          {(archiveReport.skipped.length > 0 || archiveReport.errors.length > 0) && (
+            <table>
+              <tbody>
+                {archiveReport.skipped.map((item, index) => <tr key={`s-${index}`}><td><span className="pill warn">{t("common.skipped")}</span></td><td>{item}</td></tr>)}
+                {archiveReport.errors.map((item, index) => <tr key={`e-${index}`}><td><span className="pill warn">{t("common.errors")}</span></td><td>{item}</td></tr>)}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th>{t("table.id")}</th><th>{t("table.sample")}</th><th>{t("table.input")}</th><th>{t("table.output")}</th><th></th></tr></thead>
+          <tbody>{tests.map((test) => <TestRow key={test.id} test={test} onSave={saveTest} onDelete={deleteTest} />)}</tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function TestRow({ test, onSave, onDelete }: { test: TaskTest; onSave: (test: TaskTest, patch: Partial<TaskTest>) => void; onDelete: (test: TaskTest) => void }) {
+  const { t } = useI18n();
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(test);
+  useEffect(() => setDraft(test), [test]);
+
+  return (
+    <tr className={editing ? "editing" : ""}>
+      <td>{test.id}</td>
+      <td>{editing ? <input className="check" type="checkbox" checked={draft.is_sample} onChange={(event) => setDraft({ ...draft, is_sample: event.target.checked })} /> : test.is_sample ? t("common.yes") : t("common.no")}</td>
+      <td>{editing ? <textarea className="short code" value={draft.input_data} onChange={(event) => setDraft({ ...draft, input_data: event.target.value })} /> : <pre>{test.input_data}</pre>}</td>
+      <td>{editing ? <textarea className="short code" value={draft.output_data} onChange={(event) => setDraft({ ...draft, output_data: event.target.value })} /> : <pre>{test.output_data}</pre>}</td>
+      <td className="row-actions">
+        {editing ? (
+          <>
+            <button onClick={() => { onSave(test, { input_data: draft.input_data, output_data: draft.output_data, is_sample: draft.is_sample }); setEditing(false); }}>{t("common.save")}</button>
+            <button onClick={() => setEditing(false)}>{t("common.cancel")}</button>
+          </>
+        ) : (
+          <>
+            <button onClick={() => setEditing(true)}>{t("common.edit")}</button>
+            <button className="danger" onClick={() => onDelete(test)}>{t("common.delete")}</button>
+          </>
+        )}
+      </td>
+    </tr>
+  );
+}
+
+function SubmissionsAdmin({ api }: { api: ApiClient }) {
+  const { t } = useI18n();
+  const [contests, setContests] = useState<Contest[]>([]);
+  const [submissions, setSubmissions] = useState<Submission[]>([]);
+  const [selectedContestId, setSelectedContestId] = useState<number | "all">("all");
+  const [selectedSubmissionId, setSelectedSubmissionId] = useState<number | null>(null);
+  const [detail, setDetail] = useState<SubmissionDetail | null>(null);
+  const [flash, setFlash] = useState<Flash>(emptyFlash);
+
+  const loadContests = useCallback(() => api<Contest[]>("/api/contests").then(setContests), [api]);
+  const loadSubmissions = useCallback(async () => {
+    const query = selectedContestId === "all" ? "" : `?contest_id=${selectedContestId}`;
+    setSubmissions(await api<Submission[]>(`/api/submissions${query}`));
+  }, [api, selectedContestId]);
+
+  useEffect(() => { loadContests().catch((error) => setFlash({ kind: "error", text: errorText(error) })); }, [loadContests]);
+  useEffect(() => {
+    loadSubmissions().catch((error) => setFlash({ kind: "error", text: errorText(error) }));
+    const interval = window.setInterval(() => loadSubmissions().catch(console.error), 2000);
+    return () => window.clearInterval(interval);
+  }, [loadSubmissions]);
+  useEffect(() => {
+    if (!selectedSubmissionId) {
+      setDetail(null);
+      return;
+    }
+    api<SubmissionDetail>(`/api/admin/submissions/${selectedSubmissionId}`)
+      .then(setDetail)
+      .catch((error) => setFlash({ kind: "error", text: errorText(error) }));
+  }, [api, selectedSubmissionId, submissions]);
+
+  return (
+    <section className="panel">
+      <Header title={t("tab.submissions")} subtitle={t("title.submissionsPolling")} />
+      <label className="selector">
+        {t("table.contest")}
+        <select value={selectedContestId} onChange={(event) => setSelectedContestId(event.target.value === "all" ? "all" : Number(event.target.value))}>
+          <option value="all">{t("common.allContests")}</option>
+          {contests.map((contest) => <option key={contest.id} value={contest.id}>{contest.id}: {contest.title}</option>)}
+        </select>
+      </label>
+      <FlashMessage flash={flash} />
+      <div className="split">
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>{t("table.id")}</th><th>{t("table.contest")}</th><th>{t("table.task")}</th><th>{t("table.user")}</th><th>{t("table.lang")}</th><th>{t("table.verdict")}</th><th>{t("table.score")}</th><th>{t("table.created")}</th></tr></thead>
+            <tbody>
+              {submissions.map((submission) => (
+                <tr key={submission.id} className={submission.id === selectedSubmissionId ? "selected" : ""} onClick={() => setSelectedSubmissionId(submission.id)}>
+                  <td>#{submission.id}</td><td>{submission.contest_id}</td><td>{submission.task_id}</td><td>{submission.user_id}</td><td>{submission.language}</td>
+                  <td><span className={verdictClass(submission.verdict)}>{t(`verdict.${submission.verdict}`)}</span></td><td>{formatScore(submission.score)}</td><td>{formatDate(submission.created_at)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <SubmissionDetailView detail={detail} />
+      </div>
+    </section>
+  );
+}

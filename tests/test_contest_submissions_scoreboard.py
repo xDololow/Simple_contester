@@ -1,0 +1,291 @@
+from datetime import datetime, timedelta
+from typing import Any, Callable
+
+from sqlalchemy import select
+
+from app.database import SessionLocal
+from app.models import ParticipantContest, Submission, SubmissionVerdict, TaskTest, TestResult
+from conftest import APIClient
+
+
+def test_individual_deadline_blocks_submission_without_sleeping(
+    client: APIClient,
+    participant: dict,
+    participant_headers: dict[str, str],
+    demo_contest: dict,
+    demo_task: dict,
+) -> None:
+    start = client.get(f"/api/contests/{demo_contest['id']}/start", headers=participant_headers)
+    assert start.status_code == 200, start.text
+
+    with SessionLocal() as db:
+        participant_window = db.scalar(
+            select(ParticipantContest).where(
+                ParticipantContest.contest_id == demo_contest["id"],
+                ParticipantContest.user_id == participant["id"],
+            )
+        )
+        assert participant_window is not None
+        participant_window.deadline_at = datetime.utcnow() - timedelta(minutes=1)
+        db.commit()
+
+    response = client.post(
+        f"/api/contests/{demo_contest['id']}/tasks/{demo_task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(sum(map(int, input().split())))"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Individual contest deadline has passed"
+
+
+def test_contest_individual_duration_must_fit_available_window(client: APIClient, admin_headers: dict[str, str]) -> None:
+    now = datetime.utcnow()
+    create_response = client.post(
+        "/api/contests",
+        headers=admin_headers,
+        json={
+            "title": "Too Short",
+            "description": "",
+            "status": "scheduled",
+            "time_mode": "individual",
+            "starts_at": now.isoformat(),
+            "ends_at": (now + timedelta(minutes=30)).isoformat(),
+            "individual_duration_minutes": 31,
+        },
+    )
+
+    assert create_response.status_code == 400
+    assert create_response.json()["detail"] == "individual_duration_minutes must fit contest window"
+
+    ok_response = client.post(
+        "/api/contests",
+        headers=admin_headers,
+        json={
+            "title": "Window",
+            "description": "",
+            "status": "scheduled",
+            "time_mode": "individual",
+            "starts_at": now.isoformat(),
+            "ends_at": (now + timedelta(minutes=30)).isoformat(),
+            "individual_duration_minutes": 30,
+        },
+    )
+    assert ok_response.status_code == 200, ok_response.text
+
+    update_response = client.patch(
+        f"/api/contests/{ok_response.json()['id']}",
+        headers=admin_headers,
+        json={"individual_duration_minutes": 31},
+    )
+
+    assert update_response.status_code == 400
+    assert update_response.json()["detail"] == "individual_duration_minutes must fit contest window"
+
+
+def test_participant_task_detail_hides_test_inputs_and_outputs(
+    client: APIClient,
+    participant_headers: dict[str, str],
+    admin_headers: dict[str, str],
+    demo_task: dict,
+) -> None:
+    participant_response = client.get(f"/api/tasks/{demo_task['id']}", headers=participant_headers)
+    assert participant_response.status_code == 200, participant_response.text
+    participant_task = participant_response.json()
+
+    assert participant_task["test_count"] == 2
+    assert participant_task["tests"] is None
+    assert "input_data" not in participant_task
+    assert "output_data" not in participant_task
+
+    participant_tests = client.get(f"/api/tasks/{demo_task['id']}/tests", headers=participant_headers)
+    assert participant_tests.status_code == 403
+
+    admin_response = client.get(f"/api/tasks/{demo_task['id']}", headers=admin_headers)
+    assert admin_response.status_code == 200, admin_response.text
+    assert admin_response.json()["tests"] == [
+        {"id": admin_response.json()["tests"][0]["id"], "is_sample": True},
+        {"id": admin_response.json()["tests"][1]["id"], "is_sample": False},
+    ]
+
+
+def test_participant_cannot_see_foreign_submission_or_hidden_results(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    create_user: Callable[..., dict[str, Any]],
+    auth_headers: Callable[[str, str], dict[str, str]],
+    demo_contest: dict,
+    demo_task: dict,
+) -> None:
+    owner = create_user(username="owner", password="owner-pass")
+    stranger = create_user(username="stranger", password="stranger-pass")
+    owner_headers = auth_headers(owner["username"], "owner-pass")
+    stranger_headers = auth_headers(stranger["username"], "stranger-pass")
+
+    created = client.post(
+        f"/api/contests/{demo_contest['id']}/tasks/{demo_task['id']}/submissions",
+        headers=owner_headers,
+        json={"language": "python", "source_code": "print(42)"},
+    )
+    assert created.status_code == 200, created.text
+    submission_id = created.json()["id"]
+
+    with SessionLocal() as db:
+        stored_submission = db.get(Submission, submission_id)
+        assert stored_submission is not None
+        task_test_id = db.scalar(select(TaskTest.id).where(TaskTest.task_id == demo_task["id"]))
+        assert task_test_id is not None
+        db.add(
+            TestResult(
+                submission_id=submission_id,
+                task_test_id=task_test_id,
+                verdict=SubmissionVerdict.wrong_answer,
+                output="hidden output",
+                error="hidden error",
+            )
+        )
+        db.commit()
+
+    owner_detail = client.get(f"/api/submissions/{submission_id}", headers=owner_headers)
+    assert owner_detail.status_code == 200
+    assert "source_code" not in owner_detail.json()
+    assert "results" not in owner_detail.json()
+    assert "hidden output" not in owner_detail.text
+
+    stranger_detail = client.get(f"/api/submissions/{submission_id}", headers=stranger_headers)
+    assert stranger_detail.status_code == 403
+
+    stranger_list = client.get(f"/api/submissions?contest_id={demo_contest['id']}", headers=stranger_headers)
+    assert stranger_list.status_code == 200
+    assert all(row["user_id"] == stranger["id"] for row in stranger_list.json())
+    assert submission_id not in [row["id"] for row in stranger_list.json()]
+
+    admin_detail = client.get(f"/api/admin/submissions/{submission_id}", headers=admin_headers)
+    assert admin_detail.status_code == 200, admin_detail.text
+    assert admin_detail.json()["source_code"] == "print(42)"
+    assert admin_detail.json()["results"][0]["output"] == "hidden output"
+
+
+def test_admin_can_assign_teams_to_contest(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant: dict,
+    demo_contest: dict,
+) -> None:
+    team = client.post(
+        "/api/teams",
+        headers=admin_headers,
+        json={"name": "Team One", "user_ids": [participant["id"]]},
+    )
+    assert team.status_code == 200, team.text
+
+    assigned = client.put(
+        f"/api/contests/{demo_contest['id']}/teams",
+        headers=admin_headers,
+        json={"team_ids": [team.json()["id"]]},
+    )
+    assert assigned.status_code == 200, assigned.text
+    assert assigned.json()[0]["id"] == team.json()["id"]
+    assert assigned.json()[0]["name"] == "Team One"
+    assert assigned.json()[0]["member_ids"] == [participant["id"]]
+
+    listed = client.get(f"/api/contests/{demo_contest['id']}/teams", headers=admin_headers)
+    assert listed.status_code == 200, listed.text
+    assert listed.json()[0]["id"] == team.json()["id"]
+    assert listed.json()[0]["name"] == "Team One"
+    assert listed.json()[0]["member_ids"] == [participant["id"]]
+
+    rejected = client.put(
+        f"/api/contests/{demo_contest['id']}/teams",
+        headers=admin_headers,
+        json={"team_ids": [9999]},
+    )
+    assert rejected.status_code == 400
+    assert rejected.json()["detail"] == "Unknown team ids: [9999]"
+
+
+def test_submission_lifecycle_and_scoreboard_after_accepted_submission(
+    client: APIClient,
+    participant: dict,
+    participant_headers: dict[str, str],
+    demo_contest: dict,
+    demo_task: dict,
+) -> None:
+    created = client.post(
+        f"/api/contests/{demo_contest['id']}/tasks/{demo_task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(sum(map(int, input().split())))"},
+    )
+    assert created.status_code == 200, created.text
+    submission = created.json()
+    assert submission["verdict"] == "Queued"
+
+    listed = client.get("/api/submissions", headers=participant_headers)
+    assert listed.status_code == 200
+    assert [row["id"] for row in listed.json()] == [submission["id"]]
+
+    with SessionLocal() as db:
+        stored_submission = db.get(Submission, submission["id"])
+        assert stored_submission is not None
+        stored_submission.verdict = SubmissionVerdict.accepted
+        stored_submission.score = demo_task["points"]
+        stored_submission.finished_at = datetime.utcnow()
+        db.commit()
+
+    scoreboard = client.get(f"/api/contests/{demo_contest['id']}/scoreboard", headers=participant_headers)
+    assert scoreboard.status_code == 200, scoreboard.text
+    row = next(item for item in scoreboard.json() if item["user_id"] == participant["id"])
+
+    assert row["username"] == participant["username"]
+    assert row["score"] == demo_task["points"]
+    assert row["penalty"] >= 0
+    assert row["cells"] == [
+        {
+            "task_id": demo_task["id"],
+            "attempts": 1,
+            "solved": True,
+            "solved_at_minutes": row["cells"][0]["solved_at_minutes"],
+        }
+    ]
+
+
+def test_scoreboard_uses_best_partial_submission_score(
+    client: APIClient,
+    participant: dict,
+    participant_headers: dict[str, str],
+    demo_contest: dict,
+    demo_task: dict,
+) -> None:
+    first = client.post(
+        f"/api/contests/{demo_contest['id']}/tasks/{demo_task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(1)"},
+    )
+    second = client.post(
+        f"/api/contests/{demo_contest['id']}/tasks/{demo_task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(2)"},
+    )
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+
+    with SessionLocal() as db:
+        first_submission = db.get(Submission, first.json()["id"])
+        second_submission = db.get(Submission, second.json()["id"])
+        assert first_submission is not None
+        assert second_submission is not None
+        first_submission.verdict = SubmissionVerdict.wrong_answer
+        first_submission.score = 25.0
+        first_submission.finished_at = datetime.utcnow()
+        second_submission.verdict = SubmissionVerdict.wrong_answer
+        second_submission.score = 50.0
+        second_submission.finished_at = datetime.utcnow()
+        db.commit()
+
+    scoreboard = client.get(f"/api/contests/{demo_contest['id']}/scoreboard", headers=participant_headers)
+    assert scoreboard.status_code == 200, scoreboard.text
+    row = next(item for item in scoreboard.json() if item["user_id"] == participant["id"])
+
+    assert row["score"] == 50.0
+    assert row["cells"][0]["attempts"] == 2
+    assert row["cells"][0]["solved"] is False
