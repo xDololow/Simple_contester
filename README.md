@@ -253,13 +253,13 @@ Start the stack first:
 docker compose up --build -d
 ```
 
-Then run the demo script. It logs in as admin, creates a participant, creates a running contest, creates an `A + B` task, logs in as the participant, and submits a Python solution.
+Then run the demo script. It logs in as admin, creates two participants, creates a team, creates a private individual contest with assigned participants, creates a private team contest with an assigned team, adds sample tasks, and submits Python/JavaScript solutions.
 
 ```bash
 bash scripts/demo.sh
 ```
 
-The script prints the created IDs and a `curl` command to inspect the submission. A judger should move the submission from `Queued` to `Accepted`.
+The script prints the created IDs and `curl` commands for both scoreboards. A judger should move the submissions from `Queued` to final verdicts.
 
 Equivalent curl workflow:
 
