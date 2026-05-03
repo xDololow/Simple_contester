@@ -336,6 +336,62 @@ p {
   gap: 8px;
 }
 
+.access-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.search-picker {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.selected-chips {
+  min-height: 30px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.chip {
+  padding: 4px 8px;
+  border-color: #b8d3e8;
+  background: #eaf4fb;
+  color: #1f5f8d;
+  font-size: 12px;
+}
+
+.picker-options {
+  max-height: 170px;
+  overflow: auto;
+  border: 1px solid #d7e0e5;
+  border-radius: 6px;
+  background: #fbfcfd;
+}
+
+.picker-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border-bottom: 1px solid #edf1f3;
+}
+
+.picker-option:last-child {
+  border-bottom: 0;
+}
+
+.picker-option small {
+  color: #64737e;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .segmented {
   display: inline-flex;
   width: fit-content;
@@ -692,6 +748,7 @@ pre,
 @media (max-width: 1100px) {
   .form-grid,
   .form-grid.wide,
+  .access-grid,
   .contest-grid,
   .contest-workspace,
   .split {

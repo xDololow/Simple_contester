@@ -3,7 +3,7 @@ import { API_BASE } from "../../api/client";
 import { FlashMessage, Header, SubmissionDetailView } from "../../components/shared";
 import { useI18n } from "../../i18n";
 import type { ApiClient, Contest, ContestStatus, Flash, ImportReport, PackageImportReport, ParticipationMode, Role, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
-import { emptyFlash, errorText, formatDate, formatScore, fromLocalInputValue, joinIds, parseIds, toLocalInputValue, verdictClass } from "../../utils/format";
+import { emptyFlash, errorText, formatDate, formatScore, fromLocalInputValue, toLocalInputValue, verdictClass } from "../../utils/format";
 
 export function AdminDashboard({ api, token, reloadContests }: { api: ApiClient; token: string; reloadContests: () => void }) {
   const { t } = useI18n();
@@ -195,12 +195,95 @@ function ImportUsersAdmin({ token }: { token: string }) {
   );
 }
 
+type PickerItem = {
+  id: number;
+  label: string;
+  meta?: string;
+};
+
+function SearchPicker({
+  label,
+  items,
+  selectedIds,
+  onChange,
+  placeholder,
+  emptyText
+}: {
+  label: string;
+  items: PickerItem[];
+  selectedIds: number[];
+  onChange: (ids: number[]) => void;
+  placeholder: string;
+  emptyText: string;
+}) {
+  const [query, setQuery] = useState("");
+  const selected = new Set(selectedIds);
+  const normalizedQuery = query.trim().toLowerCase();
+  const selectedItems = selectedIds.map((id) => items.find((item) => item.id === id)).filter(Boolean) as PickerItem[];
+  const filteredItems = items
+    .filter((item) => {
+      if (!normalizedQuery) return true;
+      return `${item.id} ${item.label} ${item.meta ?? ""}`.toLowerCase().includes(normalizedQuery);
+    })
+    .slice(0, 20);
+
+  function toggle(id: number) {
+    onChange(selected.has(id) ? selectedIds.filter((current) => current !== id) : [...selectedIds, id]);
+  }
+
+  return (
+    <div className="search-picker">
+      <label>{label}<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={placeholder} /></label>
+      <div className="selected-chips">
+        {selectedItems.length ? selectedItems.map((item) => (
+          <button key={item.id} type="button" className="chip" onClick={() => toggle(item.id)}>
+            {item.id}:{item.label} ×
+          </button>
+        )) : <span className="muted">{emptyText}</span>}
+      </div>
+      <div className="picker-options">
+        {filteredItems.length ? filteredItems.map((item) => (
+          <label key={item.id} className="picker-option">
+            <input className="check" type="checkbox" checked={selected.has(item.id)} onChange={() => toggle(item.id)} />
+            <span>{item.id}:{item.label}</span>
+            {item.meta && <small>{item.meta}</small>}
+          </label>
+        )) : <span className="muted">{emptyText}</span>}
+      </div>
+    </div>
+  );
+}
+
+function userPickerItems(users: User[]): PickerItem[] {
+  return users.map((user) => ({ id: user.id, label: user.username, meta: user.display_name }));
+}
+
+function teamPickerItems(teams: Team[]): PickerItem[] {
+  return teams.map((team) => ({ id: team.id, label: team.name, meta: `${team.member_ids.length}` }));
+}
+
+function formatUserIds(ids: number[], users: User[]) {
+  return ids
+    .map((id) => users.find((user) => user.id === id))
+    .filter(Boolean)
+    .map((user) => `${user?.id}:${user?.username}`)
+    .join(", ");
+}
+
+function formatTeamIds(ids: number[], teams: Team[]) {
+  return ids
+    .map((id) => teams.find((team) => team.id === id))
+    .filter(Boolean)
+    .map((team) => `${team?.id}:${team?.name}`)
+    .join(", ");
+}
+
 function TeamsAdmin({ api }: { api: ApiClient }) {
   const { t } = useI18n();
   const [teams, setTeams] = useState<Team[]>([]);
   const [users, setUsers] = useState<User[]>([]);
   const [flash, setFlash] = useState<Flash>(emptyFlash);
-  const [form, setForm] = useState({ name: "", user_ids: "" });
+  const [form, setForm] = useState({ name: "", user_ids: [] as number[] });
 
   const load = useCallback(async () => {
     const [nextTeams, nextUsers] = await Promise.all([api<Team[]>("/api/teams"), api<User[]>("/api/users")]);
@@ -214,8 +297,8 @@ function TeamsAdmin({ api }: { api: ApiClient }) {
     event.preventDefault();
     setFlash(emptyFlash);
     try {
-      await api<Team>("/api/teams", { method: "POST", body: JSON.stringify({ name: form.name, user_ids: parseIds(form.user_ids) }) });
-      setForm({ name: "", user_ids: "" });
+      await api<Team>("/api/teams", { method: "POST", body: JSON.stringify({ name: form.name, user_ids: form.user_ids }) });
+      setForm({ name: "", user_ids: [] });
       await load();
     } catch (error) {
       setFlash({ kind: "error", text: errorText(error) });
@@ -248,37 +331,38 @@ function TeamsAdmin({ api }: { api: ApiClient }) {
       <Header title={t("tab.teams")} subtitle={t("title.teamsCount", { count: teams.length })} />
       <form className="form-grid" onSubmit={createTeam}>
         <label>{t("table.name")}<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required /></label>
-        <label>{t("team.memberIds")}<input value={form.user_ids} onChange={(event) => setForm({ ...form, user_ids: event.target.value })} placeholder="1, 2, 3" /></label>
+        <div className="span-2">
+          <SearchPicker label={t("team.members")} items={userPickerItems(users.filter((user) => user.role === "participant"))} selectedIds={form.user_ids} onChange={(user_ids) => setForm({ ...form, user_ids })} placeholder={t("team.searchUsers")} emptyText={t("common.none")} />
+        </div>
         <button type="submit">{t("common.create")}</button>
       </form>
-      <p className="muted">{t("team.users", { users: users.map((user) => `${user.id}:${user.username}`).join(" · ") || t("common.none") })}</p>
       <FlashMessage flash={flash} />
       <div className="table-wrap">
         <table>
           <thead><tr><th>{t("table.id")}</th><th>{t("table.name")}</th><th>{t("table.members")}</th><th>{t("table.created")}</th><th></th></tr></thead>
-          <tbody>{teams.map((team) => <TeamRow key={team.id} team={team} onSave={saveTeam} onDelete={deleteTeam} />)}</tbody>
+          <tbody>{teams.map((team) => <TeamRow key={team.id} team={team} users={users.filter((user) => user.role === "participant")} onSave={saveTeam} onDelete={deleteTeam} />)}</tbody>
         </table>
       </div>
     </section>
   );
 }
 
-function TeamRow({ team, onSave, onDelete }: { team: Team; onSave: (team: Team, patch: { name: string; user_ids: number[] }) => void; onDelete: (team: Team) => void }) {
+function TeamRow({ team, users, onSave, onDelete }: { team: Team; users: User[]; onSave: (team: Team, patch: { name: string; user_ids: number[] }) => void; onDelete: (team: Team) => void }) {
   const { t } = useI18n();
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState({ name: team.name, user_ids: joinIds(team.member_ids) });
-  useEffect(() => setDraft({ name: team.name, user_ids: joinIds(team.member_ids) }), [team]);
+  const [draft, setDraft] = useState({ name: team.name, user_ids: team.member_ids });
+  useEffect(() => setDraft({ name: team.name, user_ids: team.member_ids }), [team]);
 
   return (
     <tr className={editing ? "editing" : ""}>
       <td>{team.id}</td>
       <td>{editing ? <input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} /> : team.name}</td>
-      <td>{editing ? <input value={draft.user_ids} onChange={(event) => setDraft({ ...draft, user_ids: event.target.value })} /> : joinIds(team.member_ids) || "-"}</td>
+      <td>{editing ? <SearchPicker label={t("team.members")} items={userPickerItems(users)} selectedIds={draft.user_ids} onChange={(user_ids) => setDraft({ ...draft, user_ids })} placeholder={t("team.searchUsers")} emptyText={t("common.none")} /> : formatUserIds(team.member_ids, users) || "-"}</td>
       <td>{formatDate(team.created_at)}</td>
       <td className="row-actions">
         {editing ? (
           <>
-            <button onClick={() => { onSave(team, { name: draft.name, user_ids: parseIds(draft.user_ids) }); setEditing(false); }}>{t("common.save")}</button>
+            <button onClick={() => { onSave(team, { name: draft.name, user_ids: draft.user_ids }); setEditing(false); }}>{t("common.save")}</button>
             <button onClick={() => setEditing(false)}>{t("common.cancel")}</button>
           </>
         ) : (
@@ -315,8 +399,8 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
     ends_at: toLocalInputValue(later.toISOString()),
     individual_duration_minutes: "180",
     task_ids: [] as number[],
-    participant_ids: "",
-    team_ids: ""
+    participant_ids: [] as number[],
+    team_ids: [] as number[]
   });
 
   const load = useCallback(async () => {
@@ -368,15 +452,15 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
       if (form.task_ids.length) {
         await api<Task[]>(`/api/contests/${contest.id}/tasks`, { method: "PUT", body: JSON.stringify({ task_ids: form.task_ids }) });
       }
-      const participantIds = parseIds(form.participant_ids);
+      const participantIds = form.participant_ids;
       if (participantIds.length) {
         await api<User[]>(`/api/contests/${contest.id}/participants`, { method: "PUT", body: JSON.stringify({ user_ids: participantIds }) });
       }
-      const teamIds = parseIds(form.team_ids);
+      const teamIds = form.team_ids;
       if (teamIds.length) {
         await api<Team[]>(`/api/contests/${contest.id}/teams`, { method: "PUT", body: JSON.stringify({ team_ids: teamIds }) });
       }
-      setForm({ ...form, title: "", description: "", task_ids: [], participant_ids: "", team_ids: "" });
+      setForm({ ...form, title: "", description: "", task_ids: [], participant_ids: [], team_ids: [] });
       await load();
       onChanged();
     } catch (error) {
@@ -457,7 +541,6 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
             <label>{t("table.title")}<input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} required /></label>
             <label>{t("table.status")}<select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value as ContestStatus })}>{contestStatuses.map((item) => <option key={item} value={item}>{t(`status.${item}`)}</option>)}</select></label>
             <label>{t("contest.participationMode")}<select value={form.participation_mode} onChange={(event) => setForm({ ...form, participation_mode: event.target.value as ParticipationMode })}><option value="individual">{t("common.individual")}</option><option value="team">{t("common.team")}</option></select></label>
-            <label className="inline"><input className="check" type="checkbox" checked={form.is_public} onChange={(event) => setForm({ ...form, is_public: event.target.checked })} /> {t("contest.public")}</label>
             <label className="span-2">{t("table.description")}<textarea className="short" value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} /></label>
           </div>
         </fieldset>
@@ -478,10 +561,11 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
         </fieldset>
         <fieldset>
           <legend>{t("contest.sectionAccess")}</legend>
-          <label>{t("contest.participantIds")}<input value={form.participant_ids} onChange={(event) => setForm({ ...form, participant_ids: event.target.value })} placeholder="1, 2, 3" /></label>
-          <label>{t("contest.teamIds")}<input value={form.team_ids} onChange={(event) => setForm({ ...form, team_ids: event.target.value })} placeholder="1, 2, 3" /></label>
-          <p className="muted">{t("contest.participantsAvailable", { users: users.map((user) => `${user.id}:${user.username}`).join(" · ") || t("common.none") })}</p>
-          <p className="muted">{t("contest.teamsAvailable", { teams: teams.map((team) => `${team.id}:${team.name}`).join(" · ") || t("common.none") })}</p>
+          <label className="inline"><input className="check" type="checkbox" checked={form.is_public} onChange={(event) => setForm({ ...form, is_public: event.target.checked })} /> {t("contest.publicAccess")}</label>
+          <div className="access-grid">
+            <SearchPicker label={t("contest.allowedParticipants")} items={userPickerItems(users)} selectedIds={form.participant_ids} onChange={(participant_ids) => setForm({ ...form, participant_ids })} placeholder={t("contest.searchParticipants")} emptyText={t("common.none")} />
+            <SearchPicker label={t("contest.allowedTeams")} items={teamPickerItems(teams)} selectedIds={form.team_ids} onChange={(team_ids) => setForm({ ...form, team_ids })} placeholder={t("contest.searchTeams")} emptyText={t("common.none")} />
+          </div>
         </fieldset>
         <button type="submit">{t("common.create")}</button>
       </form>
@@ -538,8 +622,8 @@ function ContestRow({
     individual_duration_minutes: String(contest.individual_duration_minutes ?? ""),
     description: contest.description,
     task_ids: taskIds,
-    participant_ids: joinIds(participantIds),
-    team_ids: joinIds(teamIds)
+    participant_ids: participantIds,
+    team_ids: teamIds
   });
   useEffect(() => setDraft({
     title: contest.title,
@@ -552,8 +636,8 @@ function ContestRow({
     individual_duration_minutes: String(contest.individual_duration_minutes ?? ""),
     description: contest.description,
     task_ids: taskIds,
-    participant_ids: joinIds(participantIds),
-    team_ids: joinIds(teamIds)
+    participant_ids: participantIds,
+    team_ids: teamIds
   }), [contest, taskIds, participantIds, teamIds]);
 
   function toggleDraftTask(taskId: number) {
@@ -564,16 +648,8 @@ function ContestRow({
   }
 
   if (!editing) {
-    const participantNames = participantIds
-      .map((id) => users.find((user) => user.id === id))
-      .filter(Boolean)
-      .map((user) => `${user?.id}:${user?.username}`)
-      .join(", ");
-    const teamNames = teamIds
-      .map((id) => teams.find((team) => team.id === id))
-      .filter(Boolean)
-      .map((team) => `${team?.id}:${team?.name}`)
-      .join(", ");
+    const participantNames = formatUserIds(participantIds, users);
+    const teamNames = formatTeamIds(teamIds, teams);
     return (
       <tr>
         <td>{contest.id}</td><td>{contest.title}</td><td>{t(`status.${contest.status}`)}</td><td>{contest.is_public ? t("contest.public") : t("contest.private")}</td><td>{t(`common.${contest.participation_mode}`)}</td><td>{t(`common.${contest.time_mode}`)}</td>
@@ -597,8 +673,8 @@ function ContestRow({
         <td><input type="datetime-local" value={draft.ends_at} onChange={(event) => setDraft({ ...draft, ends_at: event.target.value })} /></td>
         <td><input type="number" value={draft.individual_duration_minutes} onChange={(event) => setDraft({ ...draft, individual_duration_minutes: event.target.value })} /></td>
         <td>{draft.task_ids.length}</td>
-        <td><input value={draft.participant_ids} onChange={(event) => setDraft({ ...draft, participant_ids: event.target.value })} placeholder="1, 2, 3" /></td>
-        <td><input value={draft.team_ids} onChange={(event) => setDraft({ ...draft, team_ids: event.target.value })} placeholder="1, 2, 3" /></td>
+        <td>{draft.participant_ids.length}</td>
+        <td>{draft.team_ids.length}</td>
         <td className="row-actions">
           <button onClick={async () => {
             await onSave(contest, {
@@ -613,8 +689,8 @@ function ContestRow({
               description: draft.description
             });
             await onSaveTasks(contest, draft.task_ids);
-            await onSaveParticipants(contest, parseIds(draft.participant_ids));
-            await onSaveTeams(contest, parseIds(draft.team_ids));
+            await onSaveParticipants(contest, draft.participant_ids);
+            await onSaveTeams(contest, draft.team_ids);
             setEditing(false);
           }}>{t("common.save")}</button>
           <button onClick={() => setEditing(false)}>{t("common.cancel")}</button>
@@ -630,8 +706,10 @@ function ContestRow({
                 <span key={task.id} className="inline"><input className="check" type="checkbox" checked={draft.task_ids.includes(task.id)} onChange={() => toggleDraftTask(task.id)} /> #{task.id} {task.title}</span>
               ))}</span>
             </label>
-            <p className="muted">{t("contest.participantsAvailable", { users: users.map((user) => `${user.id}:${user.username}`).join(" · ") || t("common.none") })}</p>
-            <p className="muted">{t("contest.teamsAvailable", { teams: teams.map((team) => `${team.id}:${team.name}`).join(" · ") || t("common.none") })}</p>
+            <div className="access-grid">
+              <SearchPicker label={t("contest.allowedParticipants")} items={userPickerItems(users)} selectedIds={draft.participant_ids} onChange={(participant_ids) => setDraft({ ...draft, participant_ids })} placeholder={t("contest.searchParticipants")} emptyText={t("common.none")} />
+              <SearchPicker label={t("contest.allowedTeams")} items={teamPickerItems(teams)} selectedIds={draft.team_ids} onChange={(team_ids) => setDraft({ ...draft, team_ids })} placeholder={t("contest.searchTeams")} emptyText={t("common.none")} />
+            </div>
           </div>
         </td>
       </tr>
