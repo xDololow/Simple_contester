@@ -20,6 +20,8 @@ from .config import settings
 from .database import SessionLocal, engine, get_db
 from .models import (
     Contest,
+    ContestParticipationMode,
+    ContestStatus,
     ContestTeam,
     ContestTask,
     ContestTimeMode,
@@ -44,6 +46,7 @@ from .schemas import (
     ImportReport,
     LoginIn,
     ParticipantContestOut,
+    PackageImportReport,
     ScoreboardCell,
     ScoreboardRow,
     SubmissionAdminDetailOut,
@@ -68,6 +71,11 @@ from .schemas import (
     UserUpdate,
 )
 
+
+PACKAGE_FORMAT_VERSION = 1
+PACKAGE_MAX_FILES = 500
+PACKAGE_MAX_TOTAL_BYTES = 20 * 1024 * 1024
+PACKAGE_MAX_FILE_BYTES = 5 * 1024 * 1024
 
 app = FastAPI(title="Simple Contester")
 app.add_middleware(
@@ -159,6 +167,13 @@ def ensure_contest_access_columns() -> None:
         column = conn.execute(text("SHOW COLUMNS FROM contests LIKE 'is_public'")).mappings().first()
         if column is None:
             conn.execute(text("ALTER TABLE contests ADD COLUMN is_public BOOL NOT NULL DEFAULT 0"))
+        column = conn.execute(text("SHOW COLUMNS FROM contests LIKE 'participation_mode'")).mappings().first()
+        if column is None:
+            conn.execute(text("ALTER TABLE contests ADD COLUMN participation_mode VARCHAR(20) NOT NULL DEFAULT 'individual'"))
+        column = conn.execute(text("SHOW COLUMNS FROM submissions LIKE 'team_id'")).mappings().first()
+        if column is None:
+            conn.execute(text("ALTER TABLE submissions ADD COLUMN team_id INT NULL"))
+            conn.execute(text("CREATE INDEX ix_submissions_team_id ON submissions (team_id)"))
         conn.execute(text("ALTER TABLE participant_contests MODIFY started_at DATETIME NULL"))
         conn.execute(text("ALTER TABLE participant_contests MODIFY deadline_at DATETIME NULL"))
 
@@ -302,6 +317,24 @@ def participant_has_contest_access(db: Session, contest_id: int, user_id: int) -
     )
 
 
+def get_assigned_contest_team_ids_for_user(db: Session, contest_id: int, user_id: int) -> list[int]:
+    return list(
+        db.scalars(
+            select(Team.id)
+            .join(TeamMember, TeamMember.team_id == Team.id)
+            .join(ContestTeam, ContestTeam.team_id == Team.id)
+            .where(ContestTeam.contest_id == contest_id, TeamMember.user_id == user_id)
+            .order_by(Team.id)
+        )
+    )
+
+
+def participant_has_team_contest_access(db: Session, contest: Contest, user_id: int) -> bool:
+    if contest.participation_mode != ContestParticipationMode.team:
+        return False
+    return bool(get_assigned_contest_team_ids_for_user(db, contest.id, user_id))
+
+
 def assert_contest_access(db: Session, contest: Contest, user: User) -> None:
     if user.role == UserRole.admin:
         return
@@ -309,7 +342,21 @@ def assert_contest_access(db: Session, contest: Contest, user: User) -> None:
         return
     if participant_has_contest_access(db, contest.id, user.id):
         return
+    if participant_has_team_contest_access(db, contest, user.id):
+        return
     raise HTTPException(status_code=403, detail="Contest is not available")
+
+
+def resolve_submission_team_id(db: Session, contest: Contest, user: User) -> int | None:
+    if contest.participation_mode == ContestParticipationMode.individual:
+        return None
+    team_ids = get_assigned_contest_team_ids_for_user(db, contest.id, user.id)
+    if len(team_ids) != 1:
+        detail = "Team contest requires exactly one assigned team membership"
+        if len(team_ids) > 1:
+            detail = "Team contest requires exactly one assigned team membership; multiple assigned teams found"
+        raise HTTPException(status_code=403, detail=detail)
+    return team_ids[0]
 
 
 def replace_contest_participants(db: Session, contest: Contest, user_ids: list[int]) -> list[User]:
@@ -565,6 +612,278 @@ def safe_archive_member_name(name: str) -> str | None:
     return path.name
 
 
+def safe_package_member_name(name: str) -> str | None:
+    if "\\" in name:
+        return None
+    path = PurePosixPath(name)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        return None
+    if not path.name:
+        return None
+    return path.as_posix()
+
+
+def slug_filename(value: str, fallback: str = "package") -> str:
+    safe = "".join(char if char.isalnum() or char in {"-", "_"} else "_" for char in value.strip().lower())
+    safe = "_".join(part for part in safe.split("_") if part)
+    return safe or fallback
+
+
+def read_package_zip(content: bytes) -> dict[str, bytes]:
+    if len(content) > PACKAGE_MAX_TOTAL_BYTES:
+        raise HTTPException(status_code=400, detail="Package archive is too large")
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(status_code=400, detail="Invalid zip archive") from exc
+
+    files: dict[str, bytes] = {}
+    total_size = 0
+    with archive:
+        members = [info for info in archive.infolist() if not info.is_dir()]
+        if len(members) > PACKAGE_MAX_FILES:
+            raise HTTPException(status_code=400, detail=f"Package has too many files (max {PACKAGE_MAX_FILES})")
+        for info in members:
+            safe_name = safe_package_member_name(info.filename)
+            if safe_name is None:
+                raise HTTPException(status_code=400, detail=f"Unsafe package path: {info.filename}")
+            if info.file_size > PACKAGE_MAX_FILE_BYTES:
+                raise HTTPException(status_code=400, detail=f"Package file is too large: {safe_name}")
+            total_size += info.file_size
+            if total_size > PACKAGE_MAX_TOTAL_BYTES:
+                raise HTTPException(status_code=400, detail="Package archive is too large")
+            try:
+                files[safe_name] = archive.read(info)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Cannot read package file {safe_name}: {exc}") from exc
+    return files
+
+
+def decode_package_text(files: dict[str, bytes], name: str, required: bool = True) -> str:
+    data = files.get(name)
+    if data is None:
+        if required:
+            raise HTTPException(status_code=400, detail=f"Missing package file: {name}")
+        return ""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Package file must be UTF-8 text: {name}") from exc
+
+
+def load_package_metadata(files: dict[str, bytes], prefix: str = "") -> dict:
+    json_name = f"{prefix}metadata.json"
+    yaml_name = f"{prefix}metadata.yaml"
+    yml_name = f"{prefix}metadata.yml"
+    try:
+        if json_name in files:
+            metadata = json.loads(decode_package_text(files, json_name))
+        elif yaml_name in files:
+            metadata = yaml.safe_load(decode_package_text(files, yaml_name))
+        elif yml_name in files:
+            metadata = yaml.safe_load(decode_package_text(files, yml_name))
+        else:
+            raise HTTPException(status_code=400, detail=f"Missing package file: {prefix}metadata.json")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid package metadata: {exc}") from exc
+    if not isinstance(metadata, dict):
+        raise HTTPException(status_code=400, detail="Package metadata must be an object")
+    return metadata
+
+
+def parse_package_datetime(value: object, field_name: str) -> datetime:
+    if value is None:
+        raise HTTPException(status_code=400, detail=f"Contest {field_name} is required")
+    try:
+        return normalize_dt(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid contest {field_name}") from exc
+
+
+def task_package_metadata(task: Task, tests: list[TaskTest], package_type: str = "task") -> dict[str, object]:
+    return {
+        "format": "simple-contester-package",
+        "format_version": PACKAGE_FORMAT_VERSION,
+        "type": package_type,
+        "task": {
+            "title": task.title,
+            "input_format": task.input_format,
+            "output_format": task.output_format,
+            "samples": json.loads(task.samples or "[]"),
+            "time_limit_ms": task.time_limit_ms,
+            "memory_limit_mb": task.memory_limit_mb,
+            "points": task.points,
+            "partial_scoring": task.partial_scoring,
+        },
+        "tests": [{"name": f"{index:03d}", "is_sample": test.is_sample} for index, test in enumerate(tests, start=1)],
+    }
+
+
+def write_task_package_files(archive: zipfile.ZipFile, prefix: str, task: Task) -> None:
+    tests = sorted(task.tests, key=lambda test: test.id)
+    archive.writestr(f"{prefix}metadata.json", json.dumps(task_package_metadata(task, tests), ensure_ascii=False, indent=2))
+    archive.writestr(f"{prefix}statement.md", task.statement)
+    for index, test in enumerate(tests, start=1):
+        name = f"{index:03d}"
+        archive.writestr(f"{prefix}tests/{name}.in", test.input_data)
+        archive.writestr(f"{prefix}tests/{name}.out", test.output_data)
+
+
+def create_task_package_zip(task: Task) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        write_task_package_files(archive, "", task)
+    return buffer.getvalue()
+
+
+def create_contest_package_zip(contest: Contest) -> bytes:
+    ordered_links = sorted(contest.tasks, key=lambda link: (link.position, link.task_id))
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        metadata = {
+            "format": "simple-contester-package",
+            "format_version": PACKAGE_FORMAT_VERSION,
+            "type": "contest",
+            "contest": {
+                "title": contest.title,
+                "description": contest.description,
+                "time_mode": contest.time_mode.value if hasattr(contest.time_mode, "value") else contest.time_mode,
+                "participation_mode": contest.participation_mode.value if hasattr(contest.participation_mode, "value") else contest.participation_mode,
+                "starts_at": contest.starts_at.isoformat(),
+                "ends_at": contest.ends_at.isoformat(),
+                "individual_duration_minutes": contest.individual_duration_minutes,
+            },
+            "tasks": [
+                {"dir": f"tasks/{index:03d}", "position": index - 1}
+                for index, _link in enumerate(ordered_links, start=1)
+            ],
+        }
+        archive.writestr("metadata.json", json.dumps(metadata, ensure_ascii=False, indent=2))
+        for index, link in enumerate(ordered_links, start=1):
+            write_task_package_files(archive, f"tasks/{index:03d}/", link.task)
+    return buffer.getvalue()
+
+
+def create_task_from_package_metadata(db: Session, metadata: dict, statement: str, files: dict[str, bytes], prefix: str = "") -> tuple[Task, int]:
+    task_data = metadata.get("task")
+    if not isinstance(task_data, dict):
+        raise HTTPException(status_code=400, detail=f"Missing task metadata in {prefix or 'package'}")
+    title = str(task_data.get("title") or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Task title is required")
+    samples = task_data.get("samples", [])
+    if not isinstance(samples, list):
+        raise HTTPException(status_code=400, detail="Task samples must be a list")
+    try:
+        task = Task(
+            contest_id=None,
+            title=title,
+            statement=statement,
+            input_format=str(task_data.get("input_format") or ""),
+            output_format=str(task_data.get("output_format") or ""),
+            samples=json.dumps(samples),
+            time_limit_ms=int(task_data.get("time_limit_ms") or 2000),
+            memory_limit_mb=int(task_data.get("memory_limit_mb") or 256),
+            points=float(task_data.get("points") if task_data.get("points") is not None else 100.0),
+            partial_scoring=bool(task_data.get("partial_scoring", False)),
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid task numeric metadata") from exc
+    db.add(task)
+    db.flush()
+
+    tests_data = metadata.get("tests", [])
+    if not isinstance(tests_data, list):
+        raise HTTPException(status_code=400, detail="Package tests metadata must be a list")
+    created_tests = 0
+    for item in tests_data:
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail="Each test metadata item must be an object")
+        name = str(item.get("name") or "").strip()
+        safe_name = safe_archive_member_name(f"{name}.in")
+        if safe_name is None or safe_name != f"{name}.in":
+            raise HTTPException(status_code=400, detail=f"Unsafe test name: {name}")
+        input_data = decode_package_text(files, f"{prefix}tests/{name}.in")
+        output_data = decode_package_text(files, f"{prefix}tests/{name}.out")
+        db.add(TaskTest(task_id=task.id, input_data=input_data, output_data=output_data, is_sample=bool(item.get("is_sample", False))))
+        created_tests += 1
+    return task, created_tests
+
+
+def import_task_package_zip(db: Session, content: bytes) -> PackageImportReport:
+    files = read_package_zip(content)
+    metadata = load_package_metadata(files)
+    if metadata.get("type") not in {"task", None}:
+        raise HTTPException(status_code=400, detail="Package is not a task package")
+    statement = decode_package_text(files, "statement.md", required=False) or decode_package_text(files, "statement.txt", required=False)
+    task, created_tests = create_task_from_package_metadata(db, metadata, statement, files)
+    db.commit()
+    db.refresh(task)
+    return PackageImportReport(created_tasks=1, created_tests=created_tests, task_ids=[task.id])
+
+
+def import_contest_package_zip(db: Session, content: bytes) -> PackageImportReport:
+    files = read_package_zip(content)
+    metadata = load_package_metadata(files)
+    if metadata.get("type") != "contest":
+        raise HTTPException(status_code=400, detail="Package is not a contest package")
+    contest_data = metadata.get("contest")
+    if not isinstance(contest_data, dict):
+        raise HTTPException(status_code=400, detail="Missing contest metadata")
+    title = str(contest_data.get("title") or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Contest title is required")
+    starts_at = parse_package_datetime(contest_data.get("starts_at"), "starts_at")
+    ends_at = parse_package_datetime(contest_data.get("ends_at"), "ends_at")
+    try:
+        time_mode = ContestTimeMode(str(contest_data.get("time_mode") or ContestTimeMode.fixed.value))
+        participation_mode = ContestParticipationMode(str(contest_data.get("participation_mode") or ContestParticipationMode.individual.value))
+        individual_duration_minutes = contest_data.get("individual_duration_minutes")
+        if individual_duration_minutes is not None:
+            individual_duration_minutes = int(individual_duration_minutes)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid contest mode or duration metadata") from exc
+    validate_contest_time_window(starts_at, ends_at, time_mode, individual_duration_minutes)
+    contest = Contest(
+        title=title,
+        description=str(contest_data.get("description") or ""),
+        status=ContestStatus.draft,
+        is_public=False,
+        time_mode=time_mode,
+        participation_mode=participation_mode,
+        starts_at=starts_at,
+        ends_at=ends_at,
+        individual_duration_minutes=individual_duration_minutes,
+    )
+    db.add(contest)
+    db.flush()
+
+    tasks_data = metadata.get("tasks", [])
+    if not isinstance(tasks_data, list):
+        raise HTTPException(status_code=400, detail="Contest tasks metadata must be a list")
+    task_ids: list[int] = []
+    created_tests = 0
+    for position, item in enumerate(tasks_data):
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail="Each contest task item must be an object")
+        task_dir = str(item.get("dir") or "").strip().rstrip("/")
+        if safe_package_member_name(f"{task_dir}/metadata.json") != f"{task_dir}/metadata.json":
+            raise HTTPException(status_code=400, detail=f"Unsafe task directory: {task_dir}")
+        prefix = f"{task_dir}/"
+        task_metadata = load_package_metadata(files, prefix)
+        statement = decode_package_text(files, f"{prefix}statement.md", required=False) or decode_package_text(files, f"{prefix}statement.txt", required=False)
+        task, test_count = create_task_from_package_metadata(db, task_metadata, statement, files, prefix)
+        db.add(ContestTask(contest_id=contest.id, task_id=task.id, position=int(item.get("position", position))))
+        task_ids.append(task.id)
+        created_tests += test_count
+
+    db.commit()
+    db.refresh(contest)
+    return PackageImportReport(created_tasks=len(task_ids), created_tests=created_tests, contest_id=contest.id, task_ids=task_ids)
+
+
 def import_task_tests_zip(db: Session, task_id: int, content: bytes) -> TestArchiveImportReport:
     inputs: dict[str, bytes] = {}
     outputs: dict[str, bytes] = {}
@@ -662,7 +981,18 @@ def list_contests(db: Session = Depends(get_db), user: User = Depends(get_curren
     stmt = select(Contest).order_by(Contest.starts_at.desc())
     if user.role != UserRole.admin:
         accessible_contests = select(ParticipantContest.contest_id).where(ParticipantContest.user_id == user.id)
-        stmt = stmt.where(or_(Contest.is_public.is_(True), Contest.id.in_(accessible_contests)))
+        accessible_team_contests = (
+            select(ContestTeam.contest_id)
+            .join(TeamMember, TeamMember.team_id == ContestTeam.team_id)
+            .where(TeamMember.user_id == user.id)
+        )
+        stmt = stmt.where(
+            or_(
+                Contest.is_public.is_(True),
+                Contest.id.in_(accessible_contests),
+                and_(Contest.participation_mode == ContestParticipationMode.team, Contest.id.in_(accessible_team_contests)),
+            )
+        )
     return list(db.scalars(stmt))
 
 
@@ -682,6 +1012,18 @@ def create_contest(data: ContestCreate, _: User = Depends(require_admin), db: Se
     db.commit()
     db.refresh(contest)
     return contest
+
+
+@app.post("/api/contests/import-package", response_model=PackageImportReport)
+async def import_contest_package(
+    file: UploadFile = File(...),
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> PackageImportReport:
+    filename = (file.filename or "").lower()
+    if not filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only .zip packages are supported")
+    return import_contest_package_zip(db, await file.read())
 
 
 @app.get("/api/contests/{contest_id}", response_model=ContestOut)
@@ -726,6 +1068,24 @@ def delete_contest(contest_id: int, _: User = Depends(require_admin), db: Sessio
     db.delete(contest)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.get("/api/contests/{contest_id}/package")
+def export_contest_package(contest_id: int, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> StreamingResponse:
+    contest = db.scalar(
+        select(Contest)
+        .where(Contest.id == contest_id)
+        .options(selectinload(Contest.tasks).selectinload(ContestTask.task).selectinload(Task.tests))
+    )
+    if contest is None:
+        raise HTTPException(status_code=404, detail="Contest not found")
+    data = create_contest_package_zip(contest)
+    filename = f"contest-{contest.id}-{slug_filename(contest.title, 'contest')}.zip"
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/api/contests/{contest_id}/start", response_model=ParticipantContestOut)
@@ -815,6 +1175,18 @@ def list_all_tasks(_: User = Depends(require_admin), db: Session = Depends(get_d
     return [to_task_out(task) for task in tasks]
 
 
+@app.post("/api/tasks/import-package", response_model=PackageImportReport)
+async def import_task_package(
+    file: UploadFile = File(...),
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> PackageImportReport:
+    filename = (file.filename or "").lower()
+    if not filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only .zip packages are supported")
+    return import_task_package_zip(db, await file.read())
+
+
 @app.post("/api/tasks", response_model=TaskOut)
 def create_task(data: TaskCreate, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> TaskOut:
     task = Task(
@@ -848,7 +1220,10 @@ def get_task(task_id: int, db: Session = Depends(get_db), user: User = Depends(g
         if task.contest_id is not None:
             contest_ids.add(task.contest_id)
         contests = db.scalars(select(Contest).where(Contest.id.in_(contest_ids))).all() if contest_ids else []
-        if not any(contest.is_public or participant_has_contest_access(db, contest.id, user.id) for contest in contests):
+        if not any(
+            contest.is_public or participant_has_contest_access(db, contest.id, user.id) or participant_has_team_contest_access(db, contest, user.id)
+            for contest in contests
+        ):
             raise HTTPException(status_code=403, detail="Task is not available")
     return to_task_detail_out(task, include_tests=user.role == UserRole.admin)
 
@@ -872,6 +1247,18 @@ def delete_task(task_id: int, _: User = Depends(require_admin), db: Session = De
     db.delete(task)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.get("/api/tasks/{task_id}/package")
+def export_task_package(task_id: int, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> StreamingResponse:
+    task = get_task_or_404(db, task_id)
+    data = create_task_package_zip(task)
+    filename = f"task-{task.id}-{slug_filename(task.title, 'task')}.zip"
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/api/tasks/{task_id}/tests", response_model=list[TaskTestOut])
@@ -950,10 +1337,12 @@ def create_submission(
     if contest is None or task is None or not task_belongs_to_contest(db, contest_id, task_id):
         raise HTTPException(status_code=404, detail="Contest task not found")
     assert_contest_allows_submission(db, contest, user)
+    team_id = resolve_submission_team_id(db, contest, user)
     submission = Submission(
         contest_id=contest_id,
         task_id=task_id,
         user_id=user.id,
+        team_id=team_id,
         language=data.language,
         source_code=data.source_code,
         verdict=SubmissionVerdict.queued,
@@ -977,10 +1366,25 @@ def list_submissions(
         assert_contest_access(db, contest, user)
         filters.append(Submission.contest_id == contest_id)
     if user.role != UserRole.admin:
-        filters.append(Submission.user_id == user.id)
+        team_ids: list[int] = []
+        if contest_id is not None:
+            contest = get_contest_or_404(db, contest_id)
+            if contest.participation_mode == ContestParticipationMode.team:
+                team_ids = get_assigned_contest_team_ids_for_user(db, contest_id, user.id)
+        ownership_filter = Submission.user_id == user.id
+        if team_ids:
+            ownership_filter = or_(ownership_filter, Submission.team_id.in_(team_ids))
+        filters.append(ownership_filter)
         accessible_contests = select(ParticipantContest.contest_id).where(ParticipantContest.user_id == user.id)
+        accessible_team_contests = (
+            select(ContestTeam.contest_id)
+            .join(TeamMember, TeamMember.team_id == ContestTeam.team_id)
+            .join(Contest, Contest.id == ContestTeam.contest_id)
+            .where(TeamMember.user_id == user.id)
+            .where(Contest.participation_mode == ContestParticipationMode.team)
+        )
         public_contests = select(Contest.id).where(Contest.is_public.is_(True))
-        filters.append(or_(Submission.contest_id.in_(accessible_contests), Submission.contest_id.in_(public_contests)))
+        filters.append(or_(Submission.contest_id.in_(accessible_contests), Submission.contest_id.in_(accessible_team_contests), Submission.contest_id.in_(public_contests)))
     if filters:
         stmt = stmt.where(and_(*filters))
     return list(db.scalars(stmt))
@@ -991,10 +1395,12 @@ def get_submission(submission_id: int, db: Session = Depends(get_db), user: User
     submission = db.get(Submission, submission_id)
     if submission is None:
         raise HTTPException(status_code=404, detail="Submission not found")
-    if user.role != UserRole.admin and submission.user_id != user.id:
-        raise HTTPException(status_code=403, detail="Submission is not available")
     contest = get_contest_or_404(db, submission.contest_id)
     assert_contest_access(db, contest, user)
+    if user.role != UserRole.admin:
+        team_ids = get_assigned_contest_team_ids_for_user(db, contest.id, user.id) if contest.participation_mode == ContestParticipationMode.team else []
+        if submission.user_id != user.id and (submission.team_id is None or submission.team_id not in team_ids):
+            raise HTTPException(status_code=403, detail="Submission is not available")
     return submission
 
 
@@ -1044,6 +1450,7 @@ def contest_events_fingerprint(db: Session, contest_id: int) -> str:
         select(
             Submission.id,
             Submission.user_id,
+            Submission.team_id,
             Submission.verdict,
             Submission.score,
             Submission.started_at,
@@ -1058,6 +1465,7 @@ def contest_events_fingerprint(db: Session, contest_id: int) -> str:
             [
                 row.id,
                 row.user_id,
+                row.team_id,
                 row.verdict.value if hasattr(row.verdict, "value") else row.verdict,
                 row.score,
                 row.started_at.isoformat() if row.started_at else None,
@@ -1079,6 +1487,54 @@ def scoreboard(contest_id: int, db: Session = Depends(get_db), user: User = Depe
         .where(ContestTask.contest_id == contest_id)
         .order_by(ContestTask.position, Task.id)
     ).all()
+    if contest.participation_mode == ContestParticipationMode.team:
+        teams = db.scalars(
+            select(Team)
+            .join(ContestTeam, ContestTeam.team_id == Team.id)
+            .where(ContestTeam.contest_id == contest_id)
+            .order_by(Team.name)
+        ).all()
+        team_ids = [team.id for team in teams]
+        submission_stmt = select(Submission).where(Submission.contest_id == contest_id).order_by(Submission.created_at)
+        submissions = db.scalars(submission_stmt.where(Submission.team_id.in_(team_ids))).all() if team_ids else []
+
+        rows: list[ScoreboardRow] = []
+        for team in teams:
+            cells: list[ScoreboardCell] = []
+            score = 0.0
+            penalty = 0
+            for task in tasks:
+                task_submissions = [s for s in submissions if s.team_id == team.id and s.task_id == task.id]
+                accepted = next((s for s in task_submissions if s.verdict == SubmissionVerdict.accepted), None)
+                attempts_before_accept = [s for s in task_submissions if accepted is None or s.created_at <= accepted.created_at]
+                best_score = max((submission.score for submission in task_submissions), default=0.0)
+                solved_at_minutes = None
+                score += best_score
+                if accepted:
+                    solved_at_minutes = max(0, int((accepted.created_at - contest.starts_at).total_seconds() // 60))
+                    penalty += solved_at_minutes + 20 * max(0, len(attempts_before_accept) - 1)
+                cells.append(
+                    ScoreboardCell(
+                        task_id=task.id,
+                        attempts=len(attempts_before_accept),
+                        solved=accepted is not None,
+                        solved_at_minutes=solved_at_minutes,
+                    )
+                )
+            rows.append(
+                ScoreboardRow(
+                    user_id=team.id,
+                    username=team.name,
+                    display_name=team.name,
+                    team_id=team.id,
+                    team_name=team.name,
+                    score=round(score, 2),
+                    penalty=penalty,
+                    cells=cells,
+                )
+            )
+        return sorted(rows, key=lambda row: (-row.score, row.penalty, row.team_name or row.username))
+
     participants = {
         row.user_id: row
         for row in db.scalars(select(ParticipantContest).where(ParticipantContest.contest_id == contest_id)).all()

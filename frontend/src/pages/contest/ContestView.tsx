@@ -105,6 +105,7 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
         </div>
         <div className="meta">
           <span className="pill">{t(`status.${contest.status}`)}</span>
+          <span>{t(`common.${contest.participation_mode}`)}</span>
           <span>{contest.time_mode === "individual" ? `${contest.individual_duration_minutes} ${t("table.minutes").toLowerCase()}` : t("common.fixed")}</span>
           <span>{formatDate(contest.starts_at)} - {formatDate(contest.ends_at)}</span>
         </div>
@@ -192,12 +193,12 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
             <div className="table-wrap">
               <table>
                 <thead>
-                  <tr><th>{t("table.user")}</th><th>{t("table.points")}</th><th>{t("table.penalty")}</th>{tasks.map((task) => <th key={task.id}>{task.title}</th>)}</tr>
+                  <tr><th>{contest.participation_mode === "team" ? t("table.team") : t("table.user")}</th><th>{t("table.points")}</th><th>{t("table.penalty")}</th>{tasks.map((task) => <th key={task.id}>{task.title}</th>)}</tr>
                 </thead>
                 <tbody>
                   {scoreboard.map((row) => (
-                    <tr key={row.user_id} className={row.user_id === me.id ? "self" : ""}>
-                      <td>{row.display_name}</td>
+                    <tr key={row.user_id} className={contest.participation_mode !== "team" && row.user_id === me.id ? "self" : ""}>
+                      <td>{contest.participation_mode === "team" ? row.team_name || row.display_name : row.display_name}</td>
                       <td>{formatScore(row.score)}</td>
                       <td>{row.penalty}</td>
                       {row.cells.map((cell) => <td key={cell.task_id}>{cell.solved ? `+${cell.attempts > 1 ? cell.attempts - 1 : ""}` : cell.attempts ? `-${cell.attempts}` : ""}</td>)}

@@ -138,6 +138,62 @@ contest access checks as the normal contest endpoints, and streams a compact
 unavailable or drops, the contest view falls back to slower polling through
 `GET /api/contests/{contest_id}/live-snapshot`.
 
+## Task And Contest Packages
+
+Admins can move standalone tasks and basic contest definitions between local
+installations with ZIP packages from the admin `Packages` tab or the API:
+
+- `GET /api/tasks/{task_id}/package` exports one task.
+- `POST /api/tasks/import-package` imports one task package.
+- `GET /api/contests/{contest_id}/package` exports one contest with its attached tasks.
+- `POST /api/contests/import-package` imports a contest package.
+
+Task package layout:
+
+```text
+metadata.json
+statement.md
+tests/001.in
+tests/001.out
+tests/002.in
+tests/002.out
+```
+
+`metadata.json` contains `format`, `format_version`, `type: "task"`, task
+limits/scoring fields, samples, and the test list with numbered names and
+`is_sample` flags. `statement.txt` is also accepted on import when
+`statement.md` is absent. Contest packages use a root `metadata.json` with
+`type: "contest"` and task directories:
+
+```text
+metadata.json
+tasks/001/metadata.json
+tasks/001/statement.md
+tasks/001/tests/001.in
+tasks/001/tests/001.out
+```
+
+Contest imports intentionally create a draft, private contest by default.
+Users, teams, access lists, participant starts/deadlines, submissions, and
+results are not exported. Task imports always create new standalone tasks; if a
+task or contest with the same title already exists, it is not overwritten.
+
+Package archives are limited to 500 files, 20 MiB total uncompressed content,
+and 5 MiB per file. Package import rejects absolute paths, `..` traversal,
+backslash paths, invalid ZIP files, and non-UTF-8 text files.
+
+## Team Contest MVP
+
+Contests default to individual participation. Admins can switch a contest to
+team participation and assign teams through the contest teams allowlist. In a
+team contest, participant submissions are attached to the participant's assigned
+team and the scoreboard groups rows by team.
+
+MVP membership rule: a participant must belong to exactly one team assigned to
+the contest before submitting. Participants with no assigned team, or with more
+than one assigned team for the same contest, receive a 403 response explaining
+that exactly one assigned team membership is required.
+
 ## Scale Judgers
 
 Judger workers use row locking with `SKIP LOCKED`, so several workers can poll the same queue.

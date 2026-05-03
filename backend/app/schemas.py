@@ -3,7 +3,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .models import ContestStatus, ContestTimeMode, Language, SubmissionVerdict, UserRole
+from .models import ContestParticipationMode, ContestStatus, ContestTimeMode, Language, SubmissionVerdict, UserRole
 
 
 class TokenOut(BaseModel):
@@ -83,6 +83,7 @@ class ContestCreate(BaseModel):
     status: ContestStatus = ContestStatus.draft
     is_public: bool = False
     time_mode: ContestTimeMode = ContestTimeMode.fixed
+    participation_mode: ContestParticipationMode = ContestParticipationMode.individual
     starts_at: datetime
     ends_at: datetime
     individual_duration_minutes: int | None = None
@@ -94,6 +95,7 @@ class ContestUpdate(BaseModel):
     status: ContestStatus | None = None
     is_public: bool | None = None
     time_mode: ContestTimeMode | None = None
+    participation_mode: ContestParticipationMode | None = None
     starts_at: datetime | None = None
     ends_at: datetime | None = None
     individual_duration_minutes: int | None = Field(default=None, gt=0)
@@ -196,6 +198,13 @@ class TestArchiveImportReport(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
+class PackageImportReport(BaseModel):
+    created_tasks: int
+    created_tests: int
+    contest_id: int | None = None
+    task_ids: list[int] = Field(default_factory=list)
+
+
 class SubmissionCreate(BaseModel):
     language: Language
     source_code: str = Field(min_length=1)
@@ -208,6 +217,7 @@ class SubmissionOut(BaseModel):
     contest_id: int
     task_id: int
     user_id: int
+    team_id: int | None = None
     language: Language
     verdict: SubmissionVerdict
     score: float
@@ -246,6 +256,8 @@ class ScoreboardRow(BaseModel):
     user_id: int
     username: str
     display_name: str
+    team_id: int | None = None
+    team_name: str | None = None
     score: float
     penalty: int
     cells: list[ScoreboardCell]

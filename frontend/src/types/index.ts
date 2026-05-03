@@ -1,6 +1,7 @@
 export type Role = "admin" | "participant";
 export type ContestStatus = "draft" | "scheduled" | "running" | "finished" | "archived";
 export type TimeMode = "fixed" | "individual";
+export type ParticipationMode = "individual" | "team";
 export type Language =
   | "python"
   | "java"
@@ -40,6 +41,7 @@ export type Contest = {
   status: ContestStatus;
   is_public: boolean;
   time_mode: TimeMode;
+  participation_mode: ParticipationMode;
   starts_at: string;
   ends_at: string;
   individual_duration_minutes: number | null;
@@ -76,6 +78,7 @@ export type Submission = {
   contest_id: number;
   task_id: number;
   user_id: number;
+  team_id?: number | null;
   language: Language;
   verdict: string;
   score: number;
@@ -105,6 +108,8 @@ export type ScoreboardRow = {
   user_id: number;
   username: string;
   display_name: string;
+  team_id?: number | null;
+  team_name?: string | null;
   score: number;
   penalty: number;
   cells: Array<{ task_id: number; attempts: number; solved: boolean; solved_at_minutes: number | null }>;
@@ -125,6 +130,13 @@ export type TestArchiveImportReport = {
   created: number;
   skipped: string[];
   errors: string[];
+};
+
+export type PackageImportReport = {
+  created_tasks: number;
+  created_tests: number;
+  contest_id: number | null;
+  task_ids: number[];
 };
 
 export type Flash = { kind: "ok" | "error"; text: string };

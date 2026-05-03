@@ -28,6 +28,17 @@ def create_running_contest(client: APIClient, admin_headers: dict[str, str], tit
     return response.json()
 
 
+def create_running_team_contest(client: APIClient, admin_headers: dict[str, str], title: str, is_public: bool = False) -> dict[str, Any]:
+    contest = create_running_contest(client, admin_headers, title, is_public=is_public)
+    updated = client.patch(
+        f"/api/contests/{contest['id']}",
+        headers=admin_headers,
+        json={"participation_mode": "team"},
+    )
+    assert updated.status_code == 200, updated.text
+    return updated.json()
+
+
 def create_contest_task(client: APIClient, admin_headers: dict[str, str], contest_id: int, title: str = "Echo") -> dict[str, Any]:
     response = client.post(
         "/api/tasks",
@@ -45,6 +56,18 @@ def create_contest_task(client: APIClient, admin_headers: dict[str, str], contes
             "tests": [{"input_data": "x\n", "output_data": "x\n", "is_sample": True}],
         },
     )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def create_team(client: APIClient, admin_headers: dict[str, str], name: str, user_ids: list[int]) -> dict[str, Any]:
+    response = client.post("/api/teams", headers=admin_headers, json={"name": name, "user_ids": user_ids})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def assign_teams(client: APIClient, admin_headers: dict[str, str], contest_id: int, team_ids: list[int]) -> list[dict[str, Any]]:
+    response = client.put(f"/api/contests/{contest_id}/teams", headers=admin_headers, json={"team_ids": team_ids})
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -352,6 +375,168 @@ def test_admin_can_assign_teams_to_contest(
     )
     assert rejected.status_code == 400
     assert rejected.json()["detail"] == "Unknown team ids: [9999]"
+
+
+def test_team_contest_access_by_membership(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    create_user: Callable[..., dict[str, Any]],
+    auth_headers: Callable[[str, str], dict[str, str]],
+) -> None:
+    member = create_user(username="team_member", password="member-pass")
+    outsider = create_user(username="team_outsider", password="outsider-pass")
+    member_headers = auth_headers(member["username"], "member-pass")
+    outsider_headers = auth_headers(outsider["username"], "outsider-pass")
+    contest = create_running_team_contest(client, admin_headers, "Private Team Contest")
+    team = create_team(client, admin_headers, "Blue Team", [member["id"]])
+    assign_teams(client, admin_headers, contest["id"], [team["id"]])
+
+    member_list = client.get("/api/contests", headers=member_headers)
+    assert member_list.status_code == 200, member_list.text
+    assert contest["id"] in [item["id"] for item in member_list.json()]
+
+    member_open = client.get(f"/api/contests/{contest['id']}", headers=member_headers)
+    assert member_open.status_code == 200, member_open.text
+
+    outsider_open = client.get(f"/api/contests/{contest['id']}", headers=outsider_headers)
+    assert outsider_open.status_code == 403
+    assert outsider_open.json()["detail"] == "Contest is not available"
+
+
+def test_team_contest_submit_records_team_id(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant: dict,
+    participant_headers: dict[str, str],
+) -> None:
+    contest = create_running_team_contest(client, admin_headers, "Submit As Team")
+    task = create_contest_task(client, admin_headers, contest["id"])
+    team = create_team(client, admin_headers, "Solo Team", [participant["id"]])
+    assign_teams(client, admin_headers, contest["id"], [team["id"]])
+
+    created = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(input())"},
+    )
+
+    assert created.status_code == 200, created.text
+    assert created.json()["user_id"] == participant["id"]
+    assert created.json()["team_id"] == team["id"]
+
+    with SessionLocal() as db:
+        stored = db.get(Submission, created.json()["id"])
+        assert stored is not None
+        assert stored.team_id == team["id"]
+
+
+def test_team_scoreboard_aggregates_best_accepted_per_problem(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    create_user: Callable[..., dict[str, Any]],
+    auth_headers: Callable[[str, str], dict[str, str]],
+) -> None:
+    alice = create_user(username="score_alice", password="score-pass")
+    bob = create_user(username="score_bob", password="score-pass")
+    alice_headers = auth_headers(alice["username"], "score-pass")
+    bob_headers = auth_headers(bob["username"], "score-pass")
+    contest = create_running_team_contest(client, admin_headers, "Team Scoreboard")
+    task_a = create_contest_task(client, admin_headers, contest["id"], "A")
+    task_b = create_contest_task(client, admin_headers, contest["id"], "B")
+    team = create_team(client, admin_headers, "Aggregators", [alice["id"], bob["id"]])
+    assign_teams(client, admin_headers, contest["id"], [team["id"]])
+
+    wrong = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task_a['id']}/submissions",
+        headers=alice_headers,
+        json={"language": "python", "source_code": "print('wrong')"},
+    )
+    accepted_a = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task_a['id']}/submissions",
+        headers=bob_headers,
+        json={"language": "python", "source_code": "print(input())"},
+    )
+    accepted_b = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task_b['id']}/submissions",
+        headers=alice_headers,
+        json={"language": "python", "source_code": "print(input())"},
+    )
+    assert wrong.status_code == 200, wrong.text
+    assert accepted_a.status_code == 200, accepted_a.text
+    assert accepted_b.status_code == 200, accepted_b.text
+
+    with SessionLocal() as db:
+        wrong_submission = db.get(Submission, wrong.json()["id"])
+        accepted_a_submission = db.get(Submission, accepted_a.json()["id"])
+        accepted_b_submission = db.get(Submission, accepted_b.json()["id"])
+        assert wrong_submission is not None
+        assert accepted_a_submission is not None
+        assert accepted_b_submission is not None
+        wrong_submission.verdict = SubmissionVerdict.wrong_answer
+        wrong_submission.score = 10
+        accepted_a_submission.verdict = SubmissionVerdict.accepted
+        accepted_a_submission.score = task_a["points"]
+        accepted_a_submission.finished_at = datetime.utcnow()
+        accepted_b_submission.verdict = SubmissionVerdict.accepted
+        accepted_b_submission.score = task_b["points"]
+        accepted_b_submission.finished_at = datetime.utcnow()
+        db.commit()
+
+    scoreboard = client.get(f"/api/contests/{contest['id']}/scoreboard", headers=alice_headers)
+    assert scoreboard.status_code == 200, scoreboard.text
+    rows = scoreboard.json()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["team_id"] == team["id"]
+    assert row["team_name"] == "Aggregators"
+    assert row["score"] == task_a["points"] + task_b["points"]
+    assert row["cells"][0]["attempts"] == 2
+    assert row["cells"][0]["solved"] is True
+    assert row["cells"][1]["attempts"] == 1
+    assert row["cells"][1]["solved"] is True
+
+
+def test_team_contest_submit_without_assigned_team_denied(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant_headers: dict[str, str],
+) -> None:
+    contest = create_running_team_contest(client, admin_headers, "No Team", is_public=True)
+    task = create_contest_task(client, admin_headers, contest["id"])
+
+    created = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(input())"},
+    )
+
+    assert created.status_code == 403
+    assert created.json()["detail"] == "Team contest requires exactly one assigned team membership"
+
+
+def test_individual_mode_submissions_remain_user_owned(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant: dict,
+    participant_headers: dict[str, str],
+) -> None:
+    contest = create_running_contest(client, admin_headers, "Individual Still Works", is_public=True)
+    task = create_contest_task(client, admin_headers, contest["id"])
+    create_team(client, admin_headers, "Irrelevant Team", [participant["id"]])
+
+    created = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(input())"},
+    )
+
+    assert created.status_code == 200, created.text
+    assert created.json()["team_id"] is None
+    scoreboard = client.get(f"/api/contests/{contest['id']}/scoreboard", headers=participant_headers)
+    assert scoreboard.status_code == 200, scoreboard.text
+    row = next(item for item in scoreboard.json() if item["user_id"] == participant["id"])
+    assert row["team_id"] is None
+    assert row["display_name"] == participant["display_name"]
 
 
 def test_submission_lifecycle_and_scoreboard_after_accepted_submission(

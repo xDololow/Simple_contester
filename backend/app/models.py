@@ -29,6 +29,11 @@ class ContestTimeMode(str, Enum):
     individual = "individual"
 
 
+class ContestParticipationMode(str, Enum):
+    individual = "individual"
+    team = "team"
+
+
 class SubmissionVerdict(str, Enum):
     queued = "Queued"
     running = "Running"
@@ -102,6 +107,10 @@ class Contest(Base):
     status: Mapped[ContestStatus] = mapped_column(SAEnum(ContestStatus), default=ContestStatus.draft)
     is_public: Mapped[bool] = mapped_column(Boolean, default=False)
     time_mode: Mapped[ContestTimeMode] = mapped_column(SAEnum(ContestTimeMode), default=ContestTimeMode.fixed)
+    participation_mode: Mapped[ContestParticipationMode] = mapped_column(
+        SAEnum(ContestParticipationMode),
+        default=ContestParticipationMode.individual,
+    )
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     individual_duration_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -185,6 +194,7 @@ class Submission(Base):
     contest_id: Mapped[int] = mapped_column(ForeignKey("contests.id", ondelete="CASCADE"), index=True)
     task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    team_id: Mapped[int | None] = mapped_column(ForeignKey("teams.id", ondelete="SET NULL"), nullable=True, index=True)
     language: Mapped[Language] = mapped_column(SAEnum(Language))
     source_code: Mapped[str] = mapped_column(Text)
     verdict: Mapped[SubmissionVerdict] = mapped_column(SAEnum(SubmissionVerdict), default=SubmissionVerdict.queued, index=True)

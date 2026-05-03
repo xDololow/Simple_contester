@@ -2,12 +2,12 @@ import React, { useCallback, useEffect, useState } from "react";
 import { API_BASE } from "../../api/client";
 import { FlashMessage, Header, SubmissionDetailView } from "../../components/shared";
 import { useI18n } from "../../i18n";
-import type { ApiClient, Contest, ContestStatus, Flash, ImportReport, Role, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
+import type { ApiClient, Contest, ContestStatus, Flash, ImportReport, PackageImportReport, ParticipationMode, Role, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
 import { emptyFlash, errorText, formatDate, formatScore, fromLocalInputValue, joinIds, parseIds, toLocalInputValue, verdictClass } from "../../utils/format";
 
 export function AdminDashboard({ api, token, reloadContests }: { api: ApiClient; token: string; reloadContests: () => void }) {
   const { t } = useI18n();
-  const [tab, setTab] = useState<"users" | "import" | "teams" | "contests" | "tasks" | "tests" | "submissions">("users");
+  const [tab, setTab] = useState<"users" | "import" | "teams" | "contests" | "tasks" | "packages" | "tests" | "submissions">("users");
 
   return (
     <div className="admin-shell">
@@ -18,6 +18,7 @@ export function AdminDashboard({ api, token, reloadContests }: { api: ApiClient;
           ["teams", t("tab.teams")],
           ["contests", t("tab.contests")],
           ["tasks", t("tab.tasks")],
+          ["packages", t("tab.packages")],
           ["tests", t("tab.tests")],
           ["submissions", t("tab.submissions")]
         ].map(([id, label]) => (
@@ -31,6 +32,7 @@ export function AdminDashboard({ api, token, reloadContests }: { api: ApiClient;
       {tab === "teams" && <TeamsAdmin api={api} />}
       {tab === "contests" && <ContestsAdmin api={api} onChanged={reloadContests} />}
       {tab === "tasks" && <TasksAdmin api={api} />}
+      {tab === "packages" && <PackagesAdmin api={api} token={token} onChanged={reloadContests} />}
       {tab === "tests" && <TestsAdmin api={api} />}
       {tab === "submissions" && <SubmissionsAdmin api={api} />}
     </div>
@@ -295,8 +297,10 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
   const [contests, setContests] = useState<Contest[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [users, setUsers] = useState<User[]>([]);
+  const [teams, setTeams] = useState<Team[]>([]);
   const [contestTaskIds, setContestTaskIds] = useState<Record<number, number[]>>({});
   const [contestParticipantIds, setContestParticipantIds] = useState<Record<number, number[]>>({});
+  const [contestTeamIds, setContestTeamIds] = useState<Record<number, number[]>>({});
   const [flash, setFlash] = useState<Flash>(emptyFlash);
   const now = new Date();
   const later = new Date(Date.now() + 3 * 60 * 60_000);
@@ -306,15 +310,17 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
     status: "draft" as ContestStatus,
     is_public: false,
     time_mode: "fixed" as TimeMode,
+    participation_mode: "individual" as ParticipationMode,
     starts_at: toLocalInputValue(now.toISOString()),
     ends_at: toLocalInputValue(later.toISOString()),
     individual_duration_minutes: "180",
     task_ids: [] as number[],
-    participant_ids: ""
+    participant_ids: "",
+    team_ids: ""
   });
 
   const load = useCallback(async () => {
-    const [nextContests, nextTasks, nextUsers] = await Promise.all([api<Contest[]>("/api/contests"), api<Task[]>("/api/tasks"), api<User[]>("/api/users")]);
+    const [nextContests, nextTasks, nextUsers, nextTeams] = await Promise.all([api<Contest[]>("/api/contests"), api<Task[]>("/api/tasks"), api<User[]>("/api/users"), api<Team[]>("/api/teams")]);
     const nextContestTaskEntries = await Promise.all(
       nextContests.map(async (contest) => {
         const contestTasks = await api<Task[]>(`/api/contests/${contest.id}/tasks`);
@@ -327,11 +333,19 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
         return [contest.id, participants.map((participant) => participant.id)] as const;
       })
     );
+    const nextContestTeamEntries = await Promise.all(
+      nextContests.map(async (contest) => {
+        const contestTeams = await api<Team[]>(`/api/contests/${contest.id}/teams`);
+        return [contest.id, contestTeams.map((team) => team.id)] as const;
+      })
+    );
     setContests(nextContests);
     setTasks(nextTasks);
     setUsers(nextUsers.filter((user) => user.role === "participant"));
+    setTeams(nextTeams);
     setContestTaskIds(Object.fromEntries(nextContestTaskEntries));
     setContestParticipantIds(Object.fromEntries(nextContestParticipantEntries));
+    setContestTeamIds(Object.fromEntries(nextContestTeamEntries));
   }, [api]);
   useEffect(() => { load().catch((error) => setFlash({ kind: "error", text: errorText(error) })); }, [load]);
 
@@ -345,6 +359,7 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
           ...form,
           task_ids: undefined,
           participant_ids: undefined,
+          team_ids: undefined,
           starts_at: fromLocalInputValue(form.starts_at),
           ends_at: fromLocalInputValue(form.ends_at),
           individual_duration_minutes: form.time_mode === "individual" ? Number(form.individual_duration_minutes) : null
@@ -357,7 +372,11 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
       if (participantIds.length) {
         await api<User[]>(`/api/contests/${contest.id}/participants`, { method: "PUT", body: JSON.stringify({ user_ids: participantIds }) });
       }
-      setForm({ ...form, title: "", description: "", task_ids: [], participant_ids: "" });
+      const teamIds = parseIds(form.team_ids);
+      if (teamIds.length) {
+        await api<Team[]>(`/api/contests/${contest.id}/teams`, { method: "PUT", body: JSON.stringify({ team_ids: teamIds }) });
+      }
+      setForm({ ...form, title: "", description: "", task_ids: [], participant_ids: "", team_ids: "" });
       await load();
       onChanged();
     } catch (error) {
@@ -398,6 +417,17 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
     }
   }
 
+  async function saveContestTeams(contest: Contest, teamIds: number[]) {
+    setFlash(emptyFlash);
+    try {
+      await api<Team[]>(`/api/contests/${contest.id}/teams`, { method: "PUT", body: JSON.stringify({ team_ids: teamIds }) });
+      await load();
+      onChanged();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
   async function deleteContest(contest: Contest) {
     if (!window.confirm(t("contest.deleteConfirm", { name: contest.title }))) return;
     setFlash(emptyFlash);
@@ -426,6 +456,7 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
           <div className="form-grid">
             <label>{t("table.title")}<input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} required /></label>
             <label>{t("table.status")}<select value={form.status} onChange={(event) => setForm({ ...form, status: event.target.value as ContestStatus })}>{contestStatuses.map((item) => <option key={item} value={item}>{t(`status.${item}`)}</option>)}</select></label>
+            <label>{t("contest.participationMode")}<select value={form.participation_mode} onChange={(event) => setForm({ ...form, participation_mode: event.target.value as ParticipationMode })}><option value="individual">{t("common.individual")}</option><option value="team">{t("common.team")}</option></select></label>
             <label className="inline"><input className="check" type="checkbox" checked={form.is_public} onChange={(event) => setForm({ ...form, is_public: event.target.checked })} /> {t("contest.public")}</label>
             <label className="span-2">{t("table.description")}<textarea className="short" value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} /></label>
           </div>
@@ -448,15 +479,17 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
         <fieldset>
           <legend>{t("contest.sectionAccess")}</legend>
           <label>{t("contest.participantIds")}<input value={form.participant_ids} onChange={(event) => setForm({ ...form, participant_ids: event.target.value })} placeholder="1, 2, 3" /></label>
+          <label>{t("contest.teamIds")}<input value={form.team_ids} onChange={(event) => setForm({ ...form, team_ids: event.target.value })} placeholder="1, 2, 3" /></label>
           <p className="muted">{t("contest.participantsAvailable", { users: users.map((user) => `${user.id}:${user.username}`).join(" · ") || t("common.none") })}</p>
+          <p className="muted">{t("contest.teamsAvailable", { teams: teams.map((team) => `${team.id}:${team.name}`).join(" · ") || t("common.none") })}</p>
         </fieldset>
         <button type="submit">{t("common.create")}</button>
       </form>
       <FlashMessage flash={flash} />
       <div className="table-wrap">
         <table>
-          <thead><tr><th>{t("table.id")}</th><th>{t("table.title")}</th><th>{t("table.status")}</th><th>{t("table.access")}</th><th>{t("table.mode")}</th><th>{t("table.starts")}</th><th>{t("table.ends")}</th><th>{t("table.minutes")}</th><th>{t("table.tasks")}</th><th>{t("table.participants")}</th><th></th></tr></thead>
-          <tbody>{contests.map((contest) => <ContestRow key={contest.id} contest={contest} tasks={tasks} users={users} taskIds={contestTaskIds[contest.id] ?? []} participantIds={contestParticipantIds[contest.id] ?? []} onSave={saveContest} onSaveTasks={saveContestTasks} onSaveParticipants={saveContestParticipants} onDelete={deleteContest} />)}</tbody>
+          <thead><tr><th>{t("table.id")}</th><th>{t("table.title")}</th><th>{t("table.status")}</th><th>{t("table.access")}</th><th>{t("contest.participationMode")}</th><th>{t("table.mode")}</th><th>{t("table.starts")}</th><th>{t("table.ends")}</th><th>{t("table.minutes")}</th><th>{t("table.tasks")}</th><th>{t("table.participants")}</th><th>{t("table.teams")}</th><th></th></tr></thead>
+          <tbody>{contests.map((contest) => <ContestRow key={contest.id} contest={contest} tasks={tasks} users={users} teams={teams} taskIds={contestTaskIds[contest.id] ?? []} participantIds={contestParticipantIds[contest.id] ?? []} teamIds={contestTeamIds[contest.id] ?? []} onSave={saveContest} onSaveTasks={saveContestTasks} onSaveParticipants={saveContestParticipants} onSaveTeams={saveContestTeams} onDelete={deleteContest} />)}</tbody>
         </table>
       </div>
     </section>
@@ -469,21 +502,27 @@ function ContestRow({
   contest,
   tasks,
   users,
+  teams,
   taskIds,
   participantIds,
+  teamIds,
   onSave,
   onSaveTasks,
   onSaveParticipants,
+  onSaveTeams,
   onDelete
 }: {
   contest: Contest;
   tasks: Task[];
   users: User[];
+  teams: Team[];
   taskIds: number[];
   participantIds: number[];
+  teamIds: number[];
   onSave: (contest: Contest, patch: Partial<Contest>) => Promise<void>;
   onSaveTasks: (contest: Contest, taskIds: number[]) => Promise<void>;
   onSaveParticipants: (contest: Contest, participantIds: number[]) => Promise<void>;
+  onSaveTeams: (contest: Contest, teamIds: number[]) => Promise<void>;
   onDelete: (contest: Contest) => void;
 }) {
   const { t } = useI18n();
@@ -493,25 +532,29 @@ function ContestRow({
     status: contest.status,
     is_public: contest.is_public,
     time_mode: contest.time_mode,
+    participation_mode: contest.participation_mode,
     starts_at: toLocalInputValue(contest.starts_at),
     ends_at: toLocalInputValue(contest.ends_at),
     individual_duration_minutes: String(contest.individual_duration_minutes ?? ""),
     description: contest.description,
     task_ids: taskIds,
-    participant_ids: joinIds(participantIds)
+    participant_ids: joinIds(participantIds),
+    team_ids: joinIds(teamIds)
   });
   useEffect(() => setDraft({
     title: contest.title,
     status: contest.status,
     is_public: contest.is_public,
     time_mode: contest.time_mode,
+    participation_mode: contest.participation_mode,
     starts_at: toLocalInputValue(contest.starts_at),
     ends_at: toLocalInputValue(contest.ends_at),
     individual_duration_minutes: String(contest.individual_duration_minutes ?? ""),
     description: contest.description,
     task_ids: taskIds,
-    participant_ids: joinIds(participantIds)
-  }), [contest, taskIds, participantIds]);
+    participant_ids: joinIds(participantIds),
+    team_ids: joinIds(teamIds)
+  }), [contest, taskIds, participantIds, teamIds]);
 
   function toggleDraftTask(taskId: number) {
     setDraft((current) => ({
@@ -526,11 +569,16 @@ function ContestRow({
       .filter(Boolean)
       .map((user) => `${user?.id}:${user?.username}`)
       .join(", ");
+    const teamNames = teamIds
+      .map((id) => teams.find((team) => team.id === id))
+      .filter(Boolean)
+      .map((team) => `${team?.id}:${team?.name}`)
+      .join(", ");
     return (
       <tr>
-        <td>{contest.id}</td><td>{contest.title}</td><td>{t(`status.${contest.status}`)}</td><td>{contest.is_public ? t("contest.public") : t("contest.private")}</td><td>{t(`common.${contest.time_mode}`)}</td>
+        <td>{contest.id}</td><td>{contest.title}</td><td>{t(`status.${contest.status}`)}</td><td>{contest.is_public ? t("contest.public") : t("contest.private")}</td><td>{t(`common.${contest.participation_mode}`)}</td><td>{t(`common.${contest.time_mode}`)}</td>
         <td>{formatDate(contest.starts_at)}</td><td>{formatDate(contest.ends_at)}</td><td>{contest.individual_duration_minutes ?? "-"}</td>
-        <td>{taskIds.length}</td><td>{participantNames || t("common.none")}</td>
+        <td>{taskIds.length}</td><td>{participantNames || t("common.none")}</td><td>{teamNames || t("common.none")}</td>
         <td className="row-actions"><button onClick={() => setEditing(true)}>{t("common.edit")}</button><button className="danger" onClick={() => onDelete(contest)}>{t("common.delete")}</button></td>
       </tr>
     );
@@ -543,18 +591,21 @@ function ContestRow({
         <td><input value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} /></td>
         <td><select value={draft.status} onChange={(event) => setDraft({ ...draft, status: event.target.value as ContestStatus })}>{contestStatuses.map((item) => <option key={item} value={item}>{t(`status.${item}`)}</option>)}</select></td>
         <td><label className="inline"><input className="check" type="checkbox" checked={draft.is_public} onChange={(event) => setDraft({ ...draft, is_public: event.target.checked })} /> {t("contest.public")}</label></td>
+        <td><select value={draft.participation_mode} onChange={(event) => setDraft({ ...draft, participation_mode: event.target.value as ParticipationMode })}><option value="individual">{t("common.individual")}</option><option value="team">{t("common.team")}</option></select></td>
         <td><select value={draft.time_mode} onChange={(event) => setDraft({ ...draft, time_mode: event.target.value as TimeMode })}><option value="fixed">{t("common.fixed")}</option><option value="individual">{t("common.individual")}</option></select></td>
         <td><input type="datetime-local" value={draft.starts_at} onChange={(event) => setDraft({ ...draft, starts_at: event.target.value })} /></td>
         <td><input type="datetime-local" value={draft.ends_at} onChange={(event) => setDraft({ ...draft, ends_at: event.target.value })} /></td>
         <td><input type="number" value={draft.individual_duration_minutes} onChange={(event) => setDraft({ ...draft, individual_duration_minutes: event.target.value })} /></td>
         <td>{draft.task_ids.length}</td>
         <td><input value={draft.participant_ids} onChange={(event) => setDraft({ ...draft, participant_ids: event.target.value })} placeholder="1, 2, 3" /></td>
+        <td><input value={draft.team_ids} onChange={(event) => setDraft({ ...draft, team_ids: event.target.value })} placeholder="1, 2, 3" /></td>
         <td className="row-actions">
           <button onClick={async () => {
             await onSave(contest, {
               title: draft.title,
               status: draft.status,
               is_public: draft.is_public,
+              participation_mode: draft.participation_mode,
               time_mode: draft.time_mode,
               starts_at: fromLocalInputValue(draft.starts_at),
               ends_at: fromLocalInputValue(draft.ends_at),
@@ -563,6 +614,7 @@ function ContestRow({
             });
             await onSaveTasks(contest, draft.task_ids);
             await onSaveParticipants(contest, parseIds(draft.participant_ids));
+            await onSaveTeams(contest, parseIds(draft.team_ids));
             setEditing(false);
           }}>{t("common.save")}</button>
           <button onClick={() => setEditing(false)}>{t("common.cancel")}</button>
@@ -570,7 +622,7 @@ function ContestRow({
       </tr>
       <tr className="editing">
         <td></td>
-        <td colSpan={10}>
+        <td colSpan={12}>
           <div className="nested-edit">
             <label>{t("table.description")}<textarea className="short" value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} /></label>
             <label>{t("table.tasks")}
@@ -579,6 +631,7 @@ function ContestRow({
               ))}</span>
             </label>
             <p className="muted">{t("contest.participantsAvailable", { users: users.map((user) => `${user.id}:${user.username}`).join(" · ") || t("common.none") })}</p>
+            <p className="muted">{t("contest.teamsAvailable", { teams: teams.map((team) => `${team.id}:${team.name}`).join(" · ") || t("common.none") })}</p>
           </div>
         </td>
       </tr>
@@ -868,6 +921,111 @@ function MarkdownPreview({ value }: { value: string }) {
   flushList();
   if (code !== null) blocks.push(<pre key={blocks.length}><code>{code.join("\n")}</code></pre>);
   return <div className="markdown-preview">{blocks.length ? blocks : <p className="muted">Markdown</p>}</div>;
+}
+
+function PackagesAdmin({ api, token, onChanged }: { api: ApiClient; token: string; onChanged: () => void }) {
+  const { t } = useI18n();
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [contests, setContests] = useState<Contest[]>([]);
+  const [selectedTaskId, setSelectedTaskId] = useState<number | null>(null);
+  const [selectedContestId, setSelectedContestId] = useState<number | null>(null);
+  const [taskReport, setTaskReport] = useState<PackageImportReport | null>(null);
+  const [contestReport, setContestReport] = useState<PackageImportReport | null>(null);
+  const [flash, setFlash] = useState<Flash>(emptyFlash);
+
+  const load = useCallback(async () => {
+    const [nextTasks, nextContests] = await Promise.all([api<Task[]>("/api/tasks"), api<Contest[]>("/api/contests")]);
+    setTasks(nextTasks);
+    setContests(nextContests);
+    setSelectedTaskId((current) => current && nextTasks.some((task) => task.id === current) ? current : nextTasks[0]?.id ?? null);
+    setSelectedContestId((current) => current && nextContests.some((contest) => contest.id === current) ? current : nextContests[0]?.id ?? null);
+  }, [api]);
+
+  useEffect(() => { load().catch((error) => setFlash({ kind: "error", text: errorText(error) })); }, [load]);
+
+  async function downloadPackage(path: string) {
+    setFlash(emptyFlash);
+    try {
+      const response = await fetch(`${API_BASE}${path}`, { headers: { Authorization: `Bearer ${token}` } });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({ detail: response.statusText }));
+        throw new Error(body.detail || t("package.exportFailed"));
+      }
+      const blob = await response.blob();
+      const disposition = response.headers.get("Content-Disposition") || "";
+      const match = /filename="([^"]+)"/.exec(disposition);
+      const filename = match?.[1] || "package.zip";
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  async function importPackage(event: React.ChangeEvent<HTMLInputElement>, kind: "task" | "contest") {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setFlash(emptyFlash);
+    if (kind === "task") setTaskReport(null);
+    if (kind === "contest") setContestReport(null);
+    const body = new FormData();
+    body.append("file", file);
+    try {
+      const path = kind === "task" ? "/api/tasks/import-package" : "/api/contests/import-package";
+      const report = await api<PackageImportReport>(path, { method: "POST", body });
+      if (kind === "task") setTaskReport(report);
+      if (kind === "contest") setContestReport(report);
+      await load();
+      onChanged();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    } finally {
+      event.target.value = "";
+    }
+  }
+
+  return (
+    <section className="panel">
+      <Header title={t("tab.packages")} subtitle={t("package.subtitle")} />
+      <div className="package-grid">
+        <section>
+          <h3>{t("package.tasks")}</h3>
+          <div className="form-grid">
+            <label>{t("table.task")}<select value={selectedTaskId ?? ""} onChange={(event) => setSelectedTaskId(Number(event.target.value) || null)}>{tasks.map((task) => <option key={task.id} value={task.id}>{task.id}: {task.title}</option>)}</select></label>
+            <button type="button" disabled={!selectedTaskId} onClick={() => selectedTaskId && downloadPackage(`/api/tasks/${selectedTaskId}/package`)}>{t("package.exportTask")}</button>
+            <label>{t("package.importTask")}<input type="file" accept=".zip" onChange={(event) => importPackage(event, "task")} /></label>
+          </div>
+          {taskReport && <PackageReport report={taskReport} />}
+        </section>
+        <section>
+          <h3>{t("package.contests")}</h3>
+          <div className="form-grid">
+            <label>{t("table.contest")}<select value={selectedContestId ?? ""} onChange={(event) => setSelectedContestId(Number(event.target.value) || null)}>{contests.map((contest) => <option key={contest.id} value={contest.id}>{contest.id}: {contest.title}</option>)}</select></label>
+            <button type="button" disabled={!selectedContestId} onClick={() => selectedContestId && downloadPackage(`/api/contests/${selectedContestId}/package`)}>{t("package.exportContest")}</button>
+            <label>{t("package.importContest")}<input type="file" accept=".zip" onChange={(event) => importPackage(event, "contest")} /></label>
+          </div>
+          {contestReport && <PackageReport report={contestReport} />}
+        </section>
+      </div>
+      <p className="muted">{t("package.note")}</p>
+      <FlashMessage flash={flash} />
+    </section>
+  );
+}
+
+function PackageReport({ report }: { report: PackageImportReport }) {
+  const { t } = useI18n();
+  return (
+    <div className="report package-report">
+      <div className="stat"><strong>{report.created_tasks}</strong><span>{t("package.createdTasks")}</span></div>
+      <div className="stat"><strong>{report.created_tests}</strong><span>{t("package.createdTests")}</span></div>
+      <div className="stat"><strong>{report.contest_id ?? "-"}</strong><span>{t("package.contestId")}</span></div>
+    </div>
+  );
 }
 
 function TestsAdmin({ api }: { api: ApiClient }) {
