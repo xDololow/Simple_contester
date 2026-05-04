@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { API_BASE } from "../../api/client";
 import { FlashMessage, Header, SubmissionDetailView } from "../../components/shared";
 import { useI18n } from "../../i18n";
-import type { AdminStats, ApiClient, Contest, ContestStatus, Flash, ImportReport, JudgerWorker, PackageImportReport, ParticipationMode, Role, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
+import type { AdminStats, ApiClient, Contest, ContestStatus, Flash, ImportReport, JudgerEvent, JudgerWorker, PackageImportReport, ParticipationMode, Role, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
 import { emptyFlash, errorText, formatDate, formatScore, fromLocalInputValue, toLocalInputValue, verdictClass } from "../../utils/format";
 
 export function AdminDashboard({ api, token, reloadContests }: { api: ApiClient; token: string; reloadContests: () => void }) {
@@ -45,18 +45,21 @@ function StatusAdmin({ api }: { api: ApiClient }) {
   const { t } = useI18n();
   const [stats, setStats] = useState<AdminStats | null>(null);
   const [judgers, setJudgers] = useState<JudgerWorker[]>([]);
+  const [judgerEvents, setJudgerEvents] = useState<JudgerEvent[]>([]);
   const [flash, setFlash] = useState<Flash>(emptyFlash);
   const [loading, setLoading] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [nextStats, nextJudgers] = await Promise.all([
+      const [nextStats, nextJudgers, nextJudgerEvents] = await Promise.all([
         api<AdminStats>("/api/admin/stats"),
-        api<JudgerWorker[]>("/api/admin/judgers")
+        api<JudgerWorker[]>("/api/admin/judgers"),
+        api<JudgerEvent[]>("/api/admin/judger-events?limit=20")
       ]);
       setStats(nextStats);
       setJudgers(nextJudgers);
+      setJudgerEvents(nextJudgerEvents);
       setFlash(emptyFlash);
     } catch (error) {
       setFlash({ kind: "error", text: errorText(error) });
@@ -164,6 +167,7 @@ function StatusAdmin({ api }: { api: ApiClient }) {
             <StatusTable title={t("status.judgerRegistry")} rows={[[t("status.judgerActive"), stats.judgers.active], [t("status.judgerStale"), stats.judgers.stale], [t("status.judgerOffline"), stats.judgers.offline]]} empty={t("common.empty")} />
           )}
           <JudgerWorkersTable judgers={judgers} />
+          <JudgerEventsTable events={judgerEvents} />
           <StatusTable title={t("status.runningJudgers")} rows={runningJudgers} empty={t("common.empty")} />
           <StatusTable title={t("status.finishedJudgers24h")} rows={finishedJudgers} empty={t("common.empty")} />
         </div>
@@ -199,6 +203,37 @@ function JudgerWorkersTable({ judgers }: { judgers: JudgerWorker[] }) {
               <td>{judger.supported_languages.length}</td>
             </tr>
           )) : <tr><td colSpan={6} className="muted">{t("common.empty")}</td></tr>}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function JudgerEventsTable({ events }: { events: JudgerEvent[] }) {
+  const { t } = useI18n();
+  return (
+    <div className="status-card status-card-wide">
+      <h3>{t("status.judgerEvents")}</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>{t("table.time")}</th>
+            <th>{t("table.judger")}</th>
+            <th>{t("table.event")}</th>
+            <th>{t("table.submission")}</th>
+            <th>{t("table.message")}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {events.length ? events.map((event) => (
+            <tr key={event.id}>
+              <td>{formatDate(event.created_at)}</td>
+              <td>{event.judger_id}</td>
+              <td>{event.event_type}</td>
+              <td>{event.submission_id ?? t("common.none")}</td>
+              <td>{event.message || "-"}</td>
+            </tr>
+          )) : <tr><td colSpan={5} className="muted">{t("common.empty")}</td></tr>}
         </tbody>
       </table>
     </div>

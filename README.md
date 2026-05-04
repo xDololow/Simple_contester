@@ -107,6 +107,8 @@ Compose reads `.env` automatically. Start from `.env.example`; the defaults keep
 | `ADMIN_PASSWORD` | `admin` | Bootstrap admin password. |
 | `JUDGER_ID` | `docker-judger` | Worker ID written to claimed submissions. |
 | `POLL_INTERVAL_SECONDS` | `1` | Judger polling interval. |
+| `SUBMISSION_LEASE_SECONDS` | `60` | Lease duration for a claimed submission before another worker may reclaim it. |
+| `SUBMISSION_MAX_ATTEMPTS` | `3` | Maximum claim attempts before an expired running submission is marked Internal Error. |
 | `STOP_ON_FIRST_FAILED_TEST` | `1` | Set to `0` to run all tests after a failed test. |
 | `OUTPUT_LIMIT_BYTES` | `1048576` | Maximum combined stdout/stderr captured from a compile or run before the process is killed and reported as a runtime error. |
 | `PROCESS_LIMIT` | `256` | Per-run process limit applied with `RLIMIT_NPROC` where the host kernel enforces it. |
@@ -196,13 +198,21 @@ that exactly one assigned team membership is required.
 
 ## Scale Judgers
 
-Judger workers use row locking with `SKIP LOCKED`, so several workers can poll the same queue.
+Judger workers use row locking with `SKIP LOCKED`, so several workers can poll the same queue. A worker claim also writes a unique `claim_token`, `claimed_at`, `claim_expires_at`, `attempt_number`, and `judger_id` to the submission row.
 
 ```bash
 docker compose up --build --scale judger=3
 ```
 
 Do not publish ports on `judger`; scaling works because it is an internal worker service.
+
+Before each polling cycle, workers reclaim expired running submissions where `claim_expires_at` is in the past. Attempts below `SUBMISSION_MAX_ATTEMPTS` are returned to `Queued` and may be claimed again; once the max attempt count is reached, the submission is marked `Internal Error`. Active workers extend their lease around compile/run phases and before each test. Final reports and test-result writes are guarded by the current `claim_token`, so a stale worker cannot overwrite a submission that has already been reclaimed by another worker.
+
+Workers also write a compact audit trail to `judger_events` for startup,
+submission claim, compile/run start, finish, internal error, and shutdown.
+Admins can inspect recent events on the Status page or through
+`GET /api/admin/judger-events?limit=50` and
+`GET /api/admin/judgers/{judger_id}/events?limit=50`.
 
 ## Judger Sandbox Boundaries
 

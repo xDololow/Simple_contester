@@ -79,6 +79,7 @@ def test_admin_stats_contains_expected_counters(
     assert data["submissions"]["queue_depth"] == 0
     assert data["submissions"]["running_count"] == 1
     assert data["submissions"]["stale_running_count"] == 0
+    assert data["submissions"]["expired_running_leases"] == 0
     assert data["submissions"]["finished_1h"] == 1
     assert data["submissions"]["finished_24h"] == 1
     assert data["submissions"]["average_judging_time_seconds"] == 60
@@ -197,8 +198,10 @@ def test_admin_stats_counts_stale_running_submissions(
         assert fresh_submission is not None
         stale_submission.verdict = SubmissionVerdict.running
         stale_submission.started_at = now - timedelta(minutes=11)
+        stale_submission.claim_expires_at = now - timedelta(seconds=1)
         fresh_submission.verdict = SubmissionVerdict.running
         fresh_submission.started_at = now - timedelta(minutes=3)
+        fresh_submission.claim_expires_at = now + timedelta(minutes=1)
         db.commit()
 
     response = client.get("/api/admin/stats", headers=admin_headers)
@@ -207,3 +210,4 @@ def test_admin_stats_counts_stale_running_submissions(
     data = response.json()
     assert data["submissions"]["running_count"] == 2
     assert data["submissions"]["stale_running_count"] == 1
+    assert data["submissions"]["expired_running_leases"] == 1

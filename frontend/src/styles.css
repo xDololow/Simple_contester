@@ -537,6 +537,10 @@ p {
   min-width: 0;
 }
 
+.status-card-wide {
+  grid-column: 1 / -1;
+}
+
 .status-card h3 {
   margin-bottom: 10px;
   font-size: 14px;

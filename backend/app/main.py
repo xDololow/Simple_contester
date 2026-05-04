@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
 
 import yaml
-from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -26,6 +26,7 @@ from .models import (
     ContestTask,
     ContestTimeMode,
     Judger,
+    JudgerEvent,
     Language,
     ParticipantContest,
     Submission,
@@ -39,6 +40,7 @@ from .models import (
 )
 from .schemas import (
     AdminContestsStats,
+    AdminJudgerEventOut,
     AdminJudgerOut,
     AdminJudgerStats,
     AdminStatsOut,
@@ -633,6 +635,58 @@ def to_admin_judger_out(judger: Judger, current: datetime) -> AdminJudgerOut:
     )
 
 
+def decode_event_payload(value: str | None) -> object | None:
+    if not value:
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def to_admin_judger_event_out(event: JudgerEvent) -> AdminJudgerEventOut:
+    return AdminJudgerEventOut(
+        id=event.id,
+        judger_id=event.judger_id,
+        event_type=event.event_type,
+        submission_id=event.submission_id,
+        message=event.message,
+        payload=decode_event_payload(event.payload),
+        created_at=event.created_at,
+    )
+
+
+def record_judger_health_events(db: Session, judgers: list[Judger], current: datetime) -> None:
+    changed = False
+    for judger in judgers:
+        health = judger_health(judger, current)
+        if health not in {"stale", "offline"}:
+            continue
+        event_type = "heartbeat_missed" if health == "offline" else "heartbeat_stale"
+        latest_event = db.scalar(
+            select(JudgerEvent)
+            .where(JudgerEvent.judger_id == judger.judger_id)
+            .where(JudgerEvent.event_type == event_type)
+            .order_by(JudgerEvent.created_at.desc(), JudgerEvent.id.desc())
+            .limit(1)
+        )
+        if latest_event is not None and normalize_dt(latest_event.created_at) >= normalize_dt(judger.last_seen_at):
+            continue
+        age_seconds = max(0, int((current - normalize_dt(judger.last_seen_at)).total_seconds()))
+        db.add(
+            JudgerEvent(
+                judger_id=judger.judger_id,
+                event_type=event_type,
+                message=f"Heartbeat {health}",
+                payload=json.dumps({"age_seconds": age_seconds, "status": judger.status}),
+                created_at=current,
+            )
+        )
+        changed = True
+    if changed:
+        db.commit()
+
+
 @app.get("/api/admin/stats", response_model=AdminStatsOut)
 def admin_stats(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> AdminStatsOut:
     current = now_utc()
@@ -662,6 +716,13 @@ def admin_stats(_: User = Depends(require_admin), db: Session = Depends(get_db))
         .where(Submission.verdict == SubmissionVerdict.running)
         .where(Submission.started_at.is_not(None))
         .where(Submission.started_at < stale_running_before)
+    ) or 0
+    expired_running_leases = db.scalar(
+        select(func.count())
+        .select_from(Submission)
+        .where(Submission.verdict == SubmissionVerdict.running)
+        .where(Submission.claim_expires_at.is_not(None))
+        .where(Submission.claim_expires_at < current)
     ) or 0
     finished_1h = db.scalar(
         select(func.count()).select_from(Submission).where(Submission.finished_at.is_not(None)).where(Submission.finished_at >= one_hour_ago)
@@ -702,6 +763,7 @@ def admin_stats(_: User = Depends(require_admin), db: Session = Depends(get_db))
     except Exception:
         database_ok = False
     registered_judgers = db.scalars(select(Judger)).all()
+    record_judger_health_events(db, list(registered_judgers), current)
     judger_health_counts = {"active": 0, "stale": 0, "offline": 0}
     for judger in registered_judgers:
         judger_health_counts[judger_health(judger, current)] += 1
@@ -736,6 +798,7 @@ def admin_stats(_: User = Depends(require_admin), db: Session = Depends(get_db))
             running_count=running_count,
             oldest_queued_age_seconds=oldest_queued_age_seconds,
             stale_running_count=stale_running_count,
+            expired_running_leases=expired_running_leases,
             finished_1h=finished_1h,
             finished_24h=finished_24h,
             average_judging_time_seconds=average_judging_time_seconds,
@@ -760,7 +823,34 @@ def admin_stats(_: User = Depends(require_admin), db: Session = Depends(get_db))
 def list_admin_judgers(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> list[AdminJudgerOut]:
     current = now_utc()
     judgers = db.scalars(select(Judger).order_by(Judger.judger_id)).all()
+    record_judger_health_events(db, list(judgers), current)
     return [to_admin_judger_out(judger, current) for judger in judgers]
+
+
+@app.get("/api/admin/judger-events", response_model=list[AdminJudgerEventOut])
+def list_admin_judger_events(
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[AdminJudgerEventOut]:
+    events = db.scalars(select(JudgerEvent).order_by(JudgerEvent.created_at.desc(), JudgerEvent.id.desc()).limit(limit)).all()
+    return [to_admin_judger_event_out(event) for event in events]
+
+
+@app.get("/api/admin/judgers/{judger_id}/events", response_model=list[AdminJudgerEventOut])
+def list_admin_judger_events_for_judger(
+    judger_id: str,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[AdminJudgerEventOut]:
+    events = db.scalars(
+        select(JudgerEvent)
+        .where(JudgerEvent.judger_id == judger_id)
+        .order_by(JudgerEvent.created_at.desc(), JudgerEvent.id.desc())
+        .limit(limit)
+    ).all()
+    return [to_admin_judger_event_out(event) for event in events]
 
 
 @app.get("/api/teams", response_model=list[TeamOut])

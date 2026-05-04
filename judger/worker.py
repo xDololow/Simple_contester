@@ -6,7 +6,8 @@ import socket
 import tempfile
 import threading
 import time
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import create_engine, text
@@ -34,6 +35,8 @@ JUDGER_VERSION = os.getenv("JUDGER_VERSION", os.getenv("APP_VERSION", "unknown")
 JUDGER_SANDBOX_MODE = os.getenv("JUDGER_SANDBOX_MODE", "subprocess")
 POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "1"))
 HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("JUDGER_HEARTBEAT_INTERVAL_SECONDS", "5"))
+SUBMISSION_LEASE_SECONDS = int(os.getenv("SUBMISSION_LEASE_SECONDS", "60"))
+SUBMISSION_MAX_ATTEMPTS = int(os.getenv("SUBMISSION_MAX_ATTEMPTS", "3"))
 STOP_ON_FIRST_FAILED_TEST = os.getenv("STOP_ON_FIRST_FAILED_TEST", "0") != "0"
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
@@ -125,6 +128,36 @@ def register_or_update_judger(
         )
 
 
+def write_judger_event(
+    event_type: str,
+    submission_id: int | None = None,
+    message: str | None = None,
+    payload: dict[str, object] | None = None,
+) -> bool:
+    try:
+        payload_text = json.dumps(payload, sort_keys=True, default=str) if payload is not None else None
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO judger_events (judger_id, event_type, submission_id, message, payload, created_at)
+                    VALUES (:judger_id, :event_type, :submission_id, :message, :payload, :created_at)
+                    """
+                ),
+                {
+                    "judger_id": JUDGER_ID,
+                    "event_type": event_type,
+                    "submission_id": submission_id,
+                    "message": message,
+                    "payload": payload_text,
+                    "created_at": utc_now(),
+                },
+            )
+        return True
+    except Exception:
+        return False
+
+
 def set_judger_state(
     status: str,
     current_submission_id: int | None = None,
@@ -156,6 +189,7 @@ def request_stop(signum: int, frame: object) -> None:
 def mark_stopping() -> None:
     try:
         set_judger_state("stopping", None, state_last_error, write_now=True)
+        write_judger_event("stopping", message=state_last_error)
     except Exception:
         pass
 
@@ -165,20 +199,25 @@ def normalize_output(value: str) -> str:
 
 
 def acquire_submission() -> dict | None:
+    claim_token = uuid.uuid4().hex
+    claimed_at = utc_now()
+    claim_expires_at = claimed_at + timedelta(seconds=SUBMISSION_LEASE_SECONDS)
     with engine.begin() as conn:
         # The row lock plus SKIP LOCKED lets several judgers poll concurrently
         # without blocking each other or claiming the same queued submission.
+        lock_clause = "" if conn.dialect.name == "sqlite" else "FOR UPDATE SKIP LOCKED"
         row = conn.execute(
             text(
-                """
+                f"""
                 SELECT submissions.id, submissions.language, submissions.source_code, submissions.task_id,
+                       submissions.attempt_number,
                        tasks.time_limit_ms, tasks.memory_limit_mb, tasks.points, tasks.partial_scoring
                 FROM submissions
                 JOIN tasks ON tasks.id = submissions.task_id
-                WHERE verdict = 'queued'
-                ORDER BY created_at
+                WHERE submissions.verdict = 'queued'
+                ORDER BY submissions.created_at
                 LIMIT 1
-                FOR UPDATE SKIP LOCKED
+                {lock_clause}
                 """
             )
         ).mappings().first()
@@ -188,15 +227,119 @@ def acquire_submission() -> dict | None:
             text(
                 """
                 UPDATE submissions
-                SET verdict = 'running', started_at = :started_at, judger_id = :judger_id
+                SET verdict = 'running',
+                    started_at = COALESCE(started_at, :claimed_at),
+                    judger_id = :judger_id,
+                    claimed_at = :claimed_at,
+                    claim_expires_at = :claim_expires_at,
+                    claim_token = :claim_token,
+                    attempt_number = attempt_number + 1
                 WHERE id = :id AND verdict = 'queued'
                 """
             ),
-            {"id": row["id"], "started_at": utc_now(), "judger_id": JUDGER_ID},
+            {
+                "id": row["id"],
+                "claimed_at": claimed_at,
+                "claim_expires_at": claim_expires_at,
+                "claim_token": claim_token,
+                "judger_id": JUDGER_ID,
+            },
         )
         if result.rowcount != 1:
             return None
-        return dict(row)
+        claimed = dict(row)
+        claimed["claim_token"] = claim_token
+        claimed["claimed_at"] = claimed_at
+        claimed["claim_expires_at"] = claim_expires_at
+        return claimed
+
+
+def extend_submission_lease(submission_id: int, claim_token: str) -> bool:
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(
+                """
+                UPDATE submissions
+                SET claim_expires_at = :claim_expires_at
+                WHERE id = :id AND claim_token = :claim_token AND verdict = 'running'
+                """
+            ),
+            {
+                "id": submission_id,
+                "claim_token": claim_token,
+                "claim_expires_at": utc_now() + timedelta(seconds=SUBMISSION_LEASE_SECONDS),
+            },
+        )
+        return result.rowcount == 1
+
+
+def reclaim_expired_submissions() -> int:
+    now = utc_now()
+    with engine.begin() as conn:
+        rows = list(
+            conn.execute(
+                text(
+                    """
+                    SELECT id, attempt_number
+                    FROM submissions
+                    WHERE verdict = 'running'
+                      AND claim_expires_at IS NOT NULL
+                      AND claim_expires_at < :now
+                    """
+                ),
+                {"now": now},
+            ).mappings()
+        )
+        reclaimed = 0
+        for row in rows:
+            if int(row["attempt_number"] or 0) >= SUBMISSION_MAX_ATTEMPTS:
+                result = conn.execute(
+                    text(
+                        """
+                        UPDATE submissions
+                        SET verdict = 'internal_error',
+                            score = 0,
+                            compile_output = :compile_output,
+                            finished_at = :finished_at,
+                            claim_token = NULL,
+                            claim_expires_at = NULL,
+                            judger_id = NULL
+                        WHERE id = :id
+                          AND verdict = 'running'
+                          AND claim_expires_at IS NOT NULL
+                          AND claim_expires_at < :now
+                        """
+                    ),
+                    {
+                        "id": row["id"],
+                        "now": now,
+                        "finished_at": now,
+                        "compile_output": f"Submission lease expired after {SUBMISSION_MAX_ATTEMPTS} attempts",
+                    },
+                )
+            else:
+                conn.execute(text("DELETE FROM test_results WHERE submission_id = :id"), {"id": row["id"]})
+                result = conn.execute(
+                    text(
+                        """
+                        UPDATE submissions
+                        SET verdict = 'queued',
+                            started_at = NULL,
+                            finished_at = NULL,
+                            judger_id = NULL,
+                            claimed_at = NULL,
+                            claim_expires_at = NULL,
+                            claim_token = NULL
+                        WHERE id = :id
+                          AND verdict = 'running'
+                          AND claim_expires_at IS NOT NULL
+                          AND claim_expires_at < :now
+                        """
+                    ),
+                    {"id": row["id"], "now": now},
+                )
+            reclaimed += result.rowcount
+        return reclaimed
 
 
 def fetch_tests(task_id: int) -> list[dict]:
@@ -210,7 +353,7 @@ def fetch_tests(task_id: int) -> list[dict]:
 
 
 def verdict_to_db(verdict: str) -> str:
-    return {
+    verdicts = {
         VERDICT_ACCEPTED: "accepted",
         VERDICT_WRONG_ANSWER: "wrong_answer",
         VERDICT_TIME_LIMIT: "time_limit",
@@ -218,7 +361,8 @@ def verdict_to_db(verdict: str) -> str:
         VERDICT_RUNTIME_ERROR: "runtime_error",
         VERDICT_COMPILATION_ERROR: "compilation_error",
         VERDICT_INTERNAL_ERROR: "internal_error",
-    }[verdict]
+    }
+    return verdicts.get(verdict, verdict)
 
 
 def calculate_score(points: float, accepted_count: int, test_count: int, partial_scoring: bool = False) -> float:
@@ -229,28 +373,50 @@ def calculate_score(points: float, accepted_count: int, test_count: int, partial
     return round((accepted_count / test_count) * float(points), 2)
 
 
-def finish_submission(submission_id: int, verdict: str, score: float, compile_output: str = "") -> None:
+def finish_submission(submission_id: int, verdict: str, score: float, compile_output: str = "", claim_token: str | None = None) -> bool:
+    token_filter = "" if claim_token is None else "AND claim_token = :claim_token"
     with engine.begin() as conn:
-        conn.execute(
+        result = conn.execute(
             text(
-                """
+                f"""
                 UPDATE submissions
-                SET verdict = :verdict, score = :score, compile_output = :compile_output, finished_at = :finished_at
+                SET verdict = :verdict,
+                    score = :score,
+                    compile_output = :compile_output,
+                    finished_at = :finished_at,
+                    claim_token = NULL,
+                    claim_expires_at = NULL
                 WHERE id = :id
+                {token_filter}
                 """
             ),
             {
                 "id": submission_id,
+                "claim_token": claim_token,
                 "verdict": verdict_to_db(verdict),
                 "score": score,
                 "compile_output": compile_output[:8000],
                 "finished_at": utc_now(),
             },
         )
+        return result.rowcount == 1
 
 
-def insert_result(submission_id: int, test_id: int, verdict: str, time_ms: int, output: str, error: str) -> None:
+def insert_result(submission_id: int, test_id: int, verdict: str, time_ms: int, output: str, error: str, claim_token: str | None = None) -> bool:
     with engine.begin() as conn:
+        if claim_token is not None:
+            current = conn.execute(
+                text(
+                    """
+                    SELECT 1
+                    FROM submissions
+                    WHERE id = :submission_id AND claim_token = :claim_token AND verdict = 'running'
+                    """
+                ),
+                {"submission_id": submission_id, "claim_token": claim_token},
+            ).first()
+            if current is None:
+                return False
         conn.execute(
             text(
                 """
@@ -267,13 +433,17 @@ def insert_result(submission_id: int, test_id: int, verdict: str, time_ms: int, 
                 "error": error[:8000],
             },
         )
+        return True
 
 
 def judge(submission: dict) -> None:
+    claim_token = submission["claim_token"]
+    event_payload = {"claim_token": claim_token, "attempt_number": submission.get("attempt_number")}
     tests = fetch_tests(submission["task_id"])
     if not tests:
         set_judger_state("reporting", submission["id"])
-        finish_submission(submission["id"], VERDICT_INTERNAL_ERROR, 0, "Task has no tests")
+        finish_submission(submission["id"], VERDICT_INTERNAL_ERROR, 0, "Task has no tests", claim_token)
+        write_judger_event("failed_submission", submission["id"], "Task has no tests", event_payload)
         return
 
     with tempfile.TemporaryDirectory(prefix="simple-contester-") as tmp:
@@ -282,7 +452,10 @@ def judge(submission: dict) -> None:
             time_limit_ms=submission["time_limit_ms"],
             memory_limit_mb=submission["memory_limit_mb"],
         )
+        if not extend_submission_lease(submission["id"], claim_token):
+            return
         set_judger_state("compiling", submission["id"])
+        write_judger_event("compile_started", submission["id"], payload=event_payload)
         runner = create_runner(submission["language"], workdir, submission["source_code"], limits)
         if runner is None:
             set_judger_state("reporting", submission["id"])
@@ -291,9 +464,18 @@ def judge(submission: dict) -> None:
                 VERDICT_COMPILATION_ERROR,
                 0,
                 f"Unsupported language: {submission['language']}",
+                claim_token,
+            )
+            write_judger_event(
+                "failed_submission",
+                submission["id"],
+                f"Unsupported language: {submission['language']}",
+                event_payload,
             )
             return
         compiled = runner.compile()
+        if not extend_submission_lease(submission["id"], claim_token):
+            return
         if compiled.command is None:
             set_judger_state("reporting", submission["id"])
             finish_submission(
@@ -301,13 +483,23 @@ def judge(submission: dict) -> None:
                 compiled.verdict or VERDICT_COMPILATION_ERROR,
                 0,
                 compiled.output,
+                claim_token,
+            )
+            write_judger_event(
+                "failed_submission",
+                submission["id"],
+                compiled.output[:500] or "Compilation failed",
+                {**event_payload, "verdict": compiled.verdict or VERDICT_COMPILATION_ERROR},
             )
             return
 
         final_verdict = VERDICT_ACCEPTED
         accepted_count = 0
         set_judger_state("running", submission["id"])
+        write_judger_event("run_started", submission["id"], payload={**event_payload, "tests": len(tests)})
         for case in tests:
+            if not extend_submission_lease(submission["id"], claim_token):
+                return
             with copy_run_workspace(workdir) as run_tmp:
                 run_workdir = Path(run_tmp)
                 run_result = run_program(
@@ -332,6 +524,7 @@ def judge(submission: dict) -> None:
                 run_result.time_ms,
                 run_result.stdout,
                 run_result.stderr,
+                claim_token,
             )
             if final_verdict == VERDICT_ACCEPTED and verdict != VERDICT_ACCEPTED:
                 final_verdict = verdict
@@ -343,6 +536,12 @@ def judge(submission: dict) -> None:
             submission["id"],
             final_verdict,
             score,
+            claim_token=claim_token,
+        )
+        write_judger_event(
+            "finished_submission",
+            submission["id"],
+            payload={**event_payload, "verdict": final_verdict, "score": score},
         )
 
 
@@ -351,24 +550,41 @@ def main() -> None:
     signal.signal(signal.SIGINT, request_stop)
     atexit.register(mark_stopping)
     set_judger_state("starting", None)
+    write_judger_event("started", message="Judger registered", payload={"version": JUDGER_VERSION})
     heartbeat = threading.Thread(target=heartbeat_loop, daemon=True)
     heartbeat.start()
     try:
         while not stop_event.is_set():
             set_judger_state("polling", None, write_now=False)
+            reclaim_expired_submissions()
             set_judger_state("claiming", None, write_now=False)
             submission = acquire_submission()
             if submission is None:
                 set_judger_state("idle", None, write_now=False)
                 stop_event.wait(POLL_INTERVAL_SECONDS)
                 continue
+            write_judger_event(
+                "claimed_submission",
+                submission["id"],
+                payload={
+                    "claim_token": submission.get("claim_token"),
+                    "claim_expires_at": submission.get("claim_expires_at"),
+                    "attempt_number": submission.get("attempt_number"),
+                },
+            )
             try:
                 judge(submission)
                 set_judger_state("idle", None)
             except Exception as exc:
                 message = str(exc)
                 set_judger_state("reporting", submission["id"], message)
-                finish_submission(submission["id"], "internal_error", 0, message)
+                finish_submission(submission["id"], VERDICT_INTERNAL_ERROR, 0, message, submission.get("claim_token"))
+                write_judger_event(
+                    "internal_error",
+                    submission["id"],
+                    message,
+                    {"claim_token": submission.get("claim_token"), "attempt_number": submission.get("attempt_number")},
+                )
                 set_judger_state("idle", None, message)
     finally:
         stop_event.set()

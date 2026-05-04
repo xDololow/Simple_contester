@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import Boolean, DateTime, Enum as SAEnum, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Enum as SAEnum, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -201,6 +201,9 @@ class TaskTest(Base):
 
 class Submission(Base):
     __tablename__ = "submissions"
+    __table_args__ = (
+        Index("ix_submissions_verdict_claim_expires_at", "verdict", "claim_expires_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     contest_id: Mapped[int] = mapped_column(ForeignKey("contests.id", ondelete="CASCADE"), index=True)
@@ -216,6 +219,10 @@ class Submission(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     judger_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    claim_token: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    attempt_number: Mapped[int] = mapped_column(Integer, default=0)
 
     results: Mapped[list["TestResult"]] = relationship(back_populates="submission", cascade="all, delete-orphan")
 
@@ -237,6 +244,18 @@ class Judger(Base):
     last_state_change_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class JudgerEvent(Base):
+    __tablename__ = "judger_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    judger_id: Mapped[str] = mapped_column(String(120), index=True)
+    event_type: Mapped[str] = mapped_column(String(80))
+    submission_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
 
 
 class TestResult(Base):

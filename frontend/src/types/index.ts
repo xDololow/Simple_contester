@@ -171,6 +171,7 @@ export type AdminStats = {
     running_count: number;
     oldest_queued_age_seconds: number | null;
     stale_running_count: number;
+    expired_running_leases: number;
     finished_1h: number;
     finished_24h: number;
     average_judging_time_seconds: number | null;
@@ -213,4 +214,14 @@ export type JudgerWorker = {
   last_state_change_at: string;
   enabled: boolean;
   last_error: string | null;
+};
+
+export type JudgerEvent = {
+  id: number;
+  judger_id: string;
+  event_type: string;
+  submission_id: number | null;
+  message: string | null;
+  payload: unknown | null;
+  created_at: string;
 };

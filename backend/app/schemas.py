@@ -76,6 +76,7 @@ class AdminSubmissionsStats(BaseModel):
     running_count: int
     oldest_queued_age_seconds: int | None = None
     stale_running_count: int
+    expired_running_leases: int
     finished_1h: int
     finished_24h: int
     average_judging_time_seconds: float | None = None
@@ -128,6 +129,16 @@ class AdminJudgerOut(BaseModel):
     last_state_change_at: datetime
     enabled: bool
     last_error: str | None = None
+
+
+class AdminJudgerEventOut(BaseModel):
+    id: int
+    judger_id: str
+    event_type: str
+    submission_id: int | None = None
+    message: str | None = None
+    payload: Any | None = None
+    created_at: datetime
 
 
 class TeamCreate(BaseModel):
@@ -307,6 +318,9 @@ class SubmissionOut(BaseModel):
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+    claimed_at: datetime | None = None
+    claim_expires_at: datetime | None = None
+    attempt_number: int = 0
 
 
 class TestResultOut(BaseModel):
