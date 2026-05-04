@@ -1,5 +1,10 @@
+import atexit
+import json
 import os
+import signal
+import socket
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -8,6 +13,7 @@ from sqlalchemy import create_engine, text
 
 from runners import (
     Limits,
+    RUNNERS,
     VERDICT_ACCEPTED,
     VERDICT_COMPILATION_ERROR,
     VERDICT_INTERNAL_ERROR,
@@ -24,14 +30,134 @@ from runners import (
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./simple_contester.db")
 JUDGER_ID = os.getenv("JUDGER_ID", "local-judger")
+JUDGER_VERSION = os.getenv("JUDGER_VERSION", os.getenv("APP_VERSION", "unknown"))
+JUDGER_SANDBOX_MODE = os.getenv("JUDGER_SANDBOX_MODE", "subprocess")
 POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "1"))
+HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("JUDGER_HEARTBEAT_INTERVAL_SECONDS", "5"))
 STOP_ON_FIRST_FAILED_TEST = os.getenv("STOP_ON_FIRST_FAILED_TEST", "0") != "0"
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+state_lock = threading.Lock()
+state_status = "starting"
+state_current_submission_id: int | None = None
+state_last_error: str | None = None
+stop_event = threading.Event()
 
 
 def utc_now() -> datetime:
     return datetime.utcnow()
+
+
+def supported_languages() -> list[str]:
+    return sorted(RUNNERS)
+
+
+def judger_capabilities() -> dict[str, object]:
+    return {
+        "stop_on_first_failed_test": STOP_ON_FIRST_FAILED_TEST,
+        "output_limit_bytes": int(os.getenv("OUTPUT_LIMIT_BYTES", str(1024 * 1024))),
+        "process_limit": int(os.getenv("PROCESS_LIMIT", "256")),
+        "file_size_limit_bytes": int(os.getenv("FILE_SIZE_LIMIT_BYTES", str(16 * 1024 * 1024))),
+    }
+
+
+def register_or_update_judger(
+    status: str,
+    current_submission_id: int | None = None,
+    last_error: str | None = None,
+) -> None:
+    now = utc_now()
+    metadata = {
+        "judger_id": JUDGER_ID,
+        "hostname": socket.gethostname(),
+        "version": JUDGER_VERSION,
+        "supported_languages": json.dumps(supported_languages()),
+        "sandbox_mode": JUDGER_SANDBOX_MODE,
+        "capabilities": json.dumps(judger_capabilities(), sort_keys=True),
+        "status": status,
+        "current_submission_id": current_submission_id,
+        "last_error": last_error,
+        "now": now,
+    }
+    with engine.begin() as conn:
+        existing = conn.execute(
+            text("SELECT status FROM judgers WHERE judger_id = :judger_id"),
+            {"judger_id": JUDGER_ID},
+        ).mappings().first()
+        if existing is None:
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO judgers (
+                        judger_id, hostname, version, supported_languages, sandbox_mode, capabilities,
+                        status, current_submission_id, registered_at, last_seen_at,
+                        last_state_change_at, enabled, last_error
+                    )
+                    VALUES (
+                        :judger_id, :hostname, :version, :supported_languages, :sandbox_mode, :capabilities,
+                        :status, :current_submission_id, :now, :now, :now, 1, :last_error
+                    )
+                    """
+                ),
+                metadata,
+            )
+            return
+        last_state_change_at = now if existing["status"] != status else None
+        conn.execute(
+            text(
+                """
+                UPDATE judgers
+                SET hostname = :hostname,
+                    version = :version,
+                    supported_languages = :supported_languages,
+                    sandbox_mode = :sandbox_mode,
+                    capabilities = :capabilities,
+                    status = :status,
+                    current_submission_id = :current_submission_id,
+                    last_seen_at = :now,
+                    last_state_change_at = COALESCE(:last_state_change_at, last_state_change_at),
+                    enabled = 1,
+                    last_error = :last_error
+                WHERE judger_id = :judger_id
+                """
+            ),
+            {**metadata, "last_state_change_at": last_state_change_at},
+        )
+
+
+def set_judger_state(
+    status: str,
+    current_submission_id: int | None = None,
+    last_error: str | None = None,
+    write_now: bool = True,
+) -> None:
+    global state_status, state_current_submission_id, state_last_error
+    with state_lock:
+        state_status = status
+        state_current_submission_id = current_submission_id
+        state_last_error = last_error
+    if write_now:
+        register_or_update_judger(status, current_submission_id, last_error)
+
+
+def heartbeat_loop() -> None:
+    while not stop_event.wait(HEARTBEAT_INTERVAL_SECONDS):
+        with state_lock:
+            status = state_status
+            current_submission_id = state_current_submission_id
+            last_error = state_last_error
+        register_or_update_judger(status, current_submission_id, last_error)
+
+
+def request_stop(signum: int, frame: object) -> None:
+    stop_event.set()
+
+
+def mark_stopping() -> None:
+    try:
+        set_judger_state("stopping", None, state_last_error, write_now=True)
+    except Exception:
+        pass
 
 
 def normalize_output(value: str) -> str:
@@ -146,6 +272,7 @@ def insert_result(submission_id: int, test_id: int, verdict: str, time_ms: int, 
 def judge(submission: dict) -> None:
     tests = fetch_tests(submission["task_id"])
     if not tests:
+        set_judger_state("reporting", submission["id"])
         finish_submission(submission["id"], VERDICT_INTERNAL_ERROR, 0, "Task has no tests")
         return
 
@@ -155,8 +282,10 @@ def judge(submission: dict) -> None:
             time_limit_ms=submission["time_limit_ms"],
             memory_limit_mb=submission["memory_limit_mb"],
         )
+        set_judger_state("compiling", submission["id"])
         runner = create_runner(submission["language"], workdir, submission["source_code"], limits)
         if runner is None:
+            set_judger_state("reporting", submission["id"])
             finish_submission(
                 submission["id"],
                 VERDICT_COMPILATION_ERROR,
@@ -166,6 +295,7 @@ def judge(submission: dict) -> None:
             return
         compiled = runner.compile()
         if compiled.command is None:
+            set_judger_state("reporting", submission["id"])
             finish_submission(
                 submission["id"],
                 compiled.verdict or VERDICT_COMPILATION_ERROR,
@@ -176,6 +306,7 @@ def judge(submission: dict) -> None:
 
         final_verdict = VERDICT_ACCEPTED
         accepted_count = 0
+        set_judger_state("running", submission["id"])
         for case in tests:
             with copy_run_workspace(workdir) as run_tmp:
                 run_workdir = Path(run_tmp)
@@ -207,6 +338,7 @@ def judge(submission: dict) -> None:
             if STOP_ON_FIRST_FAILED_TEST and verdict != VERDICT_ACCEPTED:
                 break
         score = calculate_score(submission["points"], accepted_count, len(tests), bool(submission["partial_scoring"]))
+        set_judger_state("reporting", submission["id"])
         finish_submission(
             submission["id"],
             final_verdict,
@@ -215,15 +347,32 @@ def judge(submission: dict) -> None:
 
 
 def main() -> None:
-    while True:
-        submission = acquire_submission()
-        if submission is None:
-            time.sleep(POLL_INTERVAL_SECONDS)
-            continue
-        try:
-            judge(submission)
-        except Exception as exc:
-            finish_submission(submission["id"], "internal_error", 0, str(exc))
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    atexit.register(mark_stopping)
+    set_judger_state("starting", None)
+    heartbeat = threading.Thread(target=heartbeat_loop, daemon=True)
+    heartbeat.start()
+    try:
+        while not stop_event.is_set():
+            set_judger_state("polling", None, write_now=False)
+            set_judger_state("claiming", None, write_now=False)
+            submission = acquire_submission()
+            if submission is None:
+                set_judger_state("idle", None, write_now=False)
+                stop_event.wait(POLL_INTERVAL_SECONDS)
+                continue
+            try:
+                judge(submission)
+                set_judger_state("idle", None)
+            except Exception as exc:
+                message = str(exc)
+                set_judger_state("reporting", submission["id"], message)
+                finish_submission(submission["id"], "internal_error", 0, message)
+                set_judger_state("idle", None, message)
+    finally:
+        stop_event.set()
+        mark_stopping()
 
 
 if __name__ == "__main__":

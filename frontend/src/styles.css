@@ -547,6 +547,68 @@ p {
   margin-bottom: 0;
 }
 
+.status-kv {
+  margin-top: 10px;
+}
+
+.metric-bar {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.metric-bar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.metric-bar-head span {
+  color: #4a5964;
+  min-width: 0;
+}
+
+.metric-bar-track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e5ebef;
+}
+
+.metric-bar-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #2f6f9c;
+}
+
+.metric-bar.ok .metric-bar-track span {
+  background: #2f8f5b;
+}
+
+.metric-bar.warn .metric-bar-track span {
+  background: #c47a2c;
+}
+
+.latency-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid #e1e7eb;
+  font-size: 13px;
+}
+
+.latency-row:last-child {
+  border-bottom: 0;
+}
+
+.latency-row span {
+  color: #4a5964;
+}
+
 .contest {
   display: grid;
   gap: 16px;

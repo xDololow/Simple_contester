@@ -34,6 +34,7 @@ def test_alembic_upgrade_creates_current_schema(tmp_path, monkeypatch) -> None:
         "task_tests",
         "submissions",
         "test_results",
+        "judgers",
     }.issubset(tables)
     assert "is_public" in contest_columns
     assert participant_columns["started_at"]["nullable"] is True

@@ -167,12 +167,25 @@ export type AdminStats = {
     running: number;
     recent_1h: number;
     recent_24h: number;
+    queue_depth: number;
+    running_count: number;
+    oldest_queued_age_seconds: number | null;
+    stale_running_count: number;
+    finished_1h: number;
+    finished_24h: number;
+    average_judging_time_seconds: number | null;
+    p95_judging_time_seconds: number | null;
+    internal_error_count: number;
+    internal_error_rate: number;
     accepted_rate: number;
     average_score: number;
   };
   judgers: {
     running_by_judger_id: Record<string, number>;
     recent_finished_by_judger_id: Record<string, number>;
+    active: number;
+    stale: number;
+    offline: number;
   };
   system: {
     server_time: string;
@@ -180,4 +193,24 @@ export type AdminStats = {
     app_version: string;
     build: string;
   };
+};
+
+export type JudgerHealth = "active" | "stale" | "offline";
+
+export type JudgerWorker = {
+  id: number;
+  judger_id: string;
+  hostname: string;
+  version: string;
+  supported_languages: string[];
+  sandbox_mode: string;
+  capabilities: Record<string, unknown>;
+  status: string;
+  health: JudgerHealth;
+  current_submission_id: number | null;
+  registered_at: string;
+  last_seen_at: string;
+  last_state_change_at: string;
+  enabled: boolean;
+  last_error: string | null;
 };

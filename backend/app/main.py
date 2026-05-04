@@ -25,6 +25,7 @@ from .models import (
     ContestTeam,
     ContestTask,
     ContestTimeMode,
+    Judger,
     Language,
     ParticipantContest,
     Submission,
@@ -38,6 +39,7 @@ from .models import (
 )
 from .schemas import (
     AdminContestsStats,
+    AdminJudgerOut,
     AdminJudgerStats,
     AdminStatsOut,
     AdminSubmissionsStats,
@@ -82,6 +84,9 @@ PACKAGE_FORMAT_VERSION = 1
 PACKAGE_MAX_FILES = 500
 PACKAGE_MAX_TOTAL_BYTES = 20 * 1024 * 1024
 PACKAGE_MAX_FILE_BYTES = 5 * 1024 * 1024
+STALE_RUNNING_SECONDS = 10 * 60
+JUDGER_ACTIVE_SECONDS = 15
+JUDGER_OFFLINE_SECONDS = 60
 
 app = FastAPI(title="Simple Contester")
 app.add_middleware(
@@ -567,19 +572,119 @@ def grouped_counts(db: Session, column: object) -> dict[object, int]:
     return {key: count for key, count in rows}
 
 
+def percentile_nearest_rank(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, int((percentile / 100) * len(ordered) + 0.999999) - 1))
+    return ordered[index]
+
+
+def decode_json_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [str(item) for item in data]
+
+
+def decode_json_dict(value: str | None) -> dict[str, object]:
+    if not value:
+        return {}
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def judger_health(judger: Judger, current: datetime) -> str:
+    if not judger.enabled or judger.status == "offline":
+        return "offline"
+    age_seconds = (current - normalize_dt(judger.last_seen_at)).total_seconds()
+    if age_seconds <= JUDGER_ACTIVE_SECONDS:
+        return "active"
+    if age_seconds <= JUDGER_OFFLINE_SECONDS:
+        return "stale"
+    return "offline"
+
+
+def to_admin_judger_out(judger: Judger, current: datetime) -> AdminJudgerOut:
+    return AdminJudgerOut(
+        id=judger.id,
+        judger_id=judger.judger_id,
+        hostname=judger.hostname,
+        version=judger.version,
+        supported_languages=decode_json_list(judger.supported_languages),
+        sandbox_mode=judger.sandbox_mode,
+        capabilities=decode_json_dict(judger.capabilities),
+        status=judger.status,
+        health=judger_health(judger, current),
+        current_submission_id=judger.current_submission_id,
+        registered_at=judger.registered_at,
+        last_seen_at=judger.last_seen_at,
+        last_state_change_at=judger.last_state_change_at,
+        enabled=judger.enabled,
+        last_error=judger.last_error,
+    )
+
+
 @app.get("/api/admin/stats", response_model=AdminStatsOut)
 def admin_stats(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> AdminStatsOut:
     current = now_utc()
     one_hour_ago = current - timedelta(hours=1)
     one_day_ago = current - timedelta(hours=24)
+    stale_running_before = current - timedelta(seconds=STALE_RUNNING_SECONDS)
 
     users_by_role = grouped_counts(db, User.role)
     contests_by_status = grouped_counts(db, Contest.status)
     submissions_by_verdict = grouped_counts(db, Submission.verdict)
     submissions_by_language = grouped_counts(db, Submission.language)
     submission_total = sum(submissions_by_verdict.values())
+    queue_depth = submissions_by_verdict.get(SubmissionVerdict.queued, 0)
+    running_count = submissions_by_verdict.get(SubmissionVerdict.running, 0)
     accepted_total = submissions_by_verdict.get(SubmissionVerdict.accepted, 0)
+    internal_error_count = submissions_by_verdict.get(SubmissionVerdict.internal_error, 0)
     average_score = db.scalar(select(func.avg(Submission.score))) if submission_total else 0
+    oldest_queued_at = db.scalar(
+        select(func.min(Submission.created_at)).where(Submission.verdict == SubmissionVerdict.queued)
+    )
+    oldest_queued_age_seconds = None
+    if oldest_queued_at is not None:
+        oldest_queued_age_seconds = max(0, int((current - normalize_dt(oldest_queued_at)).total_seconds()))
+    stale_running_count = db.scalar(
+        select(func.count())
+        .select_from(Submission)
+        .where(Submission.verdict == SubmissionVerdict.running)
+        .where(Submission.started_at.is_not(None))
+        .where(Submission.started_at < stale_running_before)
+    ) or 0
+    finished_1h = db.scalar(
+        select(func.count()).select_from(Submission).where(Submission.finished_at.is_not(None)).where(Submission.finished_at >= one_hour_ago)
+    ) or 0
+    finished_24h = db.scalar(
+        select(func.count()).select_from(Submission).where(Submission.finished_at.is_not(None)).where(Submission.finished_at >= one_day_ago)
+    ) or 0
+    judging_rows = db.execute(
+        select(Submission.started_at, Submission.finished_at)
+        .where(Submission.started_at.is_not(None))
+        .where(Submission.finished_at.is_not(None))
+    ).all()
+    judging_durations = []
+    for started_at, finished_at in judging_rows:
+        normalized_started_at = normalize_dt(started_at)
+        normalized_finished_at = normalize_dt(finished_at)
+        if normalized_finished_at >= normalized_started_at:
+            judging_durations.append((normalized_finished_at - normalized_started_at).total_seconds())
+    average_judging_time_seconds = (
+        round(sum(judging_durations) / len(judging_durations), 2) if judging_durations else None
+    )
+    p95_judging_time = percentile_nearest_rank(judging_durations, 95)
+    p95_judging_time_seconds = round(p95_judging_time, 2) if p95_judging_time is not None else None
     running_by_judger = db.execute(
         select(Submission.judger_id, func.count())
         .where(Submission.verdict == SubmissionVerdict.running)
@@ -596,6 +701,10 @@ def admin_stats(_: User = Depends(require_admin), db: Session = Depends(get_db))
         db.execute(text("SELECT 1")).scalar()
     except Exception:
         database_ok = False
+    registered_judgers = db.scalars(select(Judger)).all()
+    judger_health_counts = {"active": 0, "stale": 0, "offline": 0}
+    for judger in registered_judgers:
+        judger_health_counts[judger_health(judger, current)] += 1
 
     return AdminStatsOut(
         users=AdminUsersStats(
@@ -619,19 +728,39 @@ def admin_stats(_: User = Depends(require_admin), db: Session = Depends(get_db))
             total=submission_total,
             by_verdict={verdict: submissions_by_verdict.get(verdict, 0) for verdict in SubmissionVerdict},
             by_language={language: submissions_by_language.get(language, 0) for language in Language},
-            queued=submissions_by_verdict.get(SubmissionVerdict.queued, 0),
-            running=submissions_by_verdict.get(SubmissionVerdict.running, 0),
+            queued=queue_depth,
+            running=running_count,
             recent_1h=db.scalar(select(func.count()).select_from(Submission).where(Submission.created_at >= one_hour_ago)) or 0,
             recent_24h=db.scalar(select(func.count()).select_from(Submission).where(Submission.created_at >= one_day_ago)) or 0,
+            queue_depth=queue_depth,
+            running_count=running_count,
+            oldest_queued_age_seconds=oldest_queued_age_seconds,
+            stale_running_count=stale_running_count,
+            finished_1h=finished_1h,
+            finished_24h=finished_24h,
+            average_judging_time_seconds=average_judging_time_seconds,
+            p95_judging_time_seconds=p95_judging_time_seconds,
+            internal_error_count=internal_error_count,
+            internal_error_rate=round((internal_error_count / submission_total) * 100, 2) if submission_total else 0,
             accepted_rate=round((accepted_total / submission_total) * 100, 2) if submission_total else 0,
             average_score=round(float(average_score or 0), 2),
         ),
         judgers=AdminJudgerStats(
             running_by_judger_id={judger_id or "unknown": count for judger_id, count in running_by_judger},
             recent_finished_by_judger_id={judger_id or "unknown": count for judger_id, count in recent_finished_by_judger},
+            active=judger_health_counts["active"],
+            stale=judger_health_counts["stale"],
+            offline=judger_health_counts["offline"],
         ),
         system=AdminSystemStats(server_time=current, database_ok=database_ok),
     )
+
+
+@app.get("/api/admin/judgers", response_model=list[AdminJudgerOut])
+def list_admin_judgers(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> list[AdminJudgerOut]:
+    current = now_utc()
+    judgers = db.scalars(select(Judger).order_by(Judger.judger_id)).all()
+    return [to_admin_judger_out(judger, current) for judger in judgers]
 
 
 @app.get("/api/teams", response_model=list[TeamOut])

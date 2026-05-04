@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { API_BASE } from "../../api/client";
 import { FlashMessage, Header, SubmissionDetailView } from "../../components/shared";
 import { useI18n } from "../../i18n";
-import type { AdminStats, ApiClient, Contest, ContestStatus, Flash, ImportReport, PackageImportReport, ParticipationMode, Role, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
+import type { AdminStats, ApiClient, Contest, ContestStatus, Flash, ImportReport, JudgerWorker, PackageImportReport, ParticipationMode, Role, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
 import { emptyFlash, errorText, formatDate, formatScore, fromLocalInputValue, toLocalInputValue, verdictClass } from "../../utils/format";
 
 export function AdminDashboard({ api, token, reloadContests }: { api: ApiClient; token: string; reloadContests: () => void }) {
@@ -44,13 +44,19 @@ export function AdminDashboard({ api, token, reloadContests }: { api: ApiClient;
 function StatusAdmin({ api }: { api: ApiClient }) {
   const { t } = useI18n();
   const [stats, setStats] = useState<AdminStats | null>(null);
+  const [judgers, setJudgers] = useState<JudgerWorker[]>([]);
   const [flash, setFlash] = useState<Flash>(emptyFlash);
   const [loading, setLoading] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      setStats(await api<AdminStats>("/api/admin/stats"));
+      const [nextStats, nextJudgers] = await Promise.all([
+        api<AdminStats>("/api/admin/stats"),
+        api<JudgerWorker[]>("/api/admin/judgers")
+      ]);
+      setStats(nextStats);
+      setJudgers(nextJudgers);
       setFlash(emptyFlash);
     } catch (error) {
       setFlash({ kind: "error", text: errorText(error) });
@@ -69,6 +75,8 @@ function StatusAdmin({ api }: { api: ApiClient }) {
   const languageRows = stats ? Object.entries(stats.submissions.by_language).filter(([, count]) => count > 0) : [];
   const runningJudgers = stats ? Object.entries(stats.judgers.running_by_judger_id) : [];
   const finishedJudgers = stats ? Object.entries(stats.judgers.recent_finished_by_judger_id) : [];
+  const maxThroughput = stats ? Math.max(stats.submissions.finished_1h, stats.submissions.finished_24h, 1) : 1;
+  const maxQueue = stats ? Math.max(stats.submissions.queue_depth, stats.submissions.running_count, stats.submissions.stale_running_count, 1) : 1;
 
   return (
     <section className="panel">
@@ -94,13 +102,48 @@ function StatusAdmin({ api }: { api: ApiClient }) {
           <div className="stat"><strong>{stats.tasks_total}</strong><span>{t("tab.tasks")}</span></div>
           <div className="stat"><strong>{stats.tests_total}</strong><span>{t("tab.tests")}</span></div>
           <div className="stat"><strong>{stats.submissions.total}</strong><span>{t("tab.submissions")}</span></div>
-          <div className="stat"><strong>{stats.submissions.queued}</strong><span>{t("verdict.Queued")}</span></div>
-          <div className="stat"><strong>{stats.submissions.running}</strong><span>{t("verdict.Running")}</span></div>
+          <div className="stat"><strong>{stats.submissions.queue_depth}</strong><span>{t("status.queueDepth")}</span></div>
+          <div className="stat"><strong>{stats.submissions.running_count}</strong><span>{t("status.runningCount")}</span></div>
           <div className="stat"><strong>{stats.submissions.accepted_rate}%</strong><span>{t("status.acceptedRate")}</span></div>
           <div className="stat"><strong>{formatScore(stats.submissions.average_score)}</strong><span>{t("status.averageScore")}</span></div>
-          <div className="stat"><strong>{stats.submissions.recent_1h}</strong><span>{t("status.recent1h")}</span></div>
-          <div className="stat"><strong>{stats.submissions.recent_24h}</strong><span>{t("status.recent24h")}</span></div>
+          <div className="stat"><strong>{stats.submissions.finished_1h}</strong><span>{t("status.finished1h")}</span></div>
+          <div className="stat"><strong>{stats.submissions.finished_24h}</strong><span>{t("status.finished24h")}</span></div>
           <div className="stat"><strong>{stats.system.app_version}</strong><span>{t("status.appVersion")}</span></div>
+
+          <div className="status-card">
+            <h3>{t("status.queue")}</h3>
+            <MetricBar label={t("status.queueDepth")} value={stats.submissions.queue_depth} max={maxQueue} />
+            <MetricBar label={t("status.runningCount")} value={stats.submissions.running_count} max={maxQueue} />
+            <MetricBar label={t("status.staleRunning")} value={stats.submissions.stale_running_count} max={maxQueue} tone={stats.submissions.stale_running_count ? "warn" : "ok"} />
+            <div className="kv compact-kv status-kv">
+              <span>{t("status.oldestQueued")}</span><strong>{formatDuration(stats.submissions.oldest_queued_age_seconds)}</strong>
+            </div>
+          </div>
+
+          <div className="status-card">
+            <h3>{t("status.throughput")}</h3>
+            <MetricBar label={t("status.finished1h")} value={stats.submissions.finished_1h} max={maxThroughput} />
+            <MetricBar label={t("status.finished24h")} value={stats.submissions.finished_24h} max={maxThroughput} />
+            <div className="kv compact-kv status-kv">
+              <span>{t("status.created1h")}</span><strong>{stats.submissions.recent_1h}</strong>
+              <span>{t("status.created24h")}</span><strong>{stats.submissions.recent_24h}</strong>
+            </div>
+          </div>
+
+          <div className="status-card">
+            <h3>{t("status.latency")}</h3>
+            <div className="latency-row"><span>{t("status.avgJudging")}</span><strong>{formatDuration(stats.submissions.average_judging_time_seconds)}</strong></div>
+            <div className="latency-row"><span>{t("status.p95Judging")}</span><strong>{formatDuration(stats.submissions.p95_judging_time_seconds)}</strong></div>
+          </div>
+
+          <div className="status-card">
+            <h3>{t("status.problems")}</h3>
+            <div className="kv compact-kv status-kv">
+              <span>{t("status.internalErrors")}</span><strong>{stats.submissions.internal_error_count}</strong>
+              <span>{t("status.internalErrorRate")}</span><strong>{stats.submissions.internal_error_rate}%</strong>
+              <span>{t("status.staleRunning")}</span><strong>{stats.submissions.stale_running_count}</strong>
+            </div>
+          </div>
 
           <div className="status-card">
             <h3>{t("status.contests")}</h3>
@@ -117,12 +160,70 @@ function StatusAdmin({ api }: { api: ApiClient }) {
 
           <StatusTable title={t("status.byVerdict")} rows={verdictRows.map(([verdict, count]) => [t(`verdict.${verdict}`), count])} empty={t("common.empty")} />
           <StatusTable title={t("status.byLanguage")} rows={languageRows} empty={t("common.empty")} />
+          {(stats.judgers.active > 0 || stats.judgers.stale > 0 || stats.judgers.offline > 0) && (
+            <StatusTable title={t("status.judgerRegistry")} rows={[[t("status.judgerActive"), stats.judgers.active], [t("status.judgerStale"), stats.judgers.stale], [t("status.judgerOffline"), stats.judgers.offline]]} empty={t("common.empty")} />
+          )}
+          <JudgerWorkersTable judgers={judgers} />
           <StatusTable title={t("status.runningJudgers")} rows={runningJudgers} empty={t("common.empty")} />
           <StatusTable title={t("status.finishedJudgers24h")} rows={finishedJudgers} empty={t("common.empty")} />
         </div>
       )}
     </section>
   );
+}
+
+function JudgerWorkersTable({ judgers }: { judgers: JudgerWorker[] }) {
+  const { t } = useI18n();
+  return (
+    <div className="status-card">
+      <h3>{t("status.judgerWorkers")}</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>{t("table.judger")}</th>
+            <th>{t("table.health")}</th>
+            <th>{t("table.status")}</th>
+            <th>{t("table.currentSubmission")}</th>
+            <th>{t("table.lastSeen")}</th>
+            <th>{t("table.languages")}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {judgers.length ? judgers.map((judger) => (
+            <tr key={judger.id}>
+              <td>{judger.judger_id}</td>
+              <td><span className={judger.health === "active" ? "pill ok" : "pill warn"}>{t(`judger.health.${judger.health}`)}</span></td>
+              <td>{t(`judger.status.${judger.status}`)}</td>
+              <td>{judger.current_submission_id ?? t("common.none")}</td>
+              <td>{formatDate(judger.last_seen_at)}</td>
+              <td>{judger.supported_languages.length}</td>
+            </tr>
+          )) : <tr><td colSpan={6} className="muted">{t("common.empty")}</td></tr>}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function MetricBar({ label, value, max, tone = "default" }: { label: string; value: number; max: number; tone?: "default" | "ok" | "warn" }) {
+  const width = max > 0 ? Math.max(4, Math.min(100, (value / max) * 100)) : 0;
+  return (
+    <div className={`metric-bar ${tone}`}>
+      <div className="metric-bar-head"><span>{label}</span><strong>{value}</strong></div>
+      <div className="metric-bar-track"><span style={{ width: `${width}%` }} /></div>
+    </div>
+  );
+}
+
+function formatDuration(seconds: number | null | undefined) {
+  if (seconds === null || seconds === undefined) return "-";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = Math.round(seconds % 60);
+  if (minutes < 60) return rest ? `${minutes}m ${rest}s` : `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const minuteRest = minutes % 60;
+  return minuteRest ? `${hours}h ${minuteRest}m` : `${hours}h`;
 }
 
 function StatusTable({ title, rows, empty }: { title: string; rows: Array<[string, number]>; empty: string }) {

@@ -3,7 +3,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .models import ContestParticipationMode, ContestStatus, ContestTimeMode, Language, SubmissionVerdict, UserRole
+from .models import ContestParticipationMode, ContestStatus, ContestTimeMode, JudgerStatus, Language, SubmissionVerdict, UserRole
 
 
 class TokenOut(BaseModel):
@@ -72,6 +72,16 @@ class AdminSubmissionsStats(BaseModel):
     running: int
     recent_1h: int
     recent_24h: int
+    queue_depth: int
+    running_count: int
+    oldest_queued_age_seconds: int | None = None
+    stale_running_count: int
+    finished_1h: int
+    finished_24h: int
+    average_judging_time_seconds: float | None = None
+    p95_judging_time_seconds: float | None = None
+    internal_error_count: int
+    internal_error_rate: float
     accepted_rate: float
     average_score: float
 
@@ -79,6 +89,9 @@ class AdminSubmissionsStats(BaseModel):
 class AdminJudgerStats(BaseModel):
     running_by_judger_id: dict[str, int]
     recent_finished_by_judger_id: dict[str, int]
+    active: int = 0
+    stale: int = 0
+    offline: int = 0
 
 
 class AdminSystemStats(BaseModel):
@@ -97,6 +110,24 @@ class AdminStatsOut(BaseModel):
     submissions: AdminSubmissionsStats
     judgers: AdminJudgerStats
     system: AdminSystemStats
+
+
+class AdminJudgerOut(BaseModel):
+    id: int
+    judger_id: str
+    hostname: str
+    version: str
+    supported_languages: list[str]
+    sandbox_mode: str
+    capabilities: dict[str, Any]
+    status: JudgerStatus | str
+    health: str
+    current_submission_id: int | None = None
+    registered_at: datetime
+    last_seen_at: datetime
+    last_state_change_at: datetime
+    enabled: bool
+    last_error: str | None = None
 
 
 class TeamCreate(BaseModel):

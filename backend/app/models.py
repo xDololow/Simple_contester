@@ -61,6 +61,18 @@ class Language(str, Enum):
     lua = "lua"
 
 
+class JudgerStatus(str, Enum):
+    starting = "starting"
+    idle = "idle"
+    polling = "polling"
+    claiming = "claiming"
+    compiling = "compiling"
+    running = "running"
+    reporting = "reporting"
+    stopping = "stopping"
+    offline = "offline"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -206,6 +218,25 @@ class Submission(Base):
     judger_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
 
     results: Mapped[list["TestResult"]] = relationship(back_populates="submission", cascade="all, delete-orphan")
+
+
+class Judger(Base):
+    __tablename__ = "judgers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    judger_id: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    hostname: Mapped[str] = mapped_column(String(255), default="")
+    version: Mapped[str] = mapped_column(String(80), default="unknown")
+    supported_languages: Mapped[str] = mapped_column(Text, default="[]")
+    sandbox_mode: Mapped[str] = mapped_column(String(80), default="subprocess")
+    capabilities: Mapped[str] = mapped_column(Text, default="{}")
+    status: Mapped[str] = mapped_column(String(32), default=JudgerStatus.starting.value, index=True)
+    current_submission_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    registered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    last_state_change_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class TestResult(Base):
