@@ -2,17 +2,18 @@ import React, { useCallback, useEffect, useState } from "react";
 import { API_BASE } from "../../api/client";
 import { FlashMessage, Header, SubmissionDetailView } from "../../components/shared";
 import { useI18n } from "../../i18n";
-import type { ApiClient, Contest, ContestStatus, Flash, ImportReport, PackageImportReport, ParticipationMode, Role, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
+import type { AdminStats, ApiClient, Contest, ContestStatus, Flash, ImportReport, PackageImportReport, ParticipationMode, Role, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
 import { emptyFlash, errorText, formatDate, formatScore, fromLocalInputValue, toLocalInputValue, verdictClass } from "../../utils/format";
 
 export function AdminDashboard({ api, token, reloadContests }: { api: ApiClient; token: string; reloadContests: () => void }) {
   const { t } = useI18n();
-  const [tab, setTab] = useState<"users" | "import" | "teams" | "contests" | "tasks" | "packages" | "tests" | "submissions">("users");
+  const [tab, setTab] = useState<"status" | "users" | "import" | "teams" | "contests" | "tasks" | "packages" | "tests" | "submissions">("status");
 
   return (
     <div className="admin-shell">
       <nav className="tabs">
         {[
+          ["status", t("tab.status")],
           ["users", t("tab.users")],
           ["import", t("tab.import")],
           ["teams", t("tab.teams")],
@@ -27,6 +28,7 @@ export function AdminDashboard({ api, token, reloadContests }: { api: ApiClient;
           </button>
         ))}
       </nav>
+      {tab === "status" && <StatusAdmin api={api} />}
       {tab === "users" && <UsersAdmin api={api} />}
       {tab === "import" && <ImportUsersAdmin token={token} />}
       {tab === "teams" && <TeamsAdmin api={api} />}
@@ -35,6 +37,105 @@ export function AdminDashboard({ api, token, reloadContests }: { api: ApiClient;
       {tab === "packages" && <PackagesAdmin api={api} token={token} onChanged={reloadContests} />}
       {tab === "tests" && <TestsAdmin api={api} />}
       {tab === "submissions" && <SubmissionsAdmin api={api} />}
+    </div>
+  );
+}
+
+function StatusAdmin({ api }: { api: ApiClient }) {
+  const { t } = useI18n();
+  const [stats, setStats] = useState<AdminStats | null>(null);
+  const [flash, setFlash] = useState<Flash>(emptyFlash);
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      setStats(await api<AdminStats>("/api/admin/stats"));
+      setFlash(emptyFlash);
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    } finally {
+      setLoading(false);
+    }
+  }, [api]);
+
+  useEffect(() => {
+    load();
+    const interval = window.setInterval(() => load().catch(console.error), 12000);
+    return () => window.clearInterval(interval);
+  }, [load]);
+
+  const verdictRows = stats ? Object.entries(stats.submissions.by_verdict).filter(([, count]) => count > 0) : [];
+  const languageRows = stats ? Object.entries(stats.submissions.by_language).filter(([, count]) => count > 0) : [];
+  const runningJudgers = stats ? Object.entries(stats.judgers.running_by_judger_id) : [];
+  const finishedJudgers = stats ? Object.entries(stats.judgers.recent_finished_by_judger_id) : [];
+
+  return (
+    <section className="panel">
+      <Header title={t("tab.status")} subtitle={stats ? t("status.lastUpdated", { time: formatDate(stats.system.server_time) }) : t("status.loading")} />
+      <div className="toolbar">
+        <button onClick={load} disabled={loading}>{loading ? t("status.refreshing") : t("common.refresh")}</button>
+        {stats ? (
+          <span className={stats.system.database_ok ? "pill ok" : "pill warn"}>{stats.system.database_ok ? t("status.dbOk") : t("status.dbDown")}</span>
+        ) : (
+          <span className="pill">{t("status.dbUnknown")}</span>
+        )}
+        <span className="muted">{t("status.autoRefresh")}</span>
+      </div>
+      <FlashMessage flash={flash} />
+      {stats && (
+        <div className="status-grid">
+          <div className="stat"><strong>{stats.users.total}</strong><span>{t("status.usersTotal")}</span></div>
+          <div className="stat"><strong>{stats.users.active}</strong><span>{t("status.usersActive")}</span></div>
+          <div className="stat"><strong>{stats.users.admin}</strong><span>{t("role.admin")}</span></div>
+          <div className="stat"><strong>{stats.users.participant}</strong><span>{t("role.participant")}</span></div>
+          <div className="stat"><strong>{stats.teams_total}</strong><span>{t("tab.teams")}</span></div>
+          <div className="stat"><strong>{stats.contests.total}</strong><span>{t("tab.contests")}</span></div>
+          <div className="stat"><strong>{stats.tasks_total}</strong><span>{t("tab.tasks")}</span></div>
+          <div className="stat"><strong>{stats.tests_total}</strong><span>{t("tab.tests")}</span></div>
+          <div className="stat"><strong>{stats.submissions.total}</strong><span>{t("tab.submissions")}</span></div>
+          <div className="stat"><strong>{stats.submissions.queued}</strong><span>{t("verdict.Queued")}</span></div>
+          <div className="stat"><strong>{stats.submissions.running}</strong><span>{t("verdict.Running")}</span></div>
+          <div className="stat"><strong>{stats.submissions.accepted_rate}%</strong><span>{t("status.acceptedRate")}</span></div>
+          <div className="stat"><strong>{formatScore(stats.submissions.average_score)}</strong><span>{t("status.averageScore")}</span></div>
+          <div className="stat"><strong>{stats.submissions.recent_1h}</strong><span>{t("status.recent1h")}</span></div>
+          <div className="stat"><strong>{stats.submissions.recent_24h}</strong><span>{t("status.recent24h")}</span></div>
+          <div className="stat"><strong>{stats.system.app_version}</strong><span>{t("status.appVersion")}</span></div>
+
+          <div className="status-card">
+            <h3>{t("status.contests")}</h3>
+            <div className="kv compact-kv">
+              <span>{t("contest.public")}</span><strong>{stats.contests.public}</strong>
+              <span>{t("contest.private")}</span><strong>{stats.contests.private}</strong>
+              <span>{t("common.individual")}</span><strong>{stats.contests.individual}</strong>
+              <span>{t("common.team")}</span><strong>{stats.contests.team}</strong>
+              {Object.entries(stats.contests.by_status).map(([status, count]) => (
+                <React.Fragment key={status}><span>{t(`status.${status}`)}</span><strong>{count}</strong></React.Fragment>
+              ))}
+            </div>
+          </div>
+
+          <StatusTable title={t("status.byVerdict")} rows={verdictRows.map(([verdict, count]) => [t(`verdict.${verdict}`), count])} empty={t("common.empty")} />
+          <StatusTable title={t("status.byLanguage")} rows={languageRows} empty={t("common.empty")} />
+          <StatusTable title={t("status.runningJudgers")} rows={runningJudgers} empty={t("common.empty")} />
+          <StatusTable title={t("status.finishedJudgers24h")} rows={finishedJudgers} empty={t("common.empty")} />
+        </div>
+      )}
+    </section>
+  );
+}
+
+function StatusTable({ title, rows, empty }: { title: string; rows: Array<[string, number]>; empty: string }) {
+  const { t } = useI18n();
+  return (
+    <div className="status-card">
+      <h3>{title}</h3>
+      <table>
+        <thead><tr><th>{t("table.name")}</th><th>{t("table.count")}</th></tr></thead>
+        <tbody>
+          {rows.length ? rows.map(([name, count]) => <tr key={name}><td>{name}</td><td>{count}</td></tr>) : <tr><td colSpan={2} className="muted">{empty}</td></tr>}
+        </tbody>
+      </table>
     </div>
   );
 }

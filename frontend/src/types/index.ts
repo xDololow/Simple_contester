@@ -140,3 +140,44 @@ export type PackageImportReport = {
 };
 
 export type Flash = { kind: "ok" | "error"; text: string };
+
+export type AdminStats = {
+  users: {
+    total: number;
+    active: number;
+    admin: number;
+    participant: number;
+  };
+  teams_total: number;
+  contests: {
+    total: number;
+    by_status: Record<ContestStatus, number>;
+    public: number;
+    private: number;
+    individual: number;
+    team: number;
+  };
+  tasks_total: number;
+  tests_total: number;
+  submissions: {
+    total: number;
+    by_verdict: Record<string, number>;
+    by_language: Record<Language, number>;
+    queued: number;
+    running: number;
+    recent_1h: number;
+    recent_24h: number;
+    accepted_rate: number;
+    average_score: number;
+  };
+  judgers: {
+    running_by_judger_id: Record<string, number>;
+    recent_finished_by_judger_id: Record<string, number>;
+  };
+  system: {
+    server_time: string;
+    database_ok: boolean;
+    app_version: string;
+    build: string;
+  };
+};

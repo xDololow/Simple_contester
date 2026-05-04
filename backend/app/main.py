@@ -11,7 +11,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, Up
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from sqlalchemy import and_, or_, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -37,6 +37,12 @@ from .models import (
     UserRole,
 )
 from .schemas import (
+    AdminContestsStats,
+    AdminJudgerStats,
+    AdminStatsOut,
+    AdminSubmissionsStats,
+    AdminSystemStats,
+    AdminUsersStats,
     ContestCreate,
     ContestParticipantsUpdate,
     ContestOut,
@@ -550,6 +556,82 @@ async def import_users(file: UploadFile = File(...), _: User = Depends(require_a
         created += 1
     db.commit()
     return ImportReport(created=created, skipped=skipped, errors=errors)
+
+
+def count_rows(db: Session, model: type[object]) -> int:
+    return db.scalar(select(func.count()).select_from(model)) or 0
+
+
+def grouped_counts(db: Session, column: object) -> dict[object, int]:
+    rows = db.execute(select(column, func.count()).group_by(column)).all()
+    return {key: count for key, count in rows}
+
+
+@app.get("/api/admin/stats", response_model=AdminStatsOut)
+def admin_stats(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> AdminStatsOut:
+    current = now_utc()
+    one_hour_ago = current - timedelta(hours=1)
+    one_day_ago = current - timedelta(hours=24)
+
+    users_by_role = grouped_counts(db, User.role)
+    contests_by_status = grouped_counts(db, Contest.status)
+    submissions_by_verdict = grouped_counts(db, Submission.verdict)
+    submissions_by_language = grouped_counts(db, Submission.language)
+    submission_total = sum(submissions_by_verdict.values())
+    accepted_total = submissions_by_verdict.get(SubmissionVerdict.accepted, 0)
+    average_score = db.scalar(select(func.avg(Submission.score))) if submission_total else 0
+    running_by_judger = db.execute(
+        select(Submission.judger_id, func.count())
+        .where(Submission.verdict == SubmissionVerdict.running)
+        .group_by(Submission.judger_id)
+    ).all()
+    recent_finished_by_judger = db.execute(
+        select(Submission.judger_id, func.count())
+        .where(Submission.finished_at.is_not(None))
+        .where(Submission.finished_at >= one_day_ago)
+        .group_by(Submission.judger_id)
+    ).all()
+    database_ok = True
+    try:
+        db.execute(text("SELECT 1")).scalar()
+    except Exception:
+        database_ok = False
+
+    return AdminStatsOut(
+        users=AdminUsersStats(
+            total=count_rows(db, User),
+            active=db.scalar(select(func.count()).select_from(User).where(User.is_active.is_(True))) or 0,
+            admin=users_by_role.get(UserRole.admin, 0),
+            participant=users_by_role.get(UserRole.participant, 0),
+        ),
+        teams_total=count_rows(db, Team),
+        contests=AdminContestsStats(
+            total=count_rows(db, Contest),
+            by_status={status: contests_by_status.get(status, 0) for status in ContestStatus},
+            public=db.scalar(select(func.count()).select_from(Contest).where(Contest.is_public.is_(True))) or 0,
+            private=db.scalar(select(func.count()).select_from(Contest).where(Contest.is_public.is_(False))) or 0,
+            individual=db.scalar(select(func.count()).select_from(Contest).where(Contest.participation_mode == ContestParticipationMode.individual)) or 0,
+            team=db.scalar(select(func.count()).select_from(Contest).where(Contest.participation_mode == ContestParticipationMode.team)) or 0,
+        ),
+        tasks_total=count_rows(db, Task),
+        tests_total=count_rows(db, TaskTest),
+        submissions=AdminSubmissionsStats(
+            total=submission_total,
+            by_verdict={verdict: submissions_by_verdict.get(verdict, 0) for verdict in SubmissionVerdict},
+            by_language={language: submissions_by_language.get(language, 0) for language in Language},
+            queued=submissions_by_verdict.get(SubmissionVerdict.queued, 0),
+            running=submissions_by_verdict.get(SubmissionVerdict.running, 0),
+            recent_1h=db.scalar(select(func.count()).select_from(Submission).where(Submission.created_at >= one_hour_ago)) or 0,
+            recent_24h=db.scalar(select(func.count()).select_from(Submission).where(Submission.created_at >= one_day_ago)) or 0,
+            accepted_rate=round((accepted_total / submission_total) * 100, 2) if submission_total else 0,
+            average_score=round(float(average_score or 0), 2),
+        ),
+        judgers=AdminJudgerStats(
+            running_by_judger_id={judger_id or "unknown": count for judger_id, count in running_by_judger},
+            recent_finished_by_judger_id={judger_id or "unknown": count for judger_id, count in recent_finished_by_judger},
+        ),
+        system=AdminSystemStats(server_time=current, database_ok=database_ok),
+    )
 
 
 @app.get("/api/teams", response_model=list[TeamOut])

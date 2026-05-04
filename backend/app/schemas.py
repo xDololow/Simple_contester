@@ -48,6 +48,57 @@ class ImportReport(BaseModel):
     errors: list[str]
 
 
+class AdminUsersStats(BaseModel):
+    total: int
+    active: int
+    admin: int
+    participant: int
+
+
+class AdminContestsStats(BaseModel):
+    total: int
+    by_status: dict[ContestStatus, int]
+    public: int
+    private: int
+    individual: int
+    team: int
+
+
+class AdminSubmissionsStats(BaseModel):
+    total: int
+    by_verdict: dict[SubmissionVerdict, int]
+    by_language: dict[Language, int]
+    queued: int
+    running: int
+    recent_1h: int
+    recent_24h: int
+    accepted_rate: float
+    average_score: float
+
+
+class AdminJudgerStats(BaseModel):
+    running_by_judger_id: dict[str, int]
+    recent_finished_by_judger_id: dict[str, int]
+
+
+class AdminSystemStats(BaseModel):
+    server_time: datetime
+    database_ok: bool
+    app_version: str = "unknown"
+    build: str = "unknown"
+
+
+class AdminStatsOut(BaseModel):
+    users: AdminUsersStats
+    teams_total: int
+    contests: AdminContestsStats
+    tasks_total: int
+    tests_total: int
+    submissions: AdminSubmissionsStats
+    judgers: AdminJudgerStats
+    system: AdminSystemStats
+
+
 class TeamCreate(BaseModel):
     name: str = Field(min_length=2, max_length=160)
     user_ids: list[int] = Field(default_factory=list)
