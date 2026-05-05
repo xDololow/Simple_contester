@@ -72,6 +72,17 @@ def assign_teams(client: APIClient, admin_headers: dict[str, str], contest_id: i
     return response.json()
 
 
+def accept_submission_at(submission_id: int, score: float, created_at: datetime) -> None:
+    with SessionLocal() as db:
+        submission = db.get(Submission, submission_id)
+        assert submission is not None
+        submission.verdict = SubmissionVerdict.accepted
+        submission.score = score
+        submission.created_at = created_at
+        submission.finished_at = created_at
+        db.commit()
+
+
 def test_participant_does_not_see_or_open_private_contest_without_access(
     client: APIClient,
     admin_headers: dict[str, str],
@@ -429,6 +440,42 @@ def test_participant_task_detail_hides_test_inputs_and_outputs(
     ]
 
 
+def test_admin_can_create_and_edit_test_scoring_metadata(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    demo_task: dict,
+) -> None:
+    created = client.post(
+        f"/api/tasks/{demo_task['id']}/tests",
+        headers=admin_headers,
+        json={
+            "input_data": "5 7\n",
+            "output_data": "12\n",
+            "is_sample": False,
+            "points": 25.5,
+            "group_name": "easy",
+        },
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["points"] == 25.5
+    assert created.json()["group_name"] == "easy"
+
+    updated = client.patch(
+        f"/api/tests/{created.json()['id']}",
+        headers=admin_headers,
+        json={"points": None, "group_name": "  main  "},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["points"] is None
+    assert updated.json()["group_name"] == "main"
+
+    tests = client.get(f"/api/tasks/{demo_task['id']}/tests", headers=admin_headers)
+    assert tests.status_code == 200, tests.text
+    stored = next(test for test in tests.json() if test["id"] == created.json()["id"])
+    assert stored["points"] is None
+    assert stored["group_name"] == "main"
+
+
 def test_participant_cannot_see_foreign_submission_or_hidden_results(
     client: APIClient,
     admin_headers: dict[str, str],
@@ -729,6 +776,128 @@ def test_submission_lifecycle_and_scoreboard_after_accepted_submission(
             "solved_at_minutes": row["cells"][0]["solved_at_minutes"],
         }
     ]
+
+
+def test_scoreboard_freeze_hides_post_freeze_results_until_unfrozen(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant: dict,
+    participant_headers: dict[str, str],
+) -> None:
+    contest = create_running_contest(client, admin_headers, "Frozen", is_public=True)
+    task_a = create_contest_task(client, admin_headers, contest["id"], "A")
+    task_b = create_contest_task(client, admin_headers, contest["id"], "B")
+    freeze_at = datetime.utcnow() - timedelta(minutes=1)
+    frozen = client.patch(
+        f"/api/contests/{contest['id']}",
+        headers=admin_headers,
+        json={"scoreboard_freeze_at": freeze_at.isoformat(), "scoreboard_unfrozen": False},
+    )
+    assert frozen.status_code == 200, frozen.text
+
+    before = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task_a['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(input())"},
+    )
+    after = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task_b['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(input())"},
+    )
+    assert before.status_code == 200, before.text
+    assert after.status_code == 200, after.text
+    accept_submission_at(before.json()["id"], task_a["points"], freeze_at - timedelta(seconds=1))
+    accept_submission_at(after.json()["id"], task_b["points"], freeze_at + timedelta(seconds=1))
+
+    participant_scoreboard = client.get(f"/api/contests/{contest['id']}/scoreboard", headers=participant_headers)
+    assert participant_scoreboard.status_code == 200, participant_scoreboard.text
+    participant_row = next(item for item in participant_scoreboard.json() if item["user_id"] == participant["id"])
+    assert participant_row["score"] == task_a["points"]
+    assert participant_row["cells"][0]["solved"] is True
+    assert participant_row["cells"][1]["solved"] is False
+
+    snapshot = client.get(f"/api/contests/{contest['id']}/live-snapshot", headers=participant_headers)
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["scoreboard_frozen"] is True
+    snapshot_row = next(item for item in snapshot.json()["scoreboard"] if item["user_id"] == participant["id"])
+    assert snapshot_row["score"] == task_a["points"]
+
+    admin_scoreboard = client.get(f"/api/contests/{contest['id']}/scoreboard", headers=admin_headers)
+    assert admin_scoreboard.status_code == 200, admin_scoreboard.text
+    admin_row = next(item for item in admin_scoreboard.json() if item["user_id"] == participant["id"])
+    assert admin_row["score"] == task_a["points"] + task_b["points"]
+    assert admin_row["cells"][1]["solved"] is True
+
+    unfrozen = client.patch(
+        f"/api/contests/{contest['id']}",
+        headers=admin_headers,
+        json={"scoreboard_unfrozen": True},
+    )
+    assert unfrozen.status_code == 200, unfrozen.text
+    revealed = client.get(f"/api/contests/{contest['id']}/scoreboard", headers=participant_headers)
+    assert revealed.status_code == 200, revealed.text
+    revealed_row = next(item for item in revealed.json() if item["user_id"] == participant["id"])
+    assert revealed_row["score"] == task_a["points"] + task_b["points"]
+    assert revealed_row["cells"][1]["solved"] is True
+
+
+def test_team_scoreboard_freeze_hides_post_freeze_results_until_unfrozen(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant: dict,
+    participant_headers: dict[str, str],
+) -> None:
+    contest = create_running_team_contest(client, admin_headers, "Frozen Team")
+    task_a = create_contest_task(client, admin_headers, contest["id"], "A")
+    task_b = create_contest_task(client, admin_headers, contest["id"], "B")
+    team = create_team(client, admin_headers, "Frozen Team One", [participant["id"]])
+    assign_teams(client, admin_headers, contest["id"], [team["id"]])
+    freeze_at = datetime.utcnow() - timedelta(minutes=1)
+    frozen = client.patch(
+        f"/api/contests/{contest['id']}",
+        headers=admin_headers,
+        json={"scoreboard_freeze_at": freeze_at.isoformat(), "scoreboard_unfrozen": False},
+    )
+    assert frozen.status_code == 200, frozen.text
+
+    before = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task_a['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(input())"},
+    )
+    after = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task_b['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(input())"},
+    )
+    assert before.status_code == 200, before.text
+    assert after.status_code == 200, after.text
+    accept_submission_at(before.json()["id"], task_a["points"], freeze_at - timedelta(seconds=1))
+    accept_submission_at(after.json()["id"], task_b["points"], freeze_at + timedelta(seconds=1))
+
+    participant_scoreboard = client.get(f"/api/contests/{contest['id']}/scoreboard", headers=participant_headers)
+    assert participant_scoreboard.status_code == 200, participant_scoreboard.text
+    row = participant_scoreboard.json()[0]
+    assert row["team_id"] == team["id"]
+    assert row["score"] == task_a["points"]
+    assert row["cells"][1]["solved"] is False
+
+    admin_scoreboard = client.get(f"/api/contests/{contest['id']}/scoreboard", headers=admin_headers)
+    assert admin_scoreboard.status_code == 200, admin_scoreboard.text
+    admin_row = admin_scoreboard.json()[0]
+    assert admin_row["score"] == task_a["points"] + task_b["points"]
+    assert admin_row["cells"][1]["solved"] is True
+
+    unfrozen = client.patch(
+        f"/api/contests/{contest['id']}",
+        headers=admin_headers,
+        json={"scoreboard_unfrozen": True},
+    )
+    assert unfrozen.status_code == 200, unfrozen.text
+    revealed = client.get(f"/api/contests/{contest['id']}/scoreboard", headers=participant_headers)
+    assert revealed.status_code == 200, revealed.text
+    assert revealed.json()[0]["score"] == task_a["points"] + task_b["points"]
 
 
 def test_contest_events_requires_token(

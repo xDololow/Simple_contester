@@ -116,14 +116,26 @@ def normalize_dt(value: datetime) -> datetime:
     return value.astimezone(timezone.utc).replace(tzinfo=None)
 
 
+def is_scoreboard_frozen_for_user(contest: Contest, user: User, current: datetime | None = None) -> bool:
+    if user.role == UserRole.admin or contest.scoreboard_unfrozen or contest.scoreboard_freeze_at is None:
+        return False
+    return normalize_dt(current or now_utc()) >= normalize_dt(contest.scoreboard_freeze_at)
+
+
 def validate_contest_time_window(
     starts_at: datetime,
     ends_at: datetime,
     time_mode: ContestTimeMode,
     individual_duration_minutes: int | None,
+    scoreboard_freeze_at: datetime | None = None,
 ) -> None:
     if ends_at <= starts_at:
         raise HTTPException(status_code=400, detail="ends_at must be after starts_at")
+    if scoreboard_freeze_at is not None:
+        if scoreboard_freeze_at < starts_at:
+            raise HTTPException(status_code=400, detail="scoreboard_freeze_at must be within contest window")
+        if scoreboard_freeze_at >= ends_at:
+            raise HTTPException(status_code=400, detail="scoreboard_freeze_at must be before ends_at")
     if time_mode == ContestTimeMode.individual:
         if individual_duration_minutes is None:
             raise HTTPException(status_code=400, detail="individual_duration_minutes is required")
@@ -179,6 +191,18 @@ def ensure_partial_scoring_column() -> None:
             conn.execute(text("ALTER TABLE tasks ADD COLUMN partial_scoring BOOL NOT NULL DEFAULT 0"))
 
 
+def ensure_task_test_scoring_columns() -> None:
+    if engine.dialect.name not in {"mysql", "mariadb"}:
+        return
+    with engine.begin() as conn:
+        points_column = conn.execute(text("SHOW COLUMNS FROM task_tests LIKE 'points'")).mappings().first()
+        if points_column is None:
+            conn.execute(text("ALTER TABLE task_tests ADD COLUMN points DOUBLE NULL"))
+        group_column = conn.execute(text("SHOW COLUMNS FROM task_tests LIKE 'group_name'")).mappings().first()
+        if group_column is None:
+            conn.execute(text("ALTER TABLE task_tests ADD COLUMN group_name VARCHAR(120) NULL"))
+
+
 def ensure_contest_access_columns() -> None:
     if engine.dialect.name not in {"mysql", "mariadb"}:
         return
@@ -189,6 +213,12 @@ def ensure_contest_access_columns() -> None:
         column = conn.execute(text("SHOW COLUMNS FROM contests LIKE 'participation_mode'")).mappings().first()
         if column is None:
             conn.execute(text("ALTER TABLE contests ADD COLUMN participation_mode VARCHAR(20) NOT NULL DEFAULT 'individual'"))
+        column = conn.execute(text("SHOW COLUMNS FROM contests LIKE 'scoreboard_freeze_at'")).mappings().first()
+        if column is None:
+            conn.execute(text("ALTER TABLE contests ADD COLUMN scoreboard_freeze_at DATETIME NULL"))
+        column = conn.execute(text("SHOW COLUMNS FROM contests LIKE 'scoreboard_unfrozen'")).mappings().first()
+        if column is None:
+            conn.execute(text("ALTER TABLE contests ADD COLUMN scoreboard_unfrozen BOOL NOT NULL DEFAULT 0"))
         column = conn.execute(text("SHOW COLUMNS FROM submissions LIKE 'team_id'")).mappings().first()
         if column is None:
             conn.execute(text("ALTER TABLE submissions ADD COLUMN team_id INT NULL"))
@@ -257,6 +287,7 @@ def startup() -> None:
     ensure_language_enum_values()
     ensure_float_score_columns()
     ensure_partial_scoring_column()
+    ensure_task_test_scoring_columns()
     ensure_contest_access_columns()
     ensure_clarifications_table()
     with SessionLocal() as db:
@@ -647,6 +678,12 @@ def decode_json_dict(value: str | None) -> dict[str, object]:
     except json.JSONDecodeError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def normalize_optional_string(value: object | None) -> str | None:
+    if value is None:
+        return None
+    return str(value).strip() or None
 
 
 def judger_health(judger: Judger, current: datetime) -> str:
@@ -1099,7 +1136,15 @@ def task_package_metadata(task: Task, tests: list[TaskTest], package_type: str =
             "points": task.points,
             "partial_scoring": task.partial_scoring,
         },
-        "tests": [{"name": f"{index:03d}", "is_sample": test.is_sample} for index, test in enumerate(tests, start=1)],
+        "tests": [
+            {
+                "name": f"{index:03d}",
+                "is_sample": test.is_sample,
+                "points": test.points,
+                "group_name": test.group_name,
+            }
+            for index, test in enumerate(tests, start=1)
+        ],
     }
 
 
@@ -1136,6 +1181,8 @@ def create_contest_package_zip(contest: Contest) -> bytes:
                 "starts_at": contest.starts_at.isoformat(),
                 "ends_at": contest.ends_at.isoformat(),
                 "individual_duration_minutes": contest.individual_duration_minutes,
+                "scoreboard_freeze_at": contest.scoreboard_freeze_at.isoformat() if contest.scoreboard_freeze_at else None,
+                "scoreboard_unfrozen": contest.scoreboard_unfrozen,
             },
             "tasks": [
                 {"dir": f"tasks/{index:03d}", "position": index - 1}
@@ -1189,7 +1236,24 @@ def create_task_from_package_metadata(db: Session, metadata: dict, statement: st
             raise HTTPException(status_code=400, detail=f"Unsafe test name: {name}")
         input_data = decode_package_text(files, f"{prefix}tests/{name}.in")
         output_data = decode_package_text(files, f"{prefix}tests/{name}.out")
-        db.add(TaskTest(task_id=task.id, input_data=input_data, output_data=output_data, is_sample=bool(item.get("is_sample", False))))
+        points = item.get("points")
+        group_name = item.get("group_name")
+        try:
+            test_points = float(points) if points is not None else None
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid test points for {name}") from exc
+        if test_points is not None and test_points < 0:
+            raise HTTPException(status_code=400, detail=f"Invalid test points for {name}")
+        db.add(
+            TaskTest(
+                task_id=task.id,
+                input_data=input_data,
+                output_data=output_data,
+                is_sample=bool(item.get("is_sample", False)),
+                points=test_points,
+                group_name=normalize_optional_string(group_name),
+            )
+        )
         created_tests += 1
     return task, created_tests
 
@@ -1219,6 +1283,9 @@ def import_contest_package_zip(db: Session, content: bytes) -> PackageImportRepo
         raise HTTPException(status_code=400, detail="Contest title is required")
     starts_at = parse_package_datetime(contest_data.get("starts_at"), "starts_at")
     ends_at = parse_package_datetime(contest_data.get("ends_at"), "ends_at")
+    scoreboard_freeze_at = None
+    if contest_data.get("scoreboard_freeze_at") is not None:
+        scoreboard_freeze_at = parse_package_datetime(contest_data.get("scoreboard_freeze_at"), "scoreboard_freeze_at")
     try:
         time_mode = ContestTimeMode(str(contest_data.get("time_mode") or ContestTimeMode.fixed.value))
         participation_mode = ContestParticipationMode(str(contest_data.get("participation_mode") or ContestParticipationMode.individual.value))
@@ -1227,7 +1294,7 @@ def import_contest_package_zip(db: Session, content: bytes) -> PackageImportRepo
             individual_duration_minutes = int(individual_duration_minutes)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="Invalid contest mode or duration metadata") from exc
-    validate_contest_time_window(starts_at, ends_at, time_mode, individual_duration_minutes)
+    validate_contest_time_window(starts_at, ends_at, time_mode, individual_duration_minutes, scoreboard_freeze_at)
     contest = Contest(
         title=title,
         description=str(contest_data.get("description") or ""),
@@ -1238,6 +1305,8 @@ def import_contest_package_zip(db: Session, content: bytes) -> PackageImportRepo
         starts_at=starts_at,
         ends_at=ends_at,
         individual_duration_minutes=individual_duration_minutes,
+        scoreboard_freeze_at=scoreboard_freeze_at,
+        scoreboard_unfrozen=bool(contest_data.get("scoreboard_unfrozen", False)),
     )
     db.add(contest)
     db.flush()
@@ -1383,11 +1452,14 @@ def create_contest(data: ContestCreate, _: User = Depends(require_admin), db: Se
     payload = data.model_dump()
     payload["starts_at"] = normalize_dt(payload["starts_at"])
     payload["ends_at"] = normalize_dt(payload["ends_at"])
+    if payload["scoreboard_freeze_at"] is not None:
+        payload["scoreboard_freeze_at"] = normalize_dt(payload["scoreboard_freeze_at"])
     validate_contest_time_window(
         payload["starts_at"],
         payload["ends_at"],
         payload["time_mode"],
         payload["individual_duration_minutes"],
+        payload["scoreboard_freeze_at"],
     )
     contest = Contest(**payload)
     db.add(contest)
@@ -1424,7 +1496,7 @@ def update_contest(
 ) -> Contest:
     contest = get_contest_or_404(db, contest_id)
     updates = data.model_dump(exclude_unset=True)
-    for key in ("starts_at", "ends_at"):
+    for key in ("starts_at", "ends_at", "scoreboard_freeze_at"):
         if key in updates and updates[key] is not None:
             updates[key] = normalize_dt(updates[key])
     candidate = {
@@ -1435,6 +1507,7 @@ def update_contest(
             "individual_duration_minutes",
             contest.individual_duration_minutes,
         ),
+        "scoreboard_freeze_at": updates.get("scoreboard_freeze_at", contest.scoreboard_freeze_at),
     }
     validate_contest_time_window(**candidate)
     for key, value in updates.items():
@@ -1675,7 +1748,16 @@ def create_task(data: TaskCreate, _: User = Depends(require_admin), db: Session 
     db.flush()
     attach_task_to_contests(db, task, [*data.contest_ids, *([data.contest_id] if data.contest_id is not None else [])])
     for test in data.tests:
-        db.add(TaskTest(task_id=task.id, input_data=test.input_data, output_data=test.output_data, is_sample=test.is_sample))
+        db.add(
+            TaskTest(
+                task_id=task.id,
+                input_data=test.input_data,
+                output_data=test.output_data,
+                is_sample=test.is_sample,
+                points=test.points,
+                group_name=normalize_optional_string(test.group_name),
+            )
+        )
     db.commit()
     db.refresh(task)
     task = db.scalar(select(Task).where(Task.id == task.id).options(selectinload(Task.tests), selectinload(Task.contests)))
@@ -1745,7 +1827,14 @@ def create_task_test(
     db: Session = Depends(get_db),
 ) -> TaskTest:
     get_task_or_404(db, task_id)
-    test = TaskTest(task_id=task_id, input_data=data.input_data, output_data=data.output_data, is_sample=data.is_sample)
+    test = TaskTest(
+        task_id=task_id,
+        input_data=data.input_data,
+        output_data=data.output_data,
+        is_sample=data.is_sample,
+        points=data.points,
+        group_name=normalize_optional_string(data.group_name),
+    )
     db.add(test)
     db.commit()
     db.refresh(test)
@@ -1780,6 +1869,8 @@ def update_task_test(
 ) -> TaskTest:
     test = get_test_or_404(db, test_id)
     for key, value in data.model_dump(exclude_unset=True).items():
+        if key == "group_name":
+            value = normalize_optional_string(value)
         setattr(test, key, value)
     db.commit()
     db.refresh(test)
@@ -1907,15 +1998,17 @@ def sse_event(event: str, data: object) -> str:
 
 
 def contest_events_payload(db: Session, contest_id: int, user: User) -> dict[str, object]:
+    contest = get_contest_or_404(db, contest_id)
     submissions = [
         SubmissionOut.model_validate(submission).model_dump(mode="json")
         for submission in list_submissions(contest_id=contest_id, db=db, user=user)
     ]
     rows = [row.model_dump(mode="json") for row in scoreboard(contest_id=contest_id, db=db, user=user)]
-    return {"submissions": submissions, "scoreboard": rows}
+    return {"submissions": submissions, "scoreboard": rows, "scoreboard_frozen": is_scoreboard_frozen_for_user(contest, user)}
 
 
 def contest_events_fingerprint(db: Session, contest_id: int) -> str:
+    contest = get_contest_or_404(db, contest_id)
     stmt = (
         select(
             Submission.id,
@@ -1942,6 +2035,13 @@ def contest_events_fingerprint(db: Session, contest_id: int) -> str:
                 row.finished_at.isoformat() if row.finished_at else None,
             ]
             for row in rows
+        ]
+        + [
+            [
+                "contest",
+                contest.scoreboard_freeze_at.isoformat() if contest.scoreboard_freeze_at else None,
+                contest.scoreboard_unfrozen,
+            ]
         ],
         separators=(",", ":"),
     )
@@ -1966,6 +2066,8 @@ def scoreboard(contest_id: int, db: Session = Depends(get_db), user: User = Depe
         ).all()
         team_ids = [team.id for team in teams]
         submission_stmt = select(Submission).where(Submission.contest_id == contest_id).order_by(Submission.created_at)
+        if is_scoreboard_frozen_for_user(contest, user):
+            submission_stmt = submission_stmt.where(Submission.created_at < contest.scoreboard_freeze_at)
         submissions = db.scalars(submission_stmt.where(Submission.team_id.in_(team_ids))).all() if team_ids else []
 
         rows: list[ScoreboardRow] = []
@@ -2015,6 +2117,8 @@ def scoreboard(contest_id: int, db: Session = Depends(get_db), user: User = Depe
     users = db.scalars(user_stmt).all()
     user_ids = [participant.id for participant in users]
     submission_stmt = select(Submission).where(Submission.contest_id == contest_id).order_by(Submission.created_at)
+    if is_scoreboard_frozen_for_user(contest, user):
+        submission_stmt = submission_stmt.where(Submission.created_at < contest.scoreboard_freeze_at)
     if user_ids:
         submission_stmt = submission_stmt.where(Submission.user_id.in_(user_ids))
         submissions = db.scalars(submission_stmt).all()

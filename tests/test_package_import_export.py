@@ -22,6 +22,14 @@ def test_task_package_export_contains_metadata_statement_and_tests(
     admin_headers: dict[str, str],
     demo_task: dict[str, Any],
 ) -> None:
+    tests = client.get(f"/api/tasks/{demo_task['id']}/tests", headers=admin_headers).json()
+    patched = client.patch(
+        f"/api/tests/{tests[1]['id']}",
+        headers=admin_headers,
+        json={"points": 40, "group_name": "hidden"},
+    )
+    assert patched.status_code == 200, patched.text
+
     response = client.get(f"/api/tasks/{demo_task['id']}/package", headers=admin_headers)
 
     assert response.status_code == 200, response.text
@@ -30,7 +38,10 @@ def test_task_package_export_contains_metadata_statement_and_tests(
     metadata = json.loads(files["metadata.json"].decode("utf-8"))
     assert metadata["type"] == "task"
     assert metadata["task"]["title"] == "A + B"
-    assert metadata["tests"] == [{"name": "001", "is_sample": True}, {"name": "002", "is_sample": False}]
+    assert metadata["tests"] == [
+        {"name": "001", "is_sample": True, "points": None, "group_name": None},
+        {"name": "002", "is_sample": False, "points": 40.0, "group_name": "hidden"},
+    ]
     assert files["statement.md"].decode("utf-8") == "Read two integers and print their sum."
     assert files["tests/001.in"].decode("utf-8") == "2 3\n"
 
@@ -60,7 +71,44 @@ def test_task_package_import_creates_standalone_task_and_tests(
     assert task["contest_ids"] == []
     tests = client.get(f"/api/tasks/{imported_task_id}/tests", headers=admin_headers).json()
     assert [test["is_sample"] for test in tests] == [True, False]
+    assert [test["points"] for test in tests] == [None, None]
+    assert [test["group_name"] for test in tests] == [None, None]
     assert tests[1]["output_data"] == "42\n"
+
+
+def test_task_package_import_preserves_test_points_and_group_name(client: Any, admin_headers: dict[str, str]) -> None:
+    archive = make_zip(
+        {
+            "metadata.json": json.dumps(
+                {
+                    "format": "simple-contester-package",
+                    "format_version": 1,
+                    "type": "task",
+                    "task": {"title": "Scored", "points": 100, "partial_scoring": True},
+                    "tests": [
+                        {"name": "001", "is_sample": True, "points": None, "group_name": None},
+                        {"name": "002", "is_sample": False, "points": 35.5, "group_name": "main"},
+                    ],
+                }
+            ),
+            "statement.md": "Scored statement",
+            "tests/001.in": "1\n",
+            "tests/001.out": "1\n",
+            "tests/002.in": "2\n",
+            "tests/002.out": "2\n",
+        }
+    )
+
+    response = client.post(
+        "/api/tasks/import-package",
+        headers=admin_headers,
+        files={"file": ("scored.zip", archive, "application/zip")},
+    )
+
+    assert response.status_code == 200, response.text
+    tests = client.get(f"/api/tasks/{response.json()['task_ids'][0]}/tests", headers=admin_headers).json()
+    assert [test["points"] for test in tests] == [None, 35.5]
+    assert [test["group_name"] for test in tests] == [None, "main"]
 
 
 def test_contest_package_export_import_roundtrip(

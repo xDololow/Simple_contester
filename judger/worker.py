@@ -359,7 +359,14 @@ def fetch_tests(task_id: int) -> list[dict]:
     with engine.begin() as conn:
         return list(
             conn.execute(
-                text("SELECT id, input_data, output_data FROM task_tests WHERE task_id = :task_id ORDER BY id"),
+                text(
+                    """
+                    SELECT id, input_data, output_data, is_sample, points
+                    FROM task_tests
+                    WHERE task_id = :task_id
+                    ORDER BY id
+                    """
+                ),
                 {"task_id": task_id},
             ).mappings()
         )
@@ -378,12 +385,28 @@ def verdict_to_db(verdict: str) -> str:
     return verdicts.get(verdict, verdict)
 
 
-def calculate_score(points: float, accepted_count: int, test_count: int, partial_scoring: bool = False) -> float:
+def calculate_score(
+    points: float,
+    accepted_count: int,
+    test_count: int,
+    partial_scoring: bool = False,
+    test_results: list[dict] | None = None,
+) -> float:
+    task_points = float(points)
+    if test_results and any(result.get("points") is not None for result in test_results):
+        score = sum(float(result.get("points") or 0) for result in test_results if result.get("accepted"))
+        return round(min(score, task_points), 2)
     if test_count <= 0:
         return 0.0
     if not partial_scoring:
-        return round(float(points), 2) if accepted_count == test_count else 0.0
-    return round((accepted_count / test_count) * float(points), 2)
+        return round(task_points, 2) if accepted_count == test_count else 0.0
+    if test_results:
+        scoring_results = [result for result in test_results if not result.get("is_sample")]
+        if not scoring_results:
+            return 0.0
+        accepted_scoring_count = sum(1 for result in scoring_results if result.get("accepted"))
+        return round((accepted_scoring_count / len(scoring_results)) * task_points, 2)
+    return round((accepted_count / test_count) * task_points, 2)
 
 
 def finish_submission(submission_id: int, verdict: str, score: float, compile_output: str = "", claim_token: str | None = None) -> bool:
@@ -508,6 +531,15 @@ def judge(submission: dict) -> None:
 
         final_verdict = VERDICT_ACCEPTED
         accepted_count = 0
+        test_results_for_score: list[dict] = [
+            {
+                "id": case["id"],
+                "accepted": False,
+                "is_sample": bool(case.get("is_sample")),
+                "points": case.get("points"),
+            }
+            for case in tests
+        ]
         set_judger_state("running", submission["id"])
         write_judger_event("run_started", submission["id"], payload={**event_payload, "tests": len(tests)})
         for case in tests:
@@ -530,6 +562,10 @@ def judge(submission: dict) -> None:
             else:
                 verdict = VERDICT_ACCEPTED
                 accepted_count += 1
+            for score_case in test_results_for_score:
+                if score_case["id"] == case["id"]:
+                    score_case["accepted"] = verdict == VERDICT_ACCEPTED
+                    break
             insert_result(
                 submission["id"],
                 case["id"],
@@ -543,7 +579,13 @@ def judge(submission: dict) -> None:
                 final_verdict = verdict
             if STOP_ON_FIRST_FAILED_TEST and verdict != VERDICT_ACCEPTED:
                 break
-        score = calculate_score(submission["points"], accepted_count, len(tests), bool(submission["partial_scoring"]))
+        score = calculate_score(
+            submission["points"],
+            accepted_count,
+            len(tests),
+            bool(submission["partial_scoring"]),
+            test_results_for_score,
+        )
         set_judger_state("reporting", submission["id"])
         finish_submission(
             submission["id"],

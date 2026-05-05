@@ -197,3 +197,37 @@ def test_partial_score_is_optional_and_rounded_to_two_decimals() -> None:
     assert calculate_score(100, 5, 10, partial_scoring=True) == 50.0
     assert calculate_score(100, 1, 3, partial_scoring=True) == 33.33
     assert calculate_score(75.5, 2, 4, partial_scoring=True) == 37.75
+
+
+def test_per_test_points_sum_passed_tests_and_cap_task_points() -> None:
+    results = [
+        {"accepted": True, "is_sample": False, "points": 30},
+        {"accepted": False, "is_sample": False, "points": 50},
+        {"accepted": True, "is_sample": False, "points": 40},
+    ]
+
+    assert calculate_score(100, 2, 3, test_results=results) == 70.0
+    assert calculate_score(60, 2, 3, test_results=results) == 60.0
+
+
+def test_partial_scoring_without_test_points_ignores_samples_for_score() -> None:
+    only_sample_passed = [
+        {"accepted": True, "is_sample": True, "points": None},
+        {"accepted": False, "is_sample": False, "points": None},
+    ]
+    hidden_passed = [
+        {"accepted": True, "is_sample": True, "points": None},
+        {"accepted": True, "is_sample": False, "points": None},
+    ]
+
+    assert calculate_score(100, 1, 2, partial_scoring=True, test_results=only_sample_passed) == 0.0
+    assert calculate_score(100, 2, 2, partial_scoring=True, test_results=hidden_passed) == 100.0
+
+
+def test_fallback_full_scoring_remains_all_or_nothing_with_samples() -> None:
+    results = [
+        {"accepted": True, "is_sample": True, "points": None},
+        {"accepted": False, "is_sample": False, "points": None},
+    ]
+
+    assert calculate_score(100, 1, 2, test_results=results) == 0.0

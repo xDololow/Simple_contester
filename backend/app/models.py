@@ -137,6 +137,8 @@ class Contest(Base):
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     individual_duration_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    scoreboard_freeze_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    scoreboard_unfrozen: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     tasks: Mapped[list["ContestTask"]] = relationship(back_populates="contest", cascade="all, delete-orphan")
@@ -206,6 +208,8 @@ class TaskTest(Base):
     input_data: Mapped[str] = mapped_column(Text)
     output_data: Mapped[str] = mapped_column(Text)
     is_sample: Mapped[bool] = mapped_column(Boolean, default=False)
+    points: Mapped[float | None] = mapped_column(Float, nullable=True)
+    group_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
 
     task: Mapped[Task] = relationship(back_populates="tests")
 

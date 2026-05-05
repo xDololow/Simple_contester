@@ -147,6 +147,24 @@ contest access checks as the normal contest endpoints, and streams a compact
 unavailable or drops, the contest view falls back to slower polling through
 `GET /api/contests/{contest_id}/live-snapshot`.
 
+## Scoring
+
+Each task has a maximum `points` value. By default, scoring is all-or-nothing:
+an accepted submission receives the full task points, and any non-accepted
+submission receives `0`.
+
+Admins can enable `partial_scoring` on a task. When no per-test points are set,
+partial scoring splits the task points evenly across non-sample tests only.
+Sample tests are still judged and can prevent an all-or-nothing Accepted result,
+but they do not award partial points unless the admin explicitly assigns points
+to that sample test.
+
+Admins can also set nullable `points` on individual tests. If at least one test
+has explicit points, the submission score is the sum of points for passed tests
+and is capped by the task's maximum points. Tests without explicit points
+contribute `0` in this mode. `group_name` is stored with tests for future group
+policies, but the MVP does not apply group min/max rules.
+
 ## Clarifications
 
 Contest participants can ask jury questions from the contest `Questions` tab.
@@ -178,8 +196,8 @@ tests/002.out
 ```
 
 `metadata.json` contains `format`, `format_version`, `type: "task"`, task
-limits/scoring fields, samples, and the test list with numbered names and
-`is_sample` flags. `statement.txt` is also accepted on import when
+limits/scoring fields, samples, and the test list with numbered names,
+`is_sample`, `points`, and `group_name` fields. `statement.txt` is also accepted on import when
 `statement.md` is absent. Contest packages use a root `metadata.json` with
 `type: "contest"` and task directories:
 
@@ -211,6 +229,19 @@ MVP membership rule: a participant must belong to exactly one team assigned to
 the contest before submitting. Participants with no assigned team, or with more
 than one assigned team for the same contest, receive a 403 response explaining
 that exactly one assigned team membership is required.
+
+## Scoreboard Freeze MVP
+
+Admins can set an optional `scoreboard_freeze_at` timestamp on a contest. Once
+that time is reached, participant scoreboards keep accepting submissions but do
+not include submissions created at or after the freeze time. Admin scoreboards
+always show the full current result.
+
+Setting `scoreboard_unfrozen` to true manually reveals the full scoreboard to
+participants again. The same visibility rule is used by the normal scoreboard
+endpoint, live snapshot endpoint, and SSE contest updates. This MVP only hides
+score visibility; it does not implement ICPC-style frozen penalty reveal
+details.
 
 ## Scale Judgers
 
@@ -402,5 +433,5 @@ YAML:
 - Tasks are stored in a standalone task library. `POST /api/tasks` creates a task without requiring a contest; optional `contest_id` is still accepted for older clients and immediately links the task to that contest. Admins can replace contest task assignments with `PUT /api/contests/{contest_id}/tasks` and a JSON body like `{"task_ids":[1,2,3]}`.
 - Task statements are stored as Markdown text in `statement`; rendering is handled by the frontend.
 - Admins can bulk import task tests with `POST /api/tasks/{task_id}/tests/import-archive` using a `.zip` file containing matching `*.in` and `*.out` files with the same basename, for example `001.in` and `001.out`. Unsafe archive paths are ignored and unmatched files are reported.
-- Partial scoring is optional per task through `partial_scoring`. When enabled, a solution earns `accepted_tests / total_tests * task.points`, rounded to two decimal places. When disabled, scoring remains all-or-nothing. Scoreboard totals use the best score per task.
+- Partial scoring is optional per task through `partial_scoring`. Without per-test points it splits `task.points` across non-sample tests only; with explicit test points it sums the points for passed tests and caps the result at `task.points`. Scoreboard totals use the best score per task.
 - Team-based scoring and team-only contest access are not enforced yet; current submissions and scoreboard remain participant-based.

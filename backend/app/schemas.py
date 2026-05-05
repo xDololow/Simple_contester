@@ -190,6 +190,8 @@ class ContestCreate(BaseModel):
     starts_at: datetime
     ends_at: datetime
     individual_duration_minutes: int | None = None
+    scoreboard_freeze_at: datetime | None = None
+    scoreboard_unfrozen: bool = False
 
 
 class ContestUpdate(BaseModel):
@@ -202,6 +204,8 @@ class ContestUpdate(BaseModel):
     starts_at: datetime | None = None
     ends_at: datetime | None = None
     individual_duration_minutes: int | None = Field(default=None, gt=0)
+    scoreboard_freeze_at: datetime | None = None
+    scoreboard_unfrozen: bool | None = None
 
 
 class ContestOut(ContestCreate):
@@ -225,12 +229,16 @@ class TaskTestCreate(BaseModel):
     input_data: str
     output_data: str
     is_sample: bool = False
+    points: float | None = Field(default=None, ge=0)
+    group_name: str | None = Field(default=None, max_length=120)
 
 
 class TaskTestUpdate(BaseModel):
     input_data: str | None = None
     output_data: str | None = None
     is_sample: bool | None = None
+    points: float | None = Field(default=None, ge=0)
+    group_name: str | None = Field(default=None, max_length=120)
 
 
 class TaskTestOut(BaseModel):
@@ -241,6 +249,8 @@ class TaskTestOut(BaseModel):
     input_data: str
     output_data: str
     is_sample: bool
+    points: float | None = None
+    group_name: str | None = None
 
 
 class TaskTestPublicOut(BaseModel):

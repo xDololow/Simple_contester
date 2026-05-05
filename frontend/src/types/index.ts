@@ -47,6 +47,8 @@ export type Contest = {
   starts_at: string;
   ends_at: string;
   individual_duration_minutes: number | null;
+  scoreboard_freeze_at: string | null;
+  scoreboard_unfrozen: boolean;
   created_at?: string | null;
 };
 
@@ -73,6 +75,8 @@ export type TaskTest = {
   input_data: string;
   output_data: string;
   is_sample: boolean;
+  points: number | null;
+  group_name: string | null;
 };
 
 export type Submission = {
@@ -120,6 +124,7 @@ export type ScoreboardRow = {
 export type ContestLiveEvent = {
   submissions: Submission[];
   scoreboard: ScoreboardRow[];
+  scoreboard_frozen?: boolean;
 };
 
 export type Clarification = {

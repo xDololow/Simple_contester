@@ -750,6 +750,8 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
     starts_at: toLocalInputValue(now.toISOString()),
     ends_at: toLocalInputValue(later.toISOString()),
     individual_duration_minutes: "180",
+    scoreboard_freeze_at: "",
+    scoreboard_unfrozen: false,
     task_ids: [] as number[],
     participant_ids: [] as number[],
     team_ids: [] as number[]
@@ -798,7 +800,9 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
           team_ids: undefined,
           starts_at: fromLocalInputValue(form.starts_at),
           ends_at: fromLocalInputValue(form.ends_at),
-          individual_duration_minutes: form.time_mode === "individual" ? Number(form.individual_duration_minutes) : null
+          individual_duration_minutes: form.time_mode === "individual" ? Number(form.individual_duration_minutes) : null,
+          scoreboard_freeze_at: form.scoreboard_freeze_at ? fromLocalInputValue(form.scoreboard_freeze_at) : null,
+          scoreboard_unfrozen: form.scoreboard_unfrozen
         })
       });
       if (form.task_ids.length) {
@@ -812,7 +816,7 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
       if (teamIds.length) {
         await api<Team[]>(`/api/contests/${contest.id}/teams`, { method: "PUT", body: JSON.stringify({ team_ids: teamIds }) });
       }
-      setForm({ ...form, title: "", description: "", task_ids: [], participant_ids: [], team_ids: [] });
+      setForm({ ...form, title: "", description: "", scoreboard_freeze_at: "", scoreboard_unfrozen: false, task_ids: [], participant_ids: [], team_ids: [] });
       await load();
       onChanged();
     } catch (error) {
@@ -903,6 +907,8 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
             <label>{t("table.starts")}<input type="datetime-local" value={form.starts_at} onChange={(event) => setForm({ ...form, starts_at: event.target.value })} required /></label>
             <label>{t("table.ends")}<input type="datetime-local" value={form.ends_at} onChange={(event) => setForm({ ...form, ends_at: event.target.value })} required /></label>
             <label>{t("table.minutes")}<input type="number" value={form.individual_duration_minutes} onChange={(event) => setForm({ ...form, individual_duration_minutes: event.target.value })} /></label>
+            <label>{t("scoreboard.freezeAt")}<input type="datetime-local" value={form.scoreboard_freeze_at} onChange={(event) => setForm({ ...form, scoreboard_freeze_at: event.target.value })} /></label>
+            <label className="inline"><input className="check" type="checkbox" checked={form.scoreboard_unfrozen} onChange={(event) => setForm({ ...form, scoreboard_unfrozen: event.target.checked })} /> {t("scoreboard.unfrozen")}</label>
           </div>
         </fieldset>
         <fieldset>
@@ -924,7 +930,7 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
       <FlashMessage flash={flash} />
       <div className="table-wrap">
         <table>
-          <thead><tr><th>{t("table.id")}</th><th>{t("table.title")}</th><th>{t("table.status")}</th><th>{t("table.access")}</th><th>{t("contest.participationMode")}</th><th>{t("table.mode")}</th><th>{t("table.starts")}</th><th>{t("table.ends")}</th><th>{t("table.minutes")}</th><th>{t("table.tasks")}</th><th>{t("table.participants")}</th><th>{t("table.teams")}</th><th></th></tr></thead>
+          <thead><tr><th>{t("table.id")}</th><th>{t("table.title")}</th><th>{t("table.status")}</th><th>{t("table.access")}</th><th>{t("contest.participationMode")}</th><th>{t("table.mode")}</th><th>{t("table.starts")}</th><th>{t("table.ends")}</th><th>{t("table.minutes")}</th><th>{t("scoreboard.freezeAt")}</th><th>{t("scoreboard.unfrozenShort")}</th><th>{t("table.tasks")}</th><th>{t("table.participants")}</th><th>{t("table.teams")}</th><th></th></tr></thead>
           <tbody>{contests.map((contest) => <ContestRow key={contest.id} contest={contest} tasks={tasks} users={users} teams={teams} taskIds={contestTaskIds[contest.id] ?? []} participantIds={contestParticipantIds[contest.id] ?? []} teamIds={contestTeamIds[contest.id] ?? []} onSave={saveContest} onSaveTasks={saveContestTasks} onSaveParticipants={saveContestParticipants} onSaveTeams={saveContestTeams} onDelete={deleteContest} />)}</tbody>
         </table>
       </div>
@@ -972,6 +978,8 @@ function ContestRow({
     starts_at: toLocalInputValue(contest.starts_at),
     ends_at: toLocalInputValue(contest.ends_at),
     individual_duration_minutes: String(contest.individual_duration_minutes ?? ""),
+    scoreboard_freeze_at: contest.scoreboard_freeze_at ? toLocalInputValue(contest.scoreboard_freeze_at) : "",
+    scoreboard_unfrozen: contest.scoreboard_unfrozen,
     description: contest.description,
     task_ids: taskIds,
     participant_ids: participantIds,
@@ -986,6 +994,8 @@ function ContestRow({
     starts_at: toLocalInputValue(contest.starts_at),
     ends_at: toLocalInputValue(contest.ends_at),
     individual_duration_minutes: String(contest.individual_duration_minutes ?? ""),
+    scoreboard_freeze_at: contest.scoreboard_freeze_at ? toLocalInputValue(contest.scoreboard_freeze_at) : "",
+    scoreboard_unfrozen: contest.scoreboard_unfrozen,
     description: contest.description,
     task_ids: taskIds,
     participant_ids: participantIds,
@@ -1005,7 +1015,7 @@ function ContestRow({
     return (
       <tr>
         <td>{contest.id}</td><td>{contest.title}</td><td>{t(`status.${contest.status}`)}</td><td>{contest.is_public ? t("contest.public") : t("contest.private")}</td><td>{t(`common.${contest.participation_mode}`)}</td><td>{t(`common.${contest.time_mode}`)}</td>
-        <td>{formatDate(contest.starts_at)}</td><td>{formatDate(contest.ends_at)}</td><td>{contest.individual_duration_minutes ?? "-"}</td>
+        <td>{formatDate(contest.starts_at)}</td><td>{formatDate(contest.ends_at)}</td><td>{contest.individual_duration_minutes ?? "-"}</td><td>{formatDate(contest.scoreboard_freeze_at)}</td><td>{contest.scoreboard_unfrozen ? t("common.yes") : t("common.no")}</td>
         <td>{taskIds.length}</td><td>{participantNames || t("common.none")}</td><td>{teamNames || t("common.none")}</td>
         <td className="row-actions"><button onClick={() => setEditing(true)}>{t("common.edit")}</button><button className="danger" onClick={() => onDelete(contest)}>{t("common.delete")}</button></td>
       </tr>
@@ -1024,6 +1034,8 @@ function ContestRow({
         <td><input type="datetime-local" value={draft.starts_at} onChange={(event) => setDraft({ ...draft, starts_at: event.target.value })} /></td>
         <td><input type="datetime-local" value={draft.ends_at} onChange={(event) => setDraft({ ...draft, ends_at: event.target.value })} /></td>
         <td><input type="number" value={draft.individual_duration_minutes} onChange={(event) => setDraft({ ...draft, individual_duration_minutes: event.target.value })} /></td>
+        <td><input type="datetime-local" value={draft.scoreboard_freeze_at} onChange={(event) => setDraft({ ...draft, scoreboard_freeze_at: event.target.value })} /></td>
+        <td><input className="check" type="checkbox" checked={draft.scoreboard_unfrozen} onChange={(event) => setDraft({ ...draft, scoreboard_unfrozen: event.target.checked })} /></td>
         <td>{draft.task_ids.length}</td>
         <td>{draft.participant_ids.length}</td>
         <td>{draft.team_ids.length}</td>
@@ -1038,6 +1050,8 @@ function ContestRow({
               starts_at: fromLocalInputValue(draft.starts_at),
               ends_at: fromLocalInputValue(draft.ends_at),
               individual_duration_minutes: draft.time_mode === "individual" ? Number(draft.individual_duration_minutes) : null,
+              scoreboard_freeze_at: draft.scoreboard_freeze_at ? fromLocalInputValue(draft.scoreboard_freeze_at) : null,
+              scoreboard_unfrozen: draft.scoreboard_unfrozen,
               description: draft.description
             });
             await onSaveTasks(contest, draft.task_ids);
@@ -1050,7 +1064,7 @@ function ContestRow({
       </tr>
       <tr className="editing">
         <td></td>
-        <td colSpan={12}>
+        <td colSpan={14}>
           <div className="nested-edit">
             <label>{t("table.description")}<textarea className="short" value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} /></label>
             <label>{t("table.tasks")}
@@ -1465,7 +1479,7 @@ function TestsAdmin({ api }: { api: ApiClient }) {
   const [selectedTaskId, setSelectedTaskId] = useState<number | null>(null);
   const [archiveReport, setArchiveReport] = useState<TestArchiveImportReport | null>(null);
   const [flash, setFlash] = useState<Flash>(emptyFlash);
-  const [form, setForm] = useState({ input_data: "", output_data: "", is_sample: false });
+  const [form, setForm] = useState({ input_data: "", output_data: "", is_sample: false, points: "", group_name: "" });
 
   const loadTasks = useCallback(async () => {
     const next = await api<Task[]>("/api/tasks");
@@ -1488,8 +1502,15 @@ function TestsAdmin({ api }: { api: ApiClient }) {
     if (!selectedTaskId) return;
     setFlash(emptyFlash);
     try {
-      await api<TaskTest>(`/api/tasks/${selectedTaskId}/tests`, { method: "POST", body: JSON.stringify(form) });
-      setForm({ input_data: "", output_data: "", is_sample: false });
+      await api<TaskTest>(`/api/tasks/${selectedTaskId}/tests`, {
+        method: "POST",
+        body: JSON.stringify({
+          ...form,
+          points: form.points.trim() ? Number(form.points) : null,
+          group_name: form.group_name.trim() || null
+        })
+      });
+      setForm({ input_data: "", output_data: "", is_sample: false, points: "", group_name: "" });
       await loadTests(selectedTaskId);
     } catch (error) {
       setFlash({ kind: "error", text: errorText(error) });
@@ -1546,6 +1567,8 @@ function TestsAdmin({ api }: { api: ApiClient }) {
       <form className="form-grid" onSubmit={createTest}>
         <label>{t("table.input")}<textarea className="short code" value={form.input_data} onChange={(event) => setForm({ ...form, input_data: event.target.value })} /></label>
         <label>{t("table.output")}<textarea className="short code" value={form.output_data} onChange={(event) => setForm({ ...form, output_data: event.target.value })} /></label>
+        <label>{t("table.points")}<input type="number" step="0.01" value={form.points} onChange={(event) => setForm({ ...form, points: event.target.value })} placeholder={t("test.pointsAuto")} /></label>
+        <label>{t("test.groupName")}<input value={form.group_name} onChange={(event) => setForm({ ...form, group_name: event.target.value })} /></label>
         <label className="inline"><input className="check" type="checkbox" checked={form.is_sample} onChange={(event) => setForm({ ...form, is_sample: event.target.checked })} /> {t("task.sample")}</label>
         <button type="submit" disabled={!selectedTaskId}>{t("common.create")}</button>
       </form>
@@ -1567,7 +1590,7 @@ function TestsAdmin({ api }: { api: ApiClient }) {
       )}
       <div className="table-wrap">
         <table>
-          <thead><tr><th>{t("table.id")}</th><th>{t("table.sample")}</th><th>{t("table.input")}</th><th>{t("table.output")}</th><th></th></tr></thead>
+          <thead><tr><th>{t("table.id")}</th><th>{t("table.sample")}</th><th>{t("table.points")}</th><th>{t("test.groupName")}</th><th>{t("table.input")}</th><th>{t("table.output")}</th><th></th></tr></thead>
           <tbody>{tests.map((test) => <TestRow key={test.id} test={test} onSave={saveTest} onDelete={deleteTest} />)}</tbody>
         </table>
       </div>
@@ -1578,19 +1601,42 @@ function TestsAdmin({ api }: { api: ApiClient }) {
 function TestRow({ test, onSave, onDelete }: { test: TaskTest; onSave: (test: TaskTest, patch: Partial<TaskTest>) => void; onDelete: (test: TaskTest) => void }) {
   const { t } = useI18n();
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(test);
-  useEffect(() => setDraft(test), [test]);
+  const [draft, setDraft] = useState({
+    input_data: test.input_data,
+    output_data: test.output_data,
+    is_sample: test.is_sample,
+    points: test.points === null ? "" : String(test.points),
+    group_name: test.group_name ?? ""
+  });
+  useEffect(() => setDraft({
+    input_data: test.input_data,
+    output_data: test.output_data,
+    is_sample: test.is_sample,
+    points: test.points === null ? "" : String(test.points),
+    group_name: test.group_name ?? ""
+  }), [test]);
 
   return (
     <tr className={editing ? "editing" : ""}>
       <td>{test.id}</td>
       <td>{editing ? <input className="check" type="checkbox" checked={draft.is_sample} onChange={(event) => setDraft({ ...draft, is_sample: event.target.checked })} /> : test.is_sample ? t("common.yes") : t("common.no")}</td>
+      <td>{editing ? <input type="number" step="0.01" value={draft.points} onChange={(event) => setDraft({ ...draft, points: event.target.value })} placeholder={t("test.pointsAuto")} /> : test.points ?? "-"}</td>
+      <td>{editing ? <input value={draft.group_name} onChange={(event) => setDraft({ ...draft, group_name: event.target.value })} /> : test.group_name || "-"}</td>
       <td>{editing ? <textarea className="short code" value={draft.input_data} onChange={(event) => setDraft({ ...draft, input_data: event.target.value })} /> : <pre>{test.input_data}</pre>}</td>
       <td>{editing ? <textarea className="short code" value={draft.output_data} onChange={(event) => setDraft({ ...draft, output_data: event.target.value })} /> : <pre>{test.output_data}</pre>}</td>
       <td className="row-actions">
         {editing ? (
           <>
-            <button onClick={() => { onSave(test, { input_data: draft.input_data, output_data: draft.output_data, is_sample: draft.is_sample }); setEditing(false); }}>{t("common.save")}</button>
+            <button onClick={() => {
+              onSave(test, {
+                input_data: draft.input_data,
+                output_data: draft.output_data,
+                is_sample: draft.is_sample,
+                points: draft.points.trim() ? Number(draft.points) : null,
+                group_name: draft.group_name.trim() || null
+              });
+              setEditing(false);
+            }}>{t("common.save")}</button>
             <button onClick={() => setEditing(false)}>{t("common.cancel")}</button>
           </>
         ) : (

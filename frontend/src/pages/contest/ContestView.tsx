@@ -28,6 +28,12 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
   const [tasks, setTasks] = useState<Task[]>([]);
   const [submissions, setSubmissions] = useState<Submission[]>([]);
   const [scoreboard, setScoreboard] = useState<ScoreboardRow[]>([]);
+  const [scoreboardFrozen, setScoreboardFrozen] = useState(
+    me.role !== "admin" &&
+      Boolean(contest.scoreboard_freeze_at) &&
+      !contest.scoreboard_unfrozen &&
+      Date.now() >= new Date(contest.scoreboard_freeze_at || "").getTime()
+  );
   const [clarifications, setClarifications] = useState<Clarification[]>([]);
   const [tab, setTab] = useState<ContestTab>("tasks");
   const [selectedTaskId, setSelectedTaskId] = useState<number | null>(null);
@@ -45,6 +51,7 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
     setTasks(nextTasks);
     setSubmissions(live.submissions);
     setScoreboard(live.scoreboard);
+    setScoreboardFrozen(Boolean(live.scoreboard_frozen));
     setClarifications(nextClarifications);
     setSelectedTaskId((current) => current ?? nextTasks[0]?.id ?? null);
   }, [api, contest.id]);
@@ -53,6 +60,7 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
     const live = await api<ContestLiveEvent>(`/api/contests/${contest.id}/live-snapshot`);
     setSubmissions(live.submissions);
     setScoreboard(live.scoreboard);
+    setScoreboardFrozen(Boolean(live.scoreboard_frozen));
   }, [api, contest.id]);
 
   useEffect(() => {
@@ -78,6 +86,7 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
       const live = JSON.parse((event as MessageEvent).data) as ContestLiveEvent;
       setSubmissions(live.submissions);
       setScoreboard(live.scoreboard);
+      setScoreboardFrozen(Boolean(live.scoreboard_frozen));
     });
     eventSource.onerror = () => {
       eventSource?.close();
@@ -111,6 +120,7 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
           <span className="pill">{t(`status.${contest.status}`)}</span>
           <span>{t(`common.${contest.participation_mode}`)}</span>
           <span>{contest.time_mode === "individual" ? `${contest.individual_duration_minutes} ${t("table.minutes").toLowerCase()}` : t("common.fixed")}</span>
+          {scoreboardFrozen && <span className="pill warn">{t("scoreboard.frozenBadge")}</span>}
           <span>{formatDate(contest.starts_at)} - {formatDate(contest.ends_at)}</span>
         </div>
       </section>
@@ -194,7 +204,7 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
 
       {tab === "scoreboard" && (
         <section className="panel">
-          <Header title={t("title.scoreboard")} subtitle={t("common.live")} />
+          <Header title={t("title.scoreboard")} subtitle={scoreboardFrozen ? t("scoreboard.frozenText") : t("common.live")} />
           {scoreboard.length ? (
             <div className="table-wrap">
               <table>
