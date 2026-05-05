@@ -3,7 +3,17 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .models import ContestParticipationMode, ContestStatus, ContestTimeMode, JudgerStatus, Language, SubmissionVerdict, UserRole
+from .models import (
+    ClarificationStatus,
+    ClarificationVisibility,
+    ContestParticipationMode,
+    ContestStatus,
+    ContestTimeMode,
+    JudgerStatus,
+    Language,
+    SubmissionVerdict,
+    UserRole,
+)
 
 
 class TokenOut(BaseModel):
@@ -296,6 +306,35 @@ class PackageImportReport(BaseModel):
     created_tests: int
     contest_id: int | None = None
     task_ids: list[int] = Field(default_factory=list)
+
+
+class ClarificationCreate(BaseModel):
+    task_id: int | None = None
+    question: str = Field(min_length=1, max_length=10000)
+
+
+class ClarificationAdminUpdate(BaseModel):
+    answer: str | None = Field(default=None, max_length=10000)
+    status: ClarificationStatus | None = None
+    visibility: ClarificationVisibility | None = None
+
+
+class ClarificationOut(BaseModel):
+    id: int
+    contest_id: int
+    task_id: int | None = None
+    task_title: str | None = None
+    author_user_id: int
+    author_username: str
+    author_display_name: str
+    question: str
+    answer: str | None = None
+    status: ClarificationStatus
+    visibility: ClarificationVisibility
+    answered_by_user_id: int | None = None
+    answered_by_username: str | None = None
+    created_at: datetime
+    answered_at: datetime | None = None
 
 
 class SubmissionCreate(BaseModel):

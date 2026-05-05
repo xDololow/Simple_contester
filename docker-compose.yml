@@ -55,10 +55,12 @@ services:
       start_period: 10s
 
   judger:
+    image: simple-contester-judger:local
     build: ./judger
     environment:
       DATABASE_URL: ${DATABASE_URL:-mysql+pymysql://contestant:contestant@mariadb:3306/simple_contester}
       JUDGER_ID: ${JUDGER_ID:-docker-judger}
+      JUDGER_SANDBOX_MODE: ${JUDGER_SANDBOX_MODE:-subprocess}
       POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-1}
       STOP_ON_FIRST_FAILED_TEST: ${STOP_ON_FIRST_FAILED_TEST:-1}
       OUTPUT_LIMIT_BYTES: ${OUTPUT_LIMIT_BYTES:-1048576}
@@ -67,6 +69,54 @@ services:
       COMPILE_MEMORY_LIMIT_MB: ${COMPILE_MEMORY_LIMIT_MB:-4096}
       COMPILE_PROCESS_LIMIT: ${COMPILE_PROCESS_LIMIT:-256}
       COMPILE_FILE_SIZE_LIMIT_BYTES: ${COMPILE_FILE_SIZE_LIMIT_BYTES:-268435456}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=512m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os; from sqlalchemy import create_engine, text; engine = create_engine(os.environ['DATABASE_URL'], pool_pre_ping=True); conn = engine.connect(); conn.execute(text('SELECT 1')); conn.close()\""]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  judger-docker-sandbox:
+    profiles:
+      - docker-sandbox
+    image: simple-contester-judger:local
+    build: ./judger
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-mysql+pymysql://contestant:contestant@mariadb:3306/simple_contester}
+      JUDGER_ID: ${JUDGER_ID:-docker-judger-hard}
+      JUDGER_SANDBOX_MODE: docker
+      JUDGER_WORK_ROOT: /tmp/simple-contester-judger-work
+      JUDGER_DOCKER_IMAGE: ${JUDGER_DOCKER_IMAGE:-simple-contester-judger:local}
+      JUDGER_DOCKER_USER: ${JUDGER_DOCKER_USER:-judge}
+      JUDGER_DOCKER_CPUS: ${JUDGER_DOCKER_CPUS:-1}
+      JUDGER_DOCKER_TMPFS_SIZE: ${JUDGER_DOCKER_TMPFS_SIZE:-512m}
+      DOCKER_CONFIG: /tmp/.docker
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-1}
+      STOP_ON_FIRST_FAILED_TEST: ${STOP_ON_FIRST_FAILED_TEST:-1}
+      OUTPUT_LIMIT_BYTES: ${OUTPUT_LIMIT_BYTES:-1048576}
+      PROCESS_LIMIT: ${PROCESS_LIMIT:-256}
+      FILE_SIZE_LIMIT_BYTES: ${FILE_SIZE_LIMIT_BYTES:-16777216}
+      COMPILE_MEMORY_LIMIT_MB: ${COMPILE_MEMORY_LIMIT_MB:-4096}
+      COMPILE_PROCESS_LIMIT: ${COMPILE_PROCESS_LIMIT:-256}
+      COMPILE_FILE_SIZE_LIMIT_BYTES: ${COMPILE_FILE_SIZE_LIMIT_BYTES:-268435456}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/simple-contester-judger-work:/tmp/simple-contester-judger-work
+    group_add:
+      - ${DOCKER_SOCK_GID:-0}
     read_only: true
     tmpfs:
       - /tmp:rw,exec,nosuid,nodev,size=512m

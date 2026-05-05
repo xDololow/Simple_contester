@@ -106,6 +106,13 @@ Compose reads `.env` automatically. Start from `.env.example`; the defaults keep
 | `ADMIN_USERNAME` | `admin` | Bootstrap admin username. |
 | `ADMIN_PASSWORD` | `admin` | Bootstrap admin password. |
 | `JUDGER_ID` | `docker-judger` | Worker ID written to claimed submissions. |
+| `JUDGER_SANDBOX_MODE` | `subprocess` | Judger execution backend: `subprocess` keeps the compatible in-container runner, `docker` runs compile/run commands in per-invocation Docker containers. |
+| `JUDGER_WORK_ROOT` | unset | Parent directory for judger workspaces. Required for Docker sandbox inside Compose so the host Docker daemon can bind-mount the same path. |
+| `JUDGER_DOCKER_IMAGE` | `simple-contester-judger:local` | Image used for per-invocation Docker sandbox containers. It must contain the language toolchains from `judger/Dockerfile`. |
+| `JUDGER_DOCKER_USER` | `judge` | Non-root user passed to `docker run --user` for sandbox containers. |
+| `JUDGER_DOCKER_CPUS` | `1` | CPU quota passed to Docker sandbox containers. |
+| `JUDGER_DOCKER_TMPFS_SIZE` | `512m` | Size of the writable tmpfs mounted at `/tmp` in Docker sandbox containers. |
+| `DOCKER_SOCK_GID` | `0` | Supplementary group added to `judger-docker-sandbox` so the non-root worker can access `/var/run/docker.sock`. Set it to `stat -c '%g' /var/run/docker.sock` when needed. |
 | `POLL_INTERVAL_SECONDS` | `1` | Judger polling interval. |
 | `SUBMISSION_LEASE_SECONDS` | `60` | Lease duration for a claimed submission before another worker may reclaim it. |
 | `SUBMISSION_MAX_ATTEMPTS` | `3` | Maximum claim attempts before an expired running submission is marked Internal Error. |
@@ -139,6 +146,15 @@ contest access checks as the normal contest endpoints, and streams a compact
 `contest` event whenever submission verdicts/scores change. If the stream is
 unavailable or drops, the contest view falls back to slower polling through
 `GET /api/contests/{contest_id}/live-snapshot`.
+
+## Clarifications
+
+Contest participants can ask jury questions from the contest `Questions` tab.
+Questions may be general or linked to a contest task. Participants see their own
+private questions plus any broadcast clarifications in the same contest; they do
+not see other participants' private questions. Admins can review open questions,
+answer them, close them, and mark an answer as broadcast for all contest
+participants.
 
 ## Task And Contest Packages
 
@@ -216,9 +232,13 @@ Admins can inspect recent events on the Status page or through
 
 ## Judger Sandbox Boundaries
 
-The default judger is still a simple Python worker, but each compile and test run now executes in an isolated temporary working directory with a restricted environment. For every test case, the compiled artifacts are copied into a fresh temp directory, so files created by one run do not persist into the next run.
+The default judger mode is `JUDGER_SANDBOX_MODE=subprocess` for compatibility.
+In this mode each compile and test run executes in an isolated temporary
+working directory with a restricted environment. For every test case, the
+compiled artifacts are copied into a fresh temp directory, so files created by
+one run do not persist into the next run.
 
-Submissions are run with:
+Subprocess-mode submissions are run with:
 
 - wall-clock and CPU time limits;
 - address-space limits where compatible with the runtime;
@@ -226,14 +246,51 @@ Submissions are run with:
 - bounded stdout/stderr capture with truncation handling;
 - `HOME` and `TMPDIR` pointed at the per-run temp directory.
 
-The Docker Compose judger service also runs as a non-root user with a read-only root filesystem, writable `/tmp` tmpfs, dropped Linux capabilities, `no-new-privileges`, and a container-level `pids_limit`.
+The Docker Compose `judger` service also runs as a non-root user with a
+read-only root filesystem, writable `/tmp` tmpfs, dropped Linux capabilities,
+`no-new-privileges`, and a container-level `pids_limit`.
+
+### Hard Docker Sandbox Mode
+
+For stronger per-invocation isolation, enable the explicit Compose profile:
+
+```bash
+# Build the judger image used both by the worker and sandbox containers.
+docker compose build judger-docker-sandbox
+
+# If your Docker socket group is not root, pass its numeric gid.
+DOCKER_SOCK_GID="$(stat -c '%g' /var/run/docker.sock)" \
+  docker compose --profile docker-sandbox up --scale judger=0 judger-docker-sandbox
+```
+
+`judger-docker-sandbox` mounts `/var/run/docker.sock` and
+`/tmp/simple-contester-judger-work`. The matching absolute work path is
+important: the judger process creates temporary submission directories there,
+and the host Docker daemon bind-mounts those same directories into each sandbox
+container at `/workspace`.
+
+In `JUDGER_SANDBOX_MODE=docker`, each compile command and each test run is
+executed with `docker run --rm` using:
+
+- `--network none`;
+- read-only root filesystem;
+- writable `/tmp` tmpfs;
+- bind-mounted per-run `/workspace`;
+- non-root `--user judge` by default;
+- memory, pids, CPU, file-size, open-file, and core limits where Docker/kernel support them;
+- dropped capabilities and `no-new-privileges`.
+
+The normal `judger` service does not mount the Docker socket. Hard sandbox mode
+must be enabled explicitly through the `docker-sandbox` profile.
 
 Important caveats:
 
-- Subprocess mode does not provide a reliable per-submission network namespace. The judger needs database network access, so untrusted code can still attempt outbound connections from inside the judger container. For production, run submissions in a separate per-submission container, VM, or microVM with network disabled.
+- Subprocess mode does not provide a reliable per-submission network namespace. The judger needs database network access, so untrusted code can still attempt outbound connections from inside the judger container.
+- Mounting `/var/run/docker.sock` gives the judger service powerful control over the host Docker daemon. Treat `judger-docker-sandbox` as privileged infrastructure, run it only on dedicated judging hosts, and do not expose it to tenant-controlled code or APIs.
+- Docker sandbox mode is a practical hardening layer, not a complete hostile-code boundary. Strong multi-tenant production deployments should still consider dedicated hosts, VMs, or microVMs, strict image provenance, cgroup/runtime monitoring, and regular kernel/runtime patching.
 - `RLIMIT_NPROC` is kernel/user dependent and is not reliably enforced for root; the Docker image runs as the non-root `judge` user to make it effective.
 - Language runtimes such as JVM, Node.js, Go, and Mono manage memory internally, so memory verdicts are best-effort and may appear as runtime errors for some failure modes.
-- This sandbox is suitable for a local MVP or trusted contests. It is not a complete hostile-code isolation boundary.
+- Docker memory kills may be reported as memory or runtime errors depending on how the runtime exits.
 
 ## Local Frontend Without Docker
 

@@ -2,12 +2,12 @@ import React, { useCallback, useEffect, useState } from "react";
 import { API_BASE } from "../../api/client";
 import { FlashMessage, Header, SubmissionDetailView } from "../../components/shared";
 import { useI18n } from "../../i18n";
-import type { AdminStats, ApiClient, Contest, ContestStatus, Flash, ImportReport, JudgerEvent, JudgerWorker, PackageImportReport, ParticipationMode, Role, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
+import type { AdminStats, ApiClient, Clarification, ClarificationStatus, ClarificationVisibility, Contest, ContestStatus, Flash, ImportReport, JudgerEvent, JudgerWorker, PackageImportReport, ParticipationMode, Role, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
 import { emptyFlash, errorText, formatDate, formatScore, fromLocalInputValue, toLocalInputValue, verdictClass } from "../../utils/format";
 
 export function AdminDashboard({ api, token, reloadContests }: { api: ApiClient; token: string; reloadContests: () => void }) {
   const { t } = useI18n();
-  const [tab, setTab] = useState<"status" | "users" | "import" | "teams" | "contests" | "tasks" | "packages" | "tests" | "submissions">("status");
+  const [tab, setTab] = useState<"status" | "users" | "import" | "teams" | "contests" | "tasks" | "packages" | "tests" | "submissions" | "clarifications">("status");
 
   return (
     <div className="admin-shell">
@@ -21,7 +21,8 @@ export function AdminDashboard({ api, token, reloadContests }: { api: ApiClient;
           ["tasks", t("tab.tasks")],
           ["packages", t("tab.packages")],
           ["tests", t("tab.tests")],
-          ["submissions", t("tab.submissions")]
+          ["submissions", t("tab.submissions")],
+          ["clarifications", t("tab.clarifications")]
         ].map(([id, label]) => (
           <button key={id} className={tab === id ? "active" : ""} onClick={() => setTab(id as typeof tab)}>
             {label}
@@ -37,6 +38,7 @@ export function AdminDashboard({ api, token, reloadContests }: { api: ApiClient;
       {tab === "packages" && <PackagesAdmin api={api} token={token} onChanged={reloadContests} />}
       {tab === "tests" && <TestsAdmin api={api} />}
       {tab === "submissions" && <SubmissionsAdmin api={api} />}
+      {tab === "clarifications" && <ClarificationsAdmin api={api} />}
     </div>
   );
 }
@@ -274,6 +276,119 @@ function StatusTable({ title, rows, empty }: { title: string; rows: Array<[strin
       </table>
     </div>
   );
+}
+
+function ClarificationsAdmin({ api }: { api: ApiClient }) {
+  const { t } = useI18n();
+  const [clarifications, setClarifications] = useState<Clarification[]>([]);
+  const [contests, setContests] = useState<Contest[]>([]);
+  const [flash, setFlash] = useState<Flash>(emptyFlash);
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [nextClarifications, nextContests] = await Promise.all([
+        api<Clarification[]>("/api/admin/clarifications?status=open&limit=100"),
+        api<Contest[]>("/api/contests")
+      ]);
+      setClarifications(nextClarifications);
+      setContests(nextContests);
+      setFlash(emptyFlash);
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    } finally {
+      setLoading(false);
+    }
+  }, [api]);
+
+  useEffect(() => { load().catch((error) => setFlash({ kind: "error", text: errorText(error) })); }, [load]);
+
+  async function updateClarification(clarification: Clarification, patch: { answer?: string; status?: ClarificationStatus; visibility?: ClarificationVisibility }) {
+    setFlash(emptyFlash);
+    try {
+      await api<Clarification>(`/api/admin/clarifications/${clarification.id}`, {
+        method: "PATCH",
+        body: JSON.stringify(patch)
+      });
+      await load();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
+  return (
+    <section className="panel">
+      <Header title={t("tab.clarifications")} subtitle={t("clarification.adminSubtitle")} />
+      <div className="toolbar">
+        <button onClick={load} disabled={loading}>{loading ? t("status.refreshing") : t("common.refresh")}</button>
+        <span className="muted">{t("clarification.openOnly")}</span>
+      </div>
+      <FlashMessage flash={flash} />
+      {clarifications.length ? (
+        <div className="clarification-list">
+          {clarifications.map((clarification) => (
+            <AdminClarificationCard
+              key={clarification.id}
+              clarification={clarification}
+              contest={contests.find((contest) => contest.id === clarification.contest_id)}
+              onUpdate={updateClarification}
+            />
+          ))}
+        </div>
+      ) : (
+        <EmptyAdminState text={t("empty.clarificationsText")} />
+      )}
+    </section>
+  );
+}
+
+function AdminClarificationCard({
+  clarification,
+  contest,
+  onUpdate
+}: {
+  clarification: Clarification;
+  contest?: Contest;
+  onUpdate: (clarification: Clarification, patch: { answer?: string; status?: ClarificationStatus; visibility?: ClarificationVisibility }) => Promise<void>;
+}) {
+  const { t } = useI18n();
+  const [answer, setAnswer] = useState(clarification.answer ?? "");
+  const [visibility, setVisibility] = useState<ClarificationVisibility>(clarification.visibility);
+  useEffect(() => {
+    setAnswer(clarification.answer ?? "");
+    setVisibility(clarification.visibility);
+  }, [clarification]);
+
+  return (
+    <article className="clarification-card admin-clarification-card">
+      <div className="clarification-head">
+        <strong>{contest?.title || `#${clarification.contest_id}`} · {clarification.task_title || t("clarification.general")}</strong>
+        <span className="meta-row">
+          <span>{clarification.author_display_name}</span>
+          <span className="pill">{t(`clarification.status.${clarification.status}`)}</span>
+          <span>{formatDate(clarification.created_at)}</span>
+        </span>
+      </div>
+      <p>{clarification.question}</p>
+      <div className="admin-answer-grid">
+        <label>{t("clarification.answer")}<textarea className="short" value={answer} onChange={(event) => setAnswer(event.target.value)} /></label>
+        <label>{t("clarification.visibilityLabel")}<select value={visibility} onChange={(event) => setVisibility(event.target.value as ClarificationVisibility)}>
+          <option value="private">{t("clarification.visibility.private")}</option>
+          <option value="broadcast">{t("clarification.visibility.broadcast")}</option>
+        </select></label>
+        <div className="toolbar">
+          <button onClick={() => onUpdate(clarification, { answer, visibility })} disabled={!answer.trim()}>{t("clarification.answerAction")}</button>
+          <button onClick={() => onUpdate(clarification, { status: "closed", visibility })}>{t("clarification.close")}</button>
+          <button onClick={() => onUpdate(clarification, { visibility: "broadcast" })}>{t("clarification.broadcast")}</button>
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function EmptyAdminState({ text }: { text: string }) {
+  return <div className="empty-state"><span>{text}</span></div>;
 }
 
 function UsersAdmin({ api }: { api: ApiClient }) {

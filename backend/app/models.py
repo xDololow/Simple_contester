@@ -73,6 +73,17 @@ class JudgerStatus(str, Enum):
     offline = "offline"
 
 
+class ClarificationStatus(str, Enum):
+    open = "open"
+    answered = "answered"
+    closed = "closed"
+
+
+class ClarificationVisibility(str, Enum):
+    private = "private"
+    broadcast = "broadcast"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -225,6 +236,30 @@ class Submission(Base):
     attempt_number: Mapped[int] = mapped_column(Integer, default=0)
 
     results: Mapped[list["TestResult"]] = relationship(back_populates="submission", cascade="all, delete-orphan")
+
+
+class Clarification(Base):
+    __tablename__ = "clarifications"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    contest_id: Mapped[int] = mapped_column(ForeignKey("contests.id", ondelete="CASCADE"), index=True)
+    task_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True, index=True)
+    author_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    question: Mapped[str] = mapped_column(Text)
+    answer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[ClarificationStatus] = mapped_column(
+        SAEnum(ClarificationStatus),
+        default=ClarificationStatus.open,
+        index=True,
+    )
+    visibility: Mapped[ClarificationVisibility] = mapped_column(
+        SAEnum(ClarificationVisibility),
+        default=ClarificationVisibility.private,
+        index=True,
+    )
+    answered_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Judger(Base):

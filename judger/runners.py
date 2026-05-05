@@ -9,6 +9,7 @@ import selectors
 import shutil
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,6 +31,13 @@ COMPILE_MEMORY_LIMIT_MB = int(os.getenv("COMPILE_MEMORY_LIMIT_MB", "4096"))
 COMPILE_PROCESS_LIMIT = int(os.getenv("COMPILE_PROCESS_LIMIT", "256"))
 COMPILE_FILE_SIZE_LIMIT_BYTES = int(os.getenv("COMPILE_FILE_SIZE_LIMIT_BYTES", str(256 * 1024 * 1024)))
 PIPE_READ_CHUNK_BYTES = 8192
+SANDBOX_MODE_SUBPROCESS = "subprocess"
+SANDBOX_MODE_DOCKER = "docker"
+DOCKER_WORKSPACE = "/workspace"
+
+
+def sandbox_mode() -> str:
+    return os.getenv("JUDGER_SANDBOX_MODE", SANDBOX_MODE_SUBPROCESS).strip().lower()
 
 
 @dataclass(frozen=True)
@@ -314,14 +322,26 @@ def create_runner(language: str, workdir: Path, source_code: str, limits: Limits
 
 
 def run_compile(command: list[str], cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
-    result = run_bounded_process(
-        command,
-        input_data="",
-        cwd=cwd,
-        env=env,
-        timeout_seconds=COMPILE_TIMEOUT_SECONDS,
-        preexec_fn=apply_compile_resource_limits,
-    )
+    if sandbox_mode() == SANDBOX_MODE_DOCKER:
+        result = run_docker_bounded_process(
+            command,
+            input_data="",
+            cwd=cwd,
+            env=env,
+            timeout_seconds=COMPILE_TIMEOUT_SECONDS,
+            memory_limit_mb=COMPILE_MEMORY_LIMIT_MB,
+            pids_limit=COMPILE_PROCESS_LIMIT,
+            file_size_limit_bytes=COMPILE_FILE_SIZE_LIMIT_BYTES,
+        )
+    else:
+        result = run_bounded_process(
+            command,
+            input_data="",
+            cwd=cwd,
+            env=env,
+            timeout_seconds=COMPILE_TIMEOUT_SECONDS,
+            preexec_fn=apply_compile_resource_limits,
+        )
     stderr = result.stderr
     if result.timed_out:
         stderr = append_message(stderr, "Compilation timed out")
@@ -356,14 +376,26 @@ def run_program(
     address_space_limit_bytes: int | None = None,
 ) -> RunResult:
     started = time.monotonic()
-    completed = run_bounded_process(
-        command,
-        input_data=input_data,
-        cwd=cwd,
-        env=env,
-        timeout_seconds=limits.timeout_seconds,
-        preexec_fn=lambda: apply_resource_limits(limits, address_space_limit_bytes),
-    )
+    if sandbox_mode() == SANDBOX_MODE_DOCKER:
+        completed = run_docker_bounded_process(
+            command,
+            input_data=input_data,
+            cwd=cwd,
+            env=env,
+            timeout_seconds=limits.timeout_seconds,
+            memory_limit_mb=limits.memory_limit_mb,
+            pids_limit=PROCESS_LIMIT,
+            file_size_limit_bytes=FILE_SIZE_LIMIT_BYTES,
+        )
+    else:
+        completed = run_bounded_process(
+            command,
+            input_data=input_data,
+            cwd=cwd,
+            env=env,
+            timeout_seconds=limits.timeout_seconds,
+            preexec_fn=lambda: apply_resource_limits(limits, address_space_limit_bytes),
+        )
 
     elapsed_ms = int((time.monotonic() - started) * 1000)
     stdout = completed.stdout or ""
@@ -469,6 +501,7 @@ def run_bounded_process(
     env: dict[str, str],
     timeout_seconds: float,
     preexec_fn,
+    kill_callback=None,
 ) -> BoundedProcessResult:
     process = subprocess.Popen(
         command,
@@ -506,7 +539,7 @@ def run_bounded_process(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
-                terminate_process_group(process)
+                terminate_process_group(process, kill_callback)
                 break
             for key, _ in selector.select(timeout=min(0.05, remaining)):
                 if key.data == "stdin":
@@ -539,7 +572,7 @@ def run_bounded_process(
                 if total_output > OUTPUT_LIMIT_BYTES:
                     truncated = True
                     key.data.extend(OUTPUT_TRUNCATION_MESSAGE.encode("utf-8"))
-                    terminate_process_group(process)
+                    terminate_process_group(process, kill_callback)
                     selector.unregister(key.fileobj)
                     break
             if truncated:
@@ -548,7 +581,7 @@ def run_bounded_process(
         try:
             returncode = process.wait(timeout=0.2)
         except subprocess.TimeoutExpired:
-            terminate_process_group(process)
+            terminate_process_group(process, kill_callback)
             returncode = process.wait()
     finally:
         for stream in (process.stdin, process.stdout, process.stderr):
@@ -570,11 +603,13 @@ def run_bounded_process(
     )
 
 
-def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+def terminate_process_group(process: subprocess.Popen[bytes], kill_callback=None) -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    if kill_callback is not None:
+        kill_callback()
 
 
 def decode_output(value: bytes) -> str:
@@ -583,3 +618,152 @@ def decode_output(value: bytes) -> str:
 
 def append_message(output: str, message: str) -> str:
     return "\n".join(part for part in (output.strip(), message) if part)
+
+
+@dataclass(frozen=True)
+class DockerSandboxConfig:
+    image: str
+    user: str
+    cpus: str
+    tmpfs_size: str
+    workspace_target: str = DOCKER_WORKSPACE
+
+
+def docker_sandbox_config() -> DockerSandboxConfig:
+    return DockerSandboxConfig(
+        image=os.getenv("JUDGER_DOCKER_IMAGE", "simple-contester-judger:local"),
+        user=os.getenv("JUDGER_DOCKER_USER", "judge"),
+        cpus=os.getenv("JUDGER_DOCKER_CPUS", "1"),
+        tmpfs_size=os.getenv("JUDGER_DOCKER_TMPFS_SIZE", "512m"),
+    )
+
+
+def build_docker_run_command(
+    command: list[str],
+    cwd: Path,
+    env: dict[str, str],
+    memory_limit_mb: int,
+    pids_limit: int,
+    file_size_limit_bytes: int,
+    container_name: str,
+    config: DockerSandboxConfig | None = None,
+) -> list[str]:
+    config = config or docker_sandbox_config()
+    translated_env = docker_env_for_workdir(env, cwd, config.workspace_target)
+    docker_command = [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        container_name,
+        "--network",
+        "none",
+        "--read-only",
+        "--tmpfs",
+        f"/tmp:rw,exec,nosuid,nodev,size={config.tmpfs_size}",
+        "--workdir",
+        config.workspace_target,
+        "--user",
+        config.user,
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges:true",
+        "--pids-limit",
+        str(max(1, pids_limit)),
+        "--memory",
+        f"{max(16, memory_limit_mb)}m",
+        "--memory-swap",
+        f"{max(16, memory_limit_mb)}m",
+        "--cpus",
+        config.cpus,
+        "--ulimit",
+        f"fsize={file_size_limit_bytes}:{file_size_limit_bytes}",
+        "--ulimit",
+        "nofile=64:64",
+        "--ulimit",
+        "core=0:0",
+        "--mount",
+        f"type=bind,src={cwd.resolve()},dst={config.workspace_target},rw",
+    ]
+    for key, value in sorted(translated_env.items()):
+        docker_command.extend(["--env", f"{key}={value}"])
+    docker_command.append(config.image)
+    docker_command.extend(command)
+    return docker_command
+
+
+def docker_env_for_workdir(env: dict[str, str], host_workdir: Path, workspace_target: str) -> dict[str, str]:
+    host_workdir = host_workdir.resolve()
+    translated: dict[str, str] = {}
+    for key, value in env.items():
+        translated[key] = translate_docker_env_path(value, host_workdir, workspace_target)
+    translated["HOME"] = "/tmp"
+    translated["TMPDIR"] = "/tmp"
+    return translated
+
+
+def translate_docker_env_path(value: str, host_workdir: Path, workspace_target: str) -> str:
+    try:
+        path = Path(value)
+    except (TypeError, ValueError):
+        return value
+    if not path.is_absolute():
+        return value
+    try:
+        relative = path.resolve().relative_to(host_workdir)
+    except (OSError, ValueError):
+        return value
+    if str(relative) == ".":
+        return workspace_target
+    return str(Path(workspace_target) / relative)
+
+
+def run_docker_bounded_process(
+    command: list[str],
+    input_data: str,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_seconds: float,
+    memory_limit_mb: int,
+    pids_limit: int,
+    file_size_limit_bytes: int,
+) -> BoundedProcessResult:
+    if shutil.which("docker") is None:
+        return BoundedProcessResult(
+            returncode=127,
+            stdout="",
+            stderr="Docker sandbox requested but docker CLI is not available",
+        )
+    container_name = f"simple-contester-{uuid.uuid4().hex}"
+    docker_command = build_docker_run_command(
+        command,
+        cwd,
+        env,
+        memory_limit_mb=memory_limit_mb,
+        pids_limit=pids_limit,
+        file_size_limit_bytes=file_size_limit_bytes,
+        container_name=container_name,
+    )
+    return run_bounded_process(
+        docker_command,
+        input_data=input_data,
+        cwd=cwd,
+        env=os.environ.copy(),
+        timeout_seconds=timeout_seconds,
+        preexec_fn=lambda: None,
+        kill_callback=lambda: remove_docker_container(container_name),
+    )
+
+
+def remove_docker_container(container_name: str) -> None:
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass

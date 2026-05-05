@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -18,8 +20,10 @@ from runners import (  # noqa: E402
     VERDICT_MEMORY_LIMIT,
     VERDICT_RUNTIME_ERROR,
     VERDICT_TIME_LIMIT,
+    build_docker_run_command,
     copy_run_workspace,
     create_runner,
+    docker_env_for_workdir,
     env_for_workdir,
     run_program,
 )
@@ -148,3 +152,104 @@ for pid in children:
 
     assert result.verdict == VERDICT_ACCEPTED
     assert "blocked" in result.stdout
+
+
+def test_docker_command_builder_applies_hard_sandbox_flags() -> None:
+    with tempfile.TemporaryDirectory(prefix="judger-docker-builder-") as tmp:
+        workdir = Path(tmp)
+        command = build_docker_run_command(
+            ["python", "main.py"],
+            workdir,
+            {"PATH": "/usr/bin", "HOME": str(workdir), "TMPDIR": str(workdir)},
+            memory_limit_mb=128,
+            pids_limit=16,
+            file_size_limit_bytes=4096,
+            container_name="simple-contester-test",
+        )
+
+    assert command[:4] == ["docker", "run", "--rm", "--name"]
+    assert "--network" in command
+    assert command[command.index("--network") + 1] == "none"
+    assert "--read-only" in command
+    assert "--tmpfs" in command
+    assert "--user" in command
+    assert command[command.index("--user") + 1] == "judge"
+    assert "--cap-drop" in command
+    assert command[command.index("--cap-drop") + 1] == "ALL"
+    assert "--security-opt" in command
+    assert command[command.index("--security-opt") + 1] == "no-new-privileges:true"
+    assert "--pids-limit" in command
+    assert command[command.index("--pids-limit") + 1] == "16"
+    assert "--memory" in command
+    assert command[command.index("--memory") + 1] == "128m"
+    assert "--memory-swap" in command
+    assert command[command.index("--memory-swap") + 1] == "128m"
+    assert "--cpus" in command
+    assert "--ulimit" in command
+    assert "fsize=4096:4096" in command
+    assert any(part.startswith("type=bind,") and "dst=/workspace,rw" in part for part in command)
+    assert command[-3:] == ["simple-contester-judger:local", "python", "main.py"]
+
+
+def test_docker_env_translates_workspace_paths() -> None:
+    with tempfile.TemporaryDirectory(prefix="judger-docker-env-") as tmp:
+        workdir = Path(tmp)
+        env = docker_env_for_workdir(
+            {
+                "HOME": str(workdir),
+                "TMPDIR": str(workdir),
+                "GOCACHE": str(workdir / ".gocache"),
+                "PATH": "/usr/local/bin:/usr/bin:/bin",
+            },
+            workdir,
+            "/workspace",
+        )
+
+    assert env["HOME"] == "/tmp"
+    assert env["TMPDIR"] == "/tmp"
+    assert env["GOCACHE"] == "/workspace/.gocache"
+    assert env["PATH"] == "/usr/local/bin:/usr/bin:/bin"
+
+
+def docker_smoke_available() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    image = os.getenv("JUDGER_DOCKER_IMAGE", "simple-contester-judger:local")
+    return subprocess.run(
+        ["docker", "image", "inspect", image],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode == 0
+
+
+@pytest.mark.skipif(not docker_smoke_available(), reason="docker or sandbox image is not available")
+def test_docker_sandbox_denies_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JUDGER_SANDBOX_MODE", "docker")
+    result = run_python_source(
+        """
+import socket
+try:
+    socket.create_connection(("1.1.1.1", 80), timeout=1)
+except OSError:
+    print("denied")
+else:
+    print("connected")
+""",
+        Limits(time_limit_ms=2000, memory_limit_mb=128),
+    )
+
+    assert result.verdict == VERDICT_ACCEPTED
+    assert result.stdout.strip() == "denied"
+
+
+@pytest.mark.skipif(not docker_smoke_available(), reason="docker or sandbox image is not available")
+def test_docker_sandbox_uses_fresh_workspace(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JUDGER_SANDBOX_MODE", "docker")
+    test_each_run_gets_fresh_workdir()
+
+
+@pytest.mark.skipif(not docker_smoke_available(), reason="docker or sandbox image is not available")
+def test_docker_sandbox_reports_huge_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JUDGER_SANDBOX_MODE", "docker")
+    test_huge_output_is_bounded_and_reported(monkeypatch)

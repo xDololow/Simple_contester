@@ -129,6 +129,153 @@ def test_participant_with_private_contest_access_can_submit(
     assert created.json()["contest_id"] == contest["id"]
 
 
+def test_participant_creates_clarification_for_available_contest(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant: dict,
+    participant_headers: dict[str, str],
+) -> None:
+    contest = create_running_contest(client, admin_headers, "Clarify", is_public=True)
+    task = create_contest_task(client, admin_headers, contest["id"])
+
+    created = client.post(
+        f"/api/contests/{contest['id']}/clarifications",
+        headers=participant_headers,
+        json={"task_id": task["id"], "question": "Is input sorted?"},
+    )
+
+    assert created.status_code == 200, created.text
+    payload = created.json()
+    assert payload["contest_id"] == contest["id"]
+    assert payload["task_id"] == task["id"]
+    assert payload["author_user_id"] == participant["id"]
+    assert payload["question"] == "Is input sorted?"
+    assert payload["status"] == "open"
+    assert payload["visibility"] == "private"
+
+
+def test_participant_cannot_create_clarification_for_unavailable_contest(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant_headers: dict[str, str],
+) -> None:
+    contest = create_running_contest(client, admin_headers, "Hidden Clarify")
+
+    created = client.post(
+        f"/api/contests/{contest['id']}/clarifications",
+        headers=participant_headers,
+        json={"question": "Can I ask?"},
+    )
+
+    assert created.status_code == 403
+    assert created.json()["detail"] == "Contest is not available"
+
+
+def test_participant_cannot_see_another_private_clarification(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    create_user: Callable[..., dict[str, Any]],
+    auth_headers: Callable[[str, str], dict[str, str]],
+) -> None:
+    alice = create_user(username="clar_alice", password="clar-pass")
+    bob = create_user(username="clar_bob", password="clar-pass")
+    alice_headers = auth_headers(alice["username"], "clar-pass")
+    bob_headers = auth_headers(bob["username"], "clar-pass")
+    contest = create_running_contest(client, admin_headers, "Private Clarifications")
+    assigned = client.put(
+        f"/api/contests/{contest['id']}/participants",
+        headers=admin_headers,
+        json={"user_ids": [alice["id"], bob["id"]]},
+    )
+    assert assigned.status_code == 200, assigned.text
+
+    created = client.post(
+        f"/api/contests/{contest['id']}/clarifications",
+        headers=alice_headers,
+        json={"question": "Only mine?"},
+    )
+    assert created.status_code == 200, created.text
+
+    alice_list = client.get(f"/api/contests/{contest['id']}/clarifications", headers=alice_headers)
+    bob_list = client.get(f"/api/contests/{contest['id']}/clarifications", headers=bob_headers)
+
+    assert [item["id"] for item in alice_list.json()] == [created.json()["id"]]
+    assert bob_list.status_code == 200, bob_list.text
+    assert bob_list.json() == []
+
+
+def test_broadcast_clarification_visible_to_all_contest_participants(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    create_user: Callable[..., dict[str, Any]],
+    auth_headers: Callable[[str, str], dict[str, str]],
+) -> None:
+    alice = create_user(username="broadcast_alice", password="clar-pass")
+    bob = create_user(username="broadcast_bob", password="clar-pass")
+    alice_headers = auth_headers(alice["username"], "clar-pass")
+    bob_headers = auth_headers(bob["username"], "clar-pass")
+    contest = create_running_contest(client, admin_headers, "Broadcast Clarifications")
+    assigned = client.put(
+        f"/api/contests/{contest['id']}/participants",
+        headers=admin_headers,
+        json={"user_ids": [alice["id"], bob["id"]]},
+    )
+    assert assigned.status_code == 200, assigned.text
+    created = client.post(
+        f"/api/contests/{contest['id']}/clarifications",
+        headers=alice_headers,
+        json={"question": "For everyone?"},
+    )
+    assert created.status_code == 200, created.text
+
+    answered = client.patch(
+        f"/api/admin/clarifications/{created.json()['id']}",
+        headers=admin_headers,
+        json={"answer": "Yes.", "visibility": "broadcast"},
+    )
+    assert answered.status_code == 200, answered.text
+    assert answered.json()["status"] == "answered"
+    assert answered.json()["visibility"] == "broadcast"
+
+    bob_list = client.get(f"/api/contests/{contest['id']}/clarifications", headers=bob_headers)
+    assert bob_list.status_code == 200, bob_list.text
+    assert [item["id"] for item in bob_list.json()] == [created.json()["id"]]
+    assert bob_list.json()[0]["answer"] == "Yes."
+
+
+def test_admin_can_answer_and_close_clarification(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant_headers: dict[str, str],
+    demo_contest: dict,
+) -> None:
+    created = client.post(
+        f"/api/contests/{demo_contest['id']}/clarifications",
+        headers=participant_headers,
+        json={"question": "What happens on ties?"},
+    )
+    assert created.status_code == 200, created.text
+
+    answered = client.patch(
+        f"/api/admin/clarifications/{created.json()['id']}",
+        headers=admin_headers,
+        json={"answer": "Penalty decides ties."},
+    )
+    assert answered.status_code == 200, answered.text
+    assert answered.json()["answer"] == "Penalty decides ties."
+    assert answered.json()["status"] == "answered"
+    assert answered.json()["answered_by_user_id"] is not None
+    assert answered.json()["answered_at"] is not None
+
+    closed = client.patch(
+        f"/api/admin/clarifications/{created.json()['id']}",
+        headers=admin_headers,
+        json={"status": "closed"},
+    )
+    assert closed.status_code == 200, closed.text
+    assert closed.json()["status"] == "closed"
+
+
 def test_participant_without_private_contest_access_cannot_submit_or_scoreboard(
     client: APIClient,
     admin_headers: dict[str, str],

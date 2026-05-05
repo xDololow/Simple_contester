@@ -2,6 +2,8 @@ export type Role = "admin" | "participant";
 export type ContestStatus = "draft" | "scheduled" | "running" | "finished" | "archived";
 export type TimeMode = "fixed" | "individual";
 export type ParticipationMode = "individual" | "team";
+export type ClarificationStatus = "open" | "answered" | "closed";
+export type ClarificationVisibility = "private" | "broadcast";
 export type Language =
   | "python"
   | "java"
@@ -118,6 +120,24 @@ export type ScoreboardRow = {
 export type ContestLiveEvent = {
   submissions: Submission[];
   scoreboard: ScoreboardRow[];
+};
+
+export type Clarification = {
+  id: number;
+  contest_id: number;
+  task_id: number | null;
+  task_title: string | null;
+  author_user_id: number;
+  author_username: string;
+  author_display_name: string;
+  question: string;
+  answer: string | null;
+  status: ClarificationStatus;
+  visibility: ClarificationVisibility;
+  answered_by_user_id: number | null;
+  answered_by_username: string | null;
+  created_at: string;
+  answered_at: string | null;
 };
 
 export type ImportReport = {

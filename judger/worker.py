@@ -33,6 +33,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./simple_contester.db")
 JUDGER_ID = os.getenv("JUDGER_ID", "local-judger")
 JUDGER_VERSION = os.getenv("JUDGER_VERSION", os.getenv("APP_VERSION", "unknown"))
 JUDGER_SANDBOX_MODE = os.getenv("JUDGER_SANDBOX_MODE", "subprocess")
+JUDGER_WORK_ROOT = os.getenv("JUDGER_WORK_ROOT")
 POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "1"))
 HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("JUDGER_HEARTBEAT_INTERVAL_SECONDS", "5"))
 SUBMISSION_LEASE_SECONDS = int(os.getenv("SUBMISSION_LEASE_SECONDS", "60"))
@@ -57,11 +58,23 @@ def supported_languages() -> list[str]:
 
 def judger_capabilities() -> dict[str, object]:
     return {
+        "sandbox_mode": JUDGER_SANDBOX_MODE,
         "stop_on_first_failed_test": STOP_ON_FIRST_FAILED_TEST,
         "output_limit_bytes": int(os.getenv("OUTPUT_LIMIT_BYTES", str(1024 * 1024))),
         "process_limit": int(os.getenv("PROCESS_LIMIT", "256")),
         "file_size_limit_bytes": int(os.getenv("FILE_SIZE_LIMIT_BYTES", str(16 * 1024 * 1024))),
+        "docker_image": os.getenv("JUDGER_DOCKER_IMAGE", "simple-contester-judger:local")
+        if JUDGER_SANDBOX_MODE == "docker"
+        else None,
     }
+
+
+def submission_work_root() -> str | None:
+    if not JUDGER_WORK_ROOT:
+        return None
+    root = Path(JUDGER_WORK_ROOT)
+    root.mkdir(parents=True, exist_ok=True)
+    return str(root)
 
 
 def register_or_update_judger(
@@ -446,7 +459,7 @@ def judge(submission: dict) -> None:
         write_judger_event("failed_submission", submission["id"], "Task has no tests", event_payload)
         return
 
-    with tempfile.TemporaryDirectory(prefix="simple-contester-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="simple-contester-", dir=submission_work_root()) as tmp:
         workdir = Path(tmp)
         limits = Limits(
             time_limit_ms=submission["time_limit_ms"],

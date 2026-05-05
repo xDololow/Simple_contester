@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
+import type { FormEvent } from "react";
 import { API_BASE } from "../../api/client";
 import { FlashMessage, Header, SubmissionDetailView } from "../../components/shared";
 import { useI18n } from "../../i18n";
-import type { ApiClient, Contest, ContestLiveEvent, Flash, Language, ScoreboardRow, Submission, SubmissionDetail, Task, User } from "../../types";
+import type { ApiClient, Clarification, Contest, ContestLiveEvent, Flash, Language, ScoreboardRow, Submission, SubmissionDetail, Task, User } from "../../types";
 import { emptyFlash, errorText, formatDate, formatScore, verdictClass } from "../../utils/format";
 
-type ContestTab = "overview" | "tasks" | "submissions" | "scoreboard";
+type ContestTab = "overview" | "tasks" | "submissions" | "scoreboard" | "clarifications";
 
 const SUBMISSION_LANGUAGES: Array<{ value: Language; label: string }> = [
   { value: "python", label: "Python" },
@@ -27,6 +28,7 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
   const [tasks, setTasks] = useState<Task[]>([]);
   const [submissions, setSubmissions] = useState<Submission[]>([]);
   const [scoreboard, setScoreboard] = useState<ScoreboardRow[]>([]);
+  const [clarifications, setClarifications] = useState<Clarification[]>([]);
   const [tab, setTab] = useState<ContestTab>("tasks");
   const [selectedTaskId, setSelectedTaskId] = useState<number | null>(null);
   const [selectedSubmissionId, setSelectedSubmissionId] = useState<number | null>(null);
@@ -35,13 +37,15 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) || tasks[0] || null;
 
   const refresh = useCallback(async () => {
-    const [nextTasks, live] = await Promise.all([
+    const [nextTasks, live, nextClarifications] = await Promise.all([
       api<Task[]>(`/api/contests/${contest.id}/tasks`),
-      api<ContestLiveEvent>(`/api/contests/${contest.id}/live-snapshot`)
+      api<ContestLiveEvent>(`/api/contests/${contest.id}/live-snapshot`),
+      api<Clarification[]>(`/api/contests/${contest.id}/clarifications`)
     ]);
     setTasks(nextTasks);
     setSubmissions(live.submissions);
     setScoreboard(live.scoreboard);
+    setClarifications(nextClarifications);
     setSelectedTaskId((current) => current ?? nextTasks[0]?.id ?? null);
   }, [api, contest.id]);
 
@@ -116,7 +120,8 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
           ["overview", t("tab.overview")],
           ["tasks", t("tab.tasks")],
           ["submissions", t("tab.submissions")],
-          ["scoreboard", t("title.scoreboard")]
+          ["scoreboard", t("title.scoreboard")],
+          ["clarifications", t("tab.clarifications")]
         ].map(([id, label]) => (
           <button key={id} className={tab === id ? "active" : ""} onClick={() => setTab(id as ContestTab)} type="button">
             {label}
@@ -131,6 +136,7 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
             <div className="stat"><strong>{tasks.length}</strong><span>{t("tab.tasks")}</span></div>
             <div className="stat"><strong>{submissions.length}</strong><span>{t("tab.submissions")}</span></div>
             <div className="stat"><strong>{scoreboard.length}</strong><span>{t("title.scoreboard")}</span></div>
+            <div className="stat"><strong>{clarifications.length}</strong><span>{t("tab.clarifications")}</span></div>
           </div>
         </section>
       )}
@@ -212,6 +218,16 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
           )}
         </section>
       )}
+
+      {tab === "clarifications" && (
+        <ClarificationsBox
+          api={api}
+          contestId={contest.id}
+          tasks={tasks}
+          clarifications={clarifications}
+          onRefresh={async () => setClarifications(await api<Clarification[]>(`/api/contests/${contest.id}/clarifications`))}
+        />
+      )}
     </div>
   );
 }
@@ -259,5 +275,88 @@ function SubmitBox({ api, contestId, task, onSubmitted }: { api: ApiClient; cont
       <button onClick={submit}>{t("submission.submit")}</button>
       {message && <span className="muted">{message}</span>}
     </div>
+  );
+}
+
+function ClarificationsBox({
+  api,
+  contestId,
+  tasks,
+  clarifications,
+  onRefresh
+}: {
+  api: ApiClient;
+  contestId: number;
+  tasks: Task[];
+  clarifications: Clarification[];
+  onRefresh: () => Promise<void>;
+}) {
+  const { t } = useI18n();
+  const [taskId, setTaskId] = useState("");
+  const [question, setQuestion] = useState("");
+  const [message, setMessage] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  async function ask(event: FormEvent) {
+    event.preventDefault();
+    setMessage("");
+    setLoading(true);
+    try {
+      await api<Clarification>(`/api/contests/${contestId}/clarifications`, {
+        method: "POST",
+        body: JSON.stringify({ task_id: taskId ? Number(taskId) : null, question })
+      });
+      setQuestion("");
+      setTaskId("");
+      await onRefresh();
+      setMessage(t("clarification.created"));
+    } catch (error) {
+      setMessage(errorText(error));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <section className="panel">
+      <Header title={t("tab.clarifications")} subtitle={t("clarification.subtitle")} />
+      <form className="clarification-form" onSubmit={ask}>
+        <label>{t("table.task")}<select value={taskId} onChange={(event) => setTaskId(event.target.value)}>
+          <option value="">{t("clarification.general")}</option>
+          {tasks.map((task) => <option key={task.id} value={task.id}>{task.title}</option>)}
+        </select></label>
+        <label className="span-2">{t("clarification.question")}<textarea className="short" value={question} onChange={(event) => setQuestion(event.target.value)} required /></label>
+        <div className="toolbar">
+          <button type="submit" disabled={loading}>{loading ? t("status.refreshing") : t("clarification.ask")}</button>
+          <button type="button" onClick={() => onRefresh().catch((error) => setMessage(errorText(error)))}>{t("common.refresh")}</button>
+          {message && <span className="muted">{message}</span>}
+        </div>
+      </form>
+      {clarifications.length ? (
+        <div className="clarification-list">
+          {clarifications.map((item) => <ClarificationCard key={item.id} item={item} />)}
+        </div>
+      ) : (
+        <EmptyState title={t("empty.clarificationsTitle")} text={t("empty.clarificationsText")} />
+      )}
+    </section>
+  );
+}
+
+function ClarificationCard({ item }: { item: Clarification }) {
+  const { t } = useI18n();
+  return (
+    <article className="clarification-card">
+      <div className="clarification-head">
+        <strong>{item.task_title || t("clarification.general")}</strong>
+        <span className="meta-row">
+          <span className="pill">{t(`clarification.status.${item.status}`)}</span>
+          <span className="pill">{t(`clarification.visibility.${item.visibility}`)}</span>
+          <span>{formatDate(item.created_at)}</span>
+        </span>
+      </div>
+      <p>{item.question}</p>
+      {item.answer ? <div className="answer"><strong>{t("clarification.answer")}</strong><p>{item.answer}</p></div> : <span className="muted">{t("clarification.noAnswer")}</span>}
+    </article>
   );
 }

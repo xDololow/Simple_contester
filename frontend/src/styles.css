@@ -663,7 +663,7 @@ p {
 
 .overview-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(120px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
   gap: 10px;
 }
 
@@ -699,6 +699,72 @@ p {
 .limits {
   color: #64737e;
   font-size: 13px;
+}
+
+.clarification-form {
+  display: grid;
+  grid-template-columns: minmax(180px, 260px) minmax(0, 1fr);
+  gap: 10px;
+  align-items: end;
+  margin-bottom: 12px;
+}
+
+.clarification-form .toolbar {
+  grid-column: 1 / -1;
+  margin-bottom: 0;
+}
+
+.clarification-list {
+  display: grid;
+  gap: 10px;
+}
+
+.clarification-card {
+  border: 1px solid #d7e0e5;
+  border-radius: 8px;
+  padding: 12px;
+  background: #fbfcfd;
+  display: grid;
+  gap: 8px;
+}
+
+.clarification-card p {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.clarification-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+  color: #64737e;
+  font-size: 12px;
+}
+
+.answer {
+  border-left: 3px solid #2f6f9c;
+  padding-left: 10px;
+  display: grid;
+  gap: 4px;
+}
+
+.admin-clarification-card {
+  background: #ffffff;
+}
+
+.admin-answer-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(160px, 220px);
+  gap: 10px;
+  align-items: end;
 }
 
 textarea {
@@ -848,6 +914,8 @@ pre,
   .form-grid,
   .form-grid.wide,
   .access-grid,
+  .admin-answer-grid,
+  .clarification-form,
   .contest-grid,
   .contest-workspace,
   .status-grid,

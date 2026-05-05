@@ -19,6 +19,7 @@ def test_alembic_upgrade_creates_current_schema(tmp_path, monkeypatch) -> None:
         contest_columns = {column["name"]: column for column in inspector.get_columns("contests")}
         participant_columns = {column["name"]: column for column in inspector.get_columns("participant_contests")}
         submission_columns = {column["name"]: column for column in inspector.get_columns("submissions")}
+        clarification_columns = {column["name"]: column for column in inspector.get_columns("clarifications")}
     finally:
         engine.dispose()
 
@@ -37,6 +38,7 @@ def test_alembic_upgrade_creates_current_schema(tmp_path, monkeypatch) -> None:
         "test_results",
         "judgers",
         "judger_events",
+        "clarifications",
     }.issubset(tables)
     assert "is_public" in contest_columns
     assert participant_columns["started_at"]["nullable"] is True
@@ -45,3 +47,6 @@ def test_alembic_upgrade_creates_current_schema(tmp_path, monkeypatch) -> None:
     assert "claim_expires_at" in submission_columns
     assert "claim_token" in submission_columns
     assert "attempt_number" in submission_columns
+    assert "question" in clarification_columns
+    assert "answer" in clarification_columns
+    assert "answered_at" in clarification_columns

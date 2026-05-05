@@ -20,6 +20,9 @@ from .config import settings
 from .database import SessionLocal, engine, get_db
 from .models import (
     Contest,
+    Clarification,
+    ClarificationStatus,
+    ClarificationVisibility,
     ContestParticipationMode,
     ContestStatus,
     ContestTeam,
@@ -47,6 +50,9 @@ from .schemas import (
     AdminSubmissionsStats,
     AdminSystemStats,
     AdminUsersStats,
+    ClarificationAdminUpdate,
+    ClarificationCreate,
+    ClarificationOut,
     ContestCreate,
     ContestParticipantsUpdate,
     ContestOut,
@@ -191,6 +197,44 @@ def ensure_contest_access_columns() -> None:
         conn.execute(text("ALTER TABLE participant_contests MODIFY deadline_at DATETIME NULL"))
 
 
+def ensure_clarifications_table() -> None:
+    if engine.dialect.name not in {"mysql", "mariadb"}:
+        return
+    with engine.begin() as conn:
+        table_exists = conn.execute(text("SHOW TABLES LIKE 'clarifications'")).first() is not None
+        if table_exists:
+            return
+        conn.execute(
+            text(
+                """
+                CREATE TABLE clarifications (
+                    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    contest_id INT NOT NULL,
+                    task_id INT NULL,
+                    author_user_id INT NOT NULL,
+                    question TEXT NOT NULL,
+                    answer TEXT NULL,
+                    status ENUM('open', 'answered', 'closed') NOT NULL DEFAULT 'open',
+                    visibility ENUM('private', 'broadcast') NOT NULL DEFAULT 'private',
+                    answered_by_user_id INT NULL,
+                    created_at DATETIME NOT NULL,
+                    answered_at DATETIME NULL,
+                    INDEX ix_clarifications_contest_id (contest_id),
+                    INDEX ix_clarifications_task_id (task_id),
+                    INDEX ix_clarifications_author_user_id (author_user_id),
+                    INDEX ix_clarifications_status (status),
+                    INDEX ix_clarifications_visibility (visibility),
+                    INDEX ix_clarifications_created_at (created_at),
+                    CONSTRAINT fk_clarifications_contest_id FOREIGN KEY (contest_id) REFERENCES contests(id) ON DELETE CASCADE,
+                    CONSTRAINT fk_clarifications_task_id FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE SET NULL,
+                    CONSTRAINT fk_clarifications_author_user_id FOREIGN KEY (author_user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    CONSTRAINT fk_clarifications_answered_by_user_id FOREIGN KEY (answered_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+                )
+                """
+            )
+        )
+
+
 def ensure_legacy_task_links(db: Session) -> None:
     legacy_tasks = db.scalars(select(Task).where(Task.contest_id.is_not(None))).all()
     changed = False
@@ -214,6 +258,7 @@ def startup() -> None:
     ensure_float_score_columns()
     ensure_partial_scoring_column()
     ensure_contest_access_columns()
+    ensure_clarifications_table()
     with SessionLocal() as db:
         ensure_admin(db)
         ensure_legacy_task_links(db)
@@ -891,6 +936,42 @@ def task_belongs_to_contest(db: Session, contest_id: int, task_id: int) -> bool:
     return db.scalar(select(ContestTask.id).where(ContestTask.contest_id == contest_id, ContestTask.task_id == task_id)) is not None
 
 
+def to_clarification_out(db: Session, clarification: Clarification) -> ClarificationOut:
+    author = get_user_or_404(db, clarification.author_user_id)
+    answered_by = db.get(User, clarification.answered_by_user_id) if clarification.answered_by_user_id else None
+    task_title = db.scalar(select(Task.title).where(Task.id == clarification.task_id)) if clarification.task_id else None
+    return ClarificationOut(
+        id=clarification.id,
+        contest_id=clarification.contest_id,
+        task_id=clarification.task_id,
+        task_title=task_title,
+        author_user_id=clarification.author_user_id,
+        author_username=author.username,
+        author_display_name=author.display_name,
+        question=clarification.question,
+        answer=clarification.answer,
+        status=clarification.status,
+        visibility=clarification.visibility,
+        answered_by_user_id=clarification.answered_by_user_id,
+        answered_by_username=answered_by.username if answered_by else None,
+        created_at=clarification.created_at,
+        answered_at=clarification.answered_at,
+    )
+
+
+def list_clarifications_for_contest(db: Session, contest: Contest, user: User) -> list[Clarification]:
+    stmt = select(Clarification).where(Clarification.contest_id == contest.id)
+    if user.role != UserRole.admin:
+        stmt = stmt.where(
+            or_(
+                Clarification.author_user_id == user.id,
+                Clarification.visibility == ClarificationVisibility.broadcast,
+            )
+        )
+    stmt = stmt.order_by(Clarification.created_at.desc(), Clarification.id.desc())
+    return list(db.scalars(stmt))
+
+
 def list_contest_tasks(db: Session, contest_id: int) -> list[TaskOut]:
     tasks = db.scalars(
         select(Task)
@@ -1450,6 +1531,94 @@ def set_contest_teams(
 ) -> list[TeamOut]:
     contest = get_contest_or_404(db, contest_id)
     return replace_contest_teams(db, contest, data.team_ids)
+
+
+@app.get("/api/contests/{contest_id}/clarifications", response_model=list[ClarificationOut])
+def list_contest_clarifications(
+    contest_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[ClarificationOut]:
+    contest = get_contest_or_404(db, contest_id)
+    assert_contest_access(db, contest, user)
+    clarifications = list_clarifications_for_contest(db, contest, user)
+    return [to_clarification_out(db, clarification) for clarification in clarifications]
+
+
+@app.post("/api/contests/{contest_id}/clarifications", response_model=ClarificationOut)
+def create_contest_clarification(
+    contest_id: int,
+    data: ClarificationCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ClarificationOut:
+    contest = get_contest_or_404(db, contest_id)
+    assert_contest_access(db, contest, user)
+    if data.task_id is not None and not task_belongs_to_contest(db, contest_id, data.task_id):
+        raise HTTPException(status_code=404, detail="Contest task not found")
+    question = data.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question is required")
+    clarification = Clarification(
+        contest_id=contest_id,
+        task_id=data.task_id,
+        author_user_id=user.id,
+        question=question,
+        status=ClarificationStatus.open,
+        visibility=ClarificationVisibility.private,
+    )
+    db.add(clarification)
+    db.commit()
+    db.refresh(clarification)
+    return to_clarification_out(db, clarification)
+
+
+@app.get("/api/admin/clarifications", response_model=list[ClarificationOut])
+def list_admin_clarifications(
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+    status_filter: ClarificationStatus | None = Query(default=None, alias="status"),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> list[ClarificationOut]:
+    stmt = select(Clarification).order_by(Clarification.created_at.desc(), Clarification.id.desc()).limit(limit)
+    if status_filter is not None:
+        stmt = stmt.where(Clarification.status == status_filter)
+    clarifications = db.scalars(stmt).all()
+    return [to_clarification_out(db, clarification) for clarification in clarifications]
+
+
+@app.patch("/api/admin/clarifications/{clarification_id}", response_model=ClarificationOut)
+def update_admin_clarification(
+    clarification_id: int,
+    data: ClarificationAdminUpdate,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> ClarificationOut:
+    clarification = db.get(Clarification, clarification_id)
+    if clarification is None:
+        raise HTTPException(status_code=404, detail="Clarification not found")
+    updates = data.model_dump(exclude_unset=True)
+    if "visibility" in updates and updates["visibility"] is not None:
+        clarification.visibility = updates["visibility"]
+    if "answer" in updates and updates["answer"] is not None:
+        answer = updates["answer"].strip()
+        if not answer:
+            raise HTTPException(status_code=400, detail="Answer cannot be empty")
+        clarification.answer = answer
+        clarification.answered_by_user_id = admin.id
+        clarification.answered_at = now_utc()
+        if "status" not in updates or updates["status"] is None:
+            clarification.status = ClarificationStatus.answered
+    if "status" in updates and updates["status"] is not None:
+        if updates["status"] == ClarificationStatus.answered and not clarification.answer:
+            raise HTTPException(status_code=400, detail="Answer is required for answered status")
+        clarification.status = updates["status"]
+        if updates["status"] == ClarificationStatus.answered:
+            clarification.answered_by_user_id = clarification.answered_by_user_id or admin.id
+            clarification.answered_at = clarification.answered_at or now_utc()
+    db.commit()
+    db.refresh(clarification)
+    return to_clarification_out(db, clarification)
 
 
 @app.get("/api/contests/{contest_id}/tasks", response_model=list[TaskOut])

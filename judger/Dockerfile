@@ -15,6 +15,7 @@ RUN apt-get update \
         mono-devel \
         nodejs \
         npm \
+        docker-cli \
     && npm install -g typescript \
     && rm -rf /var/lib/apt/lists/*
 
