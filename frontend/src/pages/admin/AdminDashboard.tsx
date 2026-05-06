@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useState } from "react";
 import { API_BASE } from "../../api/client";
 import { FlashMessage, Header, SubmissionDetailView } from "../../components/shared";
 import { useI18n } from "../../i18n";
-import type { AdminStats, ApiClient, Clarification, ClarificationStatus, ClarificationVisibility, Contest, ContestStatus, Flash, ImportReport, JudgerEvent, JudgerWorker, PackageImportReport, ParticipationMode, Role, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
+import type { AdminStats, ApiClient, Clarification, ClarificationStatus, ClarificationVisibility, Contest, ContestRegistration, ContestStatus, Flash, ImportReport, JudgerEvent, JudgerWorker, PackageImportReport, ParticipationMode, Role, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
 import { emptyFlash, errorText, formatDate, formatScore, fromLocalInputValue, toLocalInputValue, verdictClass } from "../../utils/format";
 
 export function AdminDashboard({ api, token, reloadContests }: { api: ApiClient; token: string; reloadContests: () => void }) {
@@ -737,6 +737,8 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
   const [contestTaskIds, setContestTaskIds] = useState<Record<number, number[]>>({});
   const [contestParticipantIds, setContestParticipantIds] = useState<Record<number, number[]>>({});
   const [contestTeamIds, setContestTeamIds] = useState<Record<number, number[]>>({});
+  const [registrations, setRegistrations] = useState<ContestRegistration[]>([]);
+  const [registrationFilter, setRegistrationFilter] = useState<"pending" | "all">("pending");
   const [flash, setFlash] = useState<Flash>(emptyFlash);
   const now = new Date();
   const later = new Date(Date.now() + 3 * 60 * 60_000);
@@ -745,6 +747,8 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
     description: "",
     status: "draft" as ContestStatus,
     is_public: false,
+    registration_enabled: false,
+    registration_requires_approval: true,
     time_mode: "fixed" as TimeMode,
     participation_mode: "individual" as ParticipationMode,
     starts_at: toLocalInputValue(now.toISOString()),
@@ -758,7 +762,7 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
   });
 
   const load = useCallback(async () => {
-    const [nextContests, nextTasks, nextUsers, nextTeams] = await Promise.all([api<Contest[]>("/api/contests"), api<Task[]>("/api/tasks"), api<User[]>("/api/users"), api<Team[]>("/api/teams")]);
+    const [nextContests, nextTasks, nextUsers, nextTeams, nextRegistrations] = await Promise.all([api<Contest[]>("/api/contests"), api<Task[]>("/api/tasks"), api<User[]>("/api/users"), api<Team[]>("/api/teams"), api<ContestRegistration[]>(`/api/admin/contest-registrations?status=${registrationFilter}`)]);
     const nextContestTaskEntries = await Promise.all(
       nextContests.map(async (contest) => {
         const contestTasks = await api<Task[]>(`/api/contests/${contest.id}/tasks`);
@@ -784,7 +788,8 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
     setContestTaskIds(Object.fromEntries(nextContestTaskEntries));
     setContestParticipantIds(Object.fromEntries(nextContestParticipantEntries));
     setContestTeamIds(Object.fromEntries(nextContestTeamEntries));
-  }, [api]);
+    setRegistrations(nextRegistrations);
+  }, [api, registrationFilter]);
   useEffect(() => { load().catch((error) => setFlash({ kind: "error", text: errorText(error) })); }, [load]);
 
   async function createContest(event: React.FormEvent) {
@@ -880,6 +885,17 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
     }
   }
 
+  async function decideRegistration(registration: ContestRegistration, decision: "approved" | "rejected") {
+    setFlash(emptyFlash);
+    try {
+      await api<ContestRegistration>(`/api/admin/contest-registrations/${registration.id}?decision=${decision}`, { method: "PATCH" });
+      await load();
+      onChanged();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    }
+  }
+
   function toggleFormTask(taskId: number) {
     setForm((current) => ({
       ...current,
@@ -920,6 +936,8 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
         <fieldset>
           <legend>{t("contest.sectionAccess")}</legend>
           <label className="inline"><input className="check" type="checkbox" checked={form.is_public} onChange={(event) => setForm({ ...form, is_public: event.target.checked })} /> {t("contest.publicAccess")}</label>
+          <label className="inline"><input className="check" type="checkbox" checked={form.registration_enabled} onChange={(event) => setForm({ ...form, registration_enabled: event.target.checked })} /> {t("registration.enabled")}</label>
+          <label className="inline"><input className="check" type="checkbox" checked={form.registration_requires_approval} onChange={(event) => setForm({ ...form, registration_requires_approval: event.target.checked })} /> {t("registration.requiresApproval")}</label>
           <div className="access-grid">
             <SearchPicker label={t("contest.allowedParticipants")} items={userPickerItems(users)} selectedIds={form.participant_ids} onChange={(participant_ids) => setForm({ ...form, participant_ids })} placeholder={t("contest.searchParticipants")} emptyText={t("common.none")} />
             <SearchPicker label={t("contest.allowedTeams")} items={teamPickerItems(teams)} selectedIds={form.team_ids} onChange={(team_ids) => setForm({ ...form, team_ids })} placeholder={t("contest.searchTeams")} emptyText={t("common.none")} />
@@ -928,6 +946,7 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
         <button type="submit">{t("common.create")}</button>
       </form>
       <FlashMessage flash={flash} />
+      <PendingRegistrations registrations={registrations} filter={registrationFilter} onFilterChange={setRegistrationFilter} onDecide={decideRegistration} />
       <div className="table-wrap">
         <table>
           <thead><tr><th>{t("table.id")}</th><th>{t("table.title")}</th><th>{t("table.status")}</th><th>{t("table.access")}</th><th>{t("contest.participationMode")}</th><th>{t("table.mode")}</th><th>{t("table.starts")}</th><th>{t("table.ends")}</th><th>{t("table.minutes")}</th><th>{t("scoreboard.freezeAt")}</th><th>{t("scoreboard.unfrozenShort")}</th><th>{t("table.tasks")}</th><th>{t("table.participants")}</th><th>{t("table.teams")}</th><th></th></tr></thead>
@@ -935,6 +954,57 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
         </table>
       </div>
     </section>
+  );
+}
+
+function PendingRegistrations({
+  registrations,
+  filter,
+  onFilterChange,
+  onDecide
+}: {
+  registrations: ContestRegistration[];
+  filter: "pending" | "all";
+  onFilterChange: (filter: "pending" | "all") => void;
+  onDecide: (registration: ContestRegistration, decision: "approved" | "rejected") => void;
+}) {
+  const { t } = useI18n();
+  return (
+    <div className="status-card status-card-wide">
+      <div className="toolbar">
+        <h3>{t("registration.pending")}</h3>
+        <select value={filter} onChange={(event) => onFilterChange(event.target.value as "pending" | "all")}>
+          <option value="pending">{t("registration.pendingOnly")}</option>
+          <option value="all">{t("registration.all")}</option>
+        </select>
+      </div>
+      <table>
+        <thead>
+          <tr><th>{t("table.contest")}</th><th>{t("table.user")}</th><th>{t("table.team")}</th><th>{t("table.status")}</th><th>{t("table.created")}</th><th></th></tr>
+        </thead>
+        <tbody>
+          {registrations.length ? registrations.map((registration) => (
+            <tr key={registration.id}>
+              <td>{registration.contest_title || registration.contest_id}</td>
+              <td>{registration.user_display_name || registration.username || t("common.none")}</td>
+              <td>{registration.team_name || t("common.none")}</td>
+              <td><span className={registration.status === "rejected" ? "pill warn" : "pill"}>{t(`registration.status.${registration.status}`)}</span></td>
+              <td>{formatDate(registration.requested_at)}</td>
+              <td className="row-actions">
+                {registration.status === "pending" ? (
+                  <>
+                    <button onClick={() => onDecide(registration, "approved")}>{t("registration.approve")}</button>
+                    <button className="danger" onClick={() => onDecide(registration, "rejected")}>{t("registration.reject")}</button>
+                  </>
+                ) : (
+                  <span className="muted">{registration.decided_at ? formatDate(registration.decided_at) : t("common.none")}</span>
+                )}
+              </td>
+            </tr>
+          )) : <tr><td colSpan={6} className="muted">{t("common.empty")}</td></tr>}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
@@ -973,6 +1043,8 @@ function ContestRow({
     title: contest.title,
     status: contest.status,
     is_public: contest.is_public,
+    registration_enabled: contest.registration_enabled,
+    registration_requires_approval: contest.registration_requires_approval,
     time_mode: contest.time_mode,
     participation_mode: contest.participation_mode,
     starts_at: toLocalInputValue(contest.starts_at),
@@ -989,6 +1061,8 @@ function ContestRow({
     title: contest.title,
     status: contest.status,
     is_public: contest.is_public,
+    registration_enabled: contest.registration_enabled,
+    registration_requires_approval: contest.registration_requires_approval,
     time_mode: contest.time_mode,
     participation_mode: contest.participation_mode,
     starts_at: toLocalInputValue(contest.starts_at),
@@ -1014,7 +1088,7 @@ function ContestRow({
     const teamNames = formatTeamIds(teamIds, teams);
     return (
       <tr>
-        <td>{contest.id}</td><td>{contest.title}</td><td>{t(`status.${contest.status}`)}</td><td>{contest.is_public ? t("contest.public") : t("contest.private")}</td><td>{t(`common.${contest.participation_mode}`)}</td><td>{t(`common.${contest.time_mode}`)}</td>
+        <td>{contest.id}</td><td>{contest.title}</td><td>{t(`status.${contest.status}`)}</td><td>{contest.is_public ? t("contest.public") : contest.registration_enabled ? t("registration.enabledShort") : t("contest.private")}</td><td>{t(`common.${contest.participation_mode}`)}</td><td>{t(`common.${contest.time_mode}`)}</td>
         <td>{formatDate(contest.starts_at)}</td><td>{formatDate(contest.ends_at)}</td><td>{contest.individual_duration_minutes ?? "-"}</td><td>{formatDate(contest.scoreboard_freeze_at)}</td><td>{contest.scoreboard_unfrozen ? t("common.yes") : t("common.no")}</td>
         <td>{taskIds.length}</td><td>{participantNames || t("common.none")}</td><td>{teamNames || t("common.none")}</td>
         <td className="row-actions"><button onClick={() => setEditing(true)}>{t("common.edit")}</button><button className="danger" onClick={() => onDelete(contest)}>{t("common.delete")}</button></td>
@@ -1028,7 +1102,11 @@ function ContestRow({
         <td>{contest.id}</td>
         <td><input value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} /></td>
         <td><select value={draft.status} onChange={(event) => setDraft({ ...draft, status: event.target.value as ContestStatus })}>{contestStatuses.map((item) => <option key={item} value={item}>{t(`status.${item}`)}</option>)}</select></td>
-        <td><label className="inline"><input className="check" type="checkbox" checked={draft.is_public} onChange={(event) => setDraft({ ...draft, is_public: event.target.checked })} /> {t("contest.public")}</label></td>
+        <td>
+          <label className="inline"><input className="check" type="checkbox" checked={draft.is_public} onChange={(event) => setDraft({ ...draft, is_public: event.target.checked })} /> {t("contest.public")}</label>
+          <label className="inline"><input className="check" type="checkbox" checked={draft.registration_enabled} onChange={(event) => setDraft({ ...draft, registration_enabled: event.target.checked })} /> {t("registration.enabledShort")}</label>
+          <label className="inline"><input className="check" type="checkbox" checked={draft.registration_requires_approval} onChange={(event) => setDraft({ ...draft, registration_requires_approval: event.target.checked })} /> {t("registration.approvalShort")}</label>
+        </td>
         <td><select value={draft.participation_mode} onChange={(event) => setDraft({ ...draft, participation_mode: event.target.value as ParticipationMode })}><option value="individual">{t("common.individual")}</option><option value="team">{t("common.team")}</option></select></td>
         <td><select value={draft.time_mode} onChange={(event) => setDraft({ ...draft, time_mode: event.target.value as TimeMode })}><option value="fixed">{t("common.fixed")}</option><option value="individual">{t("common.individual")}</option></select></td>
         <td><input type="datetime-local" value={draft.starts_at} onChange={(event) => setDraft({ ...draft, starts_at: event.target.value })} /></td>
@@ -1045,6 +1123,8 @@ function ContestRow({
               title: draft.title,
               status: draft.status,
               is_public: draft.is_public,
+              registration_enabled: draft.registration_enabled,
+              registration_requires_approval: draft.registration_requires_approval,
               participation_mode: draft.participation_mode,
               time_mode: draft.time_mode,
               starts_at: fromLocalInputValue(draft.starts_at),
@@ -1204,7 +1284,7 @@ function TasksAdmin({ api }: { api: ApiClient }) {
       <FlashMessage flash={flash} />
       <div className="table-wrap">
         <table>
-          <thead><tr><th>{t("table.id")}</th><th>{t("table.title")}</th><th>{t("table.limits")}</th><th>{t("table.points")}</th><th>{t("table.tests")}</th><th></th></tr></thead>
+          <thead><tr><th>{t("table.id")}</th><th>{t("table.title")}</th><th>{t("task.version")}</th><th>{t("table.limits")}</th><th>{t("table.points")}</th><th>{t("table.tests")}</th><th></th></tr></thead>
           <tbody>{tasks.map((task) => <TaskRow key={task.id} task={task} onSave={saveTask} onDelete={deleteTask} />)}</tbody>
         </table>
       </div>
@@ -1243,6 +1323,7 @@ function TaskRow({ task, onSave, onDelete }: { task: Task; onSave: (task: Task, 
       <tr className={editing ? "editing" : ""}>
         <td>{task.id}</td>
         <td>{editing ? <input value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} /> : task.title}</td>
+        <td>{task.current_version_number ? `v${task.current_version_number}` : "-"}</td>
         <td>{editing ? <><input type="number" value={draft.time_limit_ms} onChange={(event) => setDraft({ ...draft, time_limit_ms: event.target.value })} /><input type="number" value={draft.memory_limit_mb} onChange={(event) => setDraft({ ...draft, memory_limit_mb: event.target.value })} /></> : `${task.time_limit_ms} ms / ${task.memory_limit_mb} MB`}</td>
         <td>{editing ? <input type="number" step="0.01" value={draft.points} onChange={(event) => setDraft({ ...draft, points: event.target.value })} /> : formatScore(task.points)}</td>
         <td>{task.test_count}{task.partial_scoring ? ` · ${t("task.partialScoring")}` : ""}</td>
@@ -1276,7 +1357,7 @@ function TaskRow({ task, onSave, onDelete }: { task: Task; onSave: (task: Task, 
       {editing && (
         <tr className="editing">
           <td></td>
-          <td colSpan={5}>
+          <td colSpan={6}>
             <div className="nested-edit">
               <label>{t("task.statement")}<textarea value={draft.statement} onChange={(event) => setDraft({ ...draft, statement: event.target.value })} /></label>
               <label>{t("task.inputFormat")}<textarea className="short" value={draft.input_format} onChange={(event) => setDraft({ ...draft, input_format: event.target.value })} /></label>

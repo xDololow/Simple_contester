@@ -24,6 +24,8 @@ from .models import (
     ClarificationStatus,
     ClarificationVisibility,
     ContestParticipationMode,
+    ContestRegistration,
+    ContestRegistrationStatus,
     ContestStatus,
     ContestTeam,
     ContestTask,
@@ -36,6 +38,7 @@ from .models import (
     SubmissionVerdict,
     Task,
     TaskTest,
+    TaskVersion,
     Team,
     TeamMember,
     User,
@@ -55,6 +58,8 @@ from .schemas import (
     ClarificationOut,
     ContestCreate,
     ContestParticipantsUpdate,
+    ContestRegistrationDetailOut,
+    ContestRegistrationOut,
     ContestOut,
     ContestTeamsUpdate,
     ContestTasksUpdate,
@@ -76,6 +81,7 @@ from .schemas import (
     TaskTestPublicOut,
     TaskTestUpdate,
     TaskUpdate,
+    TaskVersionOut,
     TestArchiveImportReport,
     TestResultOut,
     TeamCreate,
@@ -203,6 +209,46 @@ def ensure_task_test_scoring_columns() -> None:
             conn.execute(text("ALTER TABLE task_tests ADD COLUMN group_name VARCHAR(120) NULL"))
 
 
+def ensure_task_versioning_schema() -> None:
+    if engine.dialect.name not in {"mysql", "mariadb"}:
+        return
+    with engine.begin() as conn:
+        table_exists = conn.execute(text("SHOW TABLES LIKE 'task_versions'")).first() is not None
+        if not table_exists:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE task_versions (
+                        id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                        task_id INT NOT NULL,
+                        version_number INT NOT NULL,
+                        title VARCHAR(200) NOT NULL,
+                        statement TEXT NOT NULL,
+                        input_format TEXT NOT NULL,
+                        output_format TEXT NOT NULL,
+                        samples TEXT NOT NULL,
+                        time_limit_ms INT NOT NULL,
+                        memory_limit_mb INT NOT NULL,
+                        points DOUBLE NOT NULL DEFAULT 100,
+                        partial_scoring BOOL NOT NULL DEFAULT 0,
+                        tests_snapshot TEXT NOT NULL,
+                        created_at DATETIME NOT NULL,
+                        created_by_user_id INT NULL,
+                        UNIQUE KEY uq_task_version_number (task_id, version_number),
+                        INDEX ix_task_versions_task_id (task_id),
+                        INDEX ix_task_versions_created_at (created_at),
+                        CONSTRAINT fk_task_versions_task_id FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+                        CONSTRAINT fk_task_versions_created_by_user_id FOREIGN KEY (created_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+                    )
+                    """
+                )
+            )
+        column = conn.execute(text("SHOW COLUMNS FROM submissions LIKE 'task_version_id'")).mappings().first()
+        if column is None:
+            conn.execute(text("ALTER TABLE submissions ADD COLUMN task_version_id INT NULL"))
+            conn.execute(text("CREATE INDEX ix_submissions_task_version_id ON submissions (task_version_id)"))
+
+
 def ensure_contest_access_columns() -> None:
     if engine.dialect.name not in {"mysql", "mariadb"}:
         return
@@ -210,6 +256,12 @@ def ensure_contest_access_columns() -> None:
         column = conn.execute(text("SHOW COLUMNS FROM contests LIKE 'is_public'")).mappings().first()
         if column is None:
             conn.execute(text("ALTER TABLE contests ADD COLUMN is_public BOOL NOT NULL DEFAULT 0"))
+        column = conn.execute(text("SHOW COLUMNS FROM contests LIKE 'registration_enabled'")).mappings().first()
+        if column is None:
+            conn.execute(text("ALTER TABLE contests ADD COLUMN registration_enabled BOOL NOT NULL DEFAULT 0"))
+        column = conn.execute(text("SHOW COLUMNS FROM contests LIKE 'registration_requires_approval'")).mappings().first()
+        if column is None:
+            conn.execute(text("ALTER TABLE contests ADD COLUMN registration_requires_approval BOOL NOT NULL DEFAULT 1"))
         column = conn.execute(text("SHOW COLUMNS FROM contests LIKE 'participation_mode'")).mappings().first()
         if column is None:
             conn.execute(text("ALTER TABLE contests ADD COLUMN participation_mode VARCHAR(20) NOT NULL DEFAULT 'individual'"))
@@ -225,6 +277,42 @@ def ensure_contest_access_columns() -> None:
             conn.execute(text("CREATE INDEX ix_submissions_team_id ON submissions (team_id)"))
         conn.execute(text("ALTER TABLE participant_contests MODIFY started_at DATETIME NULL"))
         conn.execute(text("ALTER TABLE participant_contests MODIFY deadline_at DATETIME NULL"))
+
+
+def ensure_contest_registrations_table() -> None:
+    if engine.dialect.name not in {"mysql", "mariadb"}:
+        return
+    with engine.begin() as conn:
+        table_exists = conn.execute(text("SHOW TABLES LIKE 'contest_registrations'")).first() is not None
+        if table_exists:
+            return
+        conn.execute(
+            text(
+                """
+                CREATE TABLE contest_registrations (
+                    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                    contest_id INT NOT NULL,
+                    user_id INT NULL,
+                    team_id INT NULL,
+                    status ENUM('pending', 'approved', 'rejected') NOT NULL DEFAULT 'pending',
+                    requested_at DATETIME NOT NULL,
+                    decided_at DATETIME NULL,
+                    decided_by_user_id INT NULL,
+                    UNIQUE KEY uq_contest_registration_user (contest_id, user_id),
+                    UNIQUE KEY uq_contest_registration_team (contest_id, team_id),
+                    INDEX ix_contest_registrations_contest_id (contest_id),
+                    INDEX ix_contest_registrations_user_id (user_id),
+                    INDEX ix_contest_registrations_team_id (team_id),
+                    INDEX ix_contest_registrations_status (status),
+                    INDEX ix_contest_registrations_requested_at (requested_at),
+                    CONSTRAINT fk_contest_registrations_contest_id FOREIGN KEY (contest_id) REFERENCES contests(id) ON DELETE CASCADE,
+                    CONSTRAINT fk_contest_registrations_user_id FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    CONSTRAINT fk_contest_registrations_team_id FOREIGN KEY (team_id) REFERENCES teams(id) ON DELETE CASCADE,
+                    CONSTRAINT fk_contest_registrations_decided_by_user_id FOREIGN KEY (decided_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+                )
+                """
+            )
+        )
 
 
 def ensure_clarifications_table() -> None:
@@ -288,7 +376,9 @@ def startup() -> None:
     ensure_float_score_columns()
     ensure_partial_scoring_column()
     ensure_task_test_scoring_columns()
+    ensure_task_versioning_schema()
     ensure_contest_access_columns()
+    ensure_contest_registrations_table()
     ensure_clarifications_table()
     with SessionLocal() as db:
         ensure_admin(db)
@@ -297,10 +387,12 @@ def startup() -> None:
 
 def to_task_out(task: Task) -> TaskOut:
     contest_ids = sorted(link.contest_id for link in task.contests)
+    current_version_number = max((version.version_number for version in task.versions), default=None)
     return TaskOut(
         id=task.id,
         contest_id=task.contest_id,
         contest_ids=contest_ids,
+        current_version_number=current_version_number,
         title=task.title,
         statement=task.statement,
         input_format=task.input_format,
@@ -320,6 +412,91 @@ def to_task_detail_out(task: Task, include_tests: bool = False) -> TaskDetailOut
     if include_tests:
         tests = [TaskTestPublicOut(id=test.id, is_sample=test.is_sample) for test in task.tests]
     return TaskDetailOut(**task_out.model_dump(), tests=tests)
+
+
+def task_tests_snapshot(task: Task) -> list[dict[str, object]]:
+    return [
+        {
+            "id": test.id,
+            "input_data": test.input_data,
+            "output_data": test.output_data,
+            "is_sample": test.is_sample,
+            "points": test.points,
+            "group_name": test.group_name,
+        }
+        for test in sorted(task.tests, key=lambda item: item.id)
+    ]
+
+
+def task_snapshot_payload(task: Task) -> dict[str, object]:
+    return {
+        "title": task.title,
+        "statement": task.statement,
+        "input_format": task.input_format,
+        "output_format": task.output_format,
+        "samples": task.samples,
+        "time_limit_ms": task.time_limit_ms,
+        "memory_limit_mb": task.memory_limit_mb,
+        "points": float(task.points),
+        "partial_scoring": bool(task.partial_scoring),
+        "tests_snapshot": json.dumps(task_tests_snapshot(task), sort_keys=True, separators=(",", ":")),
+    }
+
+
+def version_snapshot_payload(version: TaskVersion) -> dict[str, object]:
+    return {
+        "title": version.title,
+        "statement": version.statement,
+        "input_format": version.input_format,
+        "output_format": version.output_format,
+        "samples": version.samples,
+        "time_limit_ms": version.time_limit_ms,
+        "memory_limit_mb": version.memory_limit_mb,
+        "points": float(version.points),
+        "partial_scoring": bool(version.partial_scoring),
+        "tests_snapshot": version.tests_snapshot,
+    }
+
+
+def create_task_version_if_changed(db: Session, task: Task, user_id: int | None = None) -> TaskVersion:
+    db.flush()
+    db.refresh(task, attribute_names=["tests", "versions"])
+    latest = max(task.versions, key=lambda version: version.version_number, default=None)
+    payload = task_snapshot_payload(task)
+    if latest is not None and version_snapshot_payload(latest) == payload:
+        return latest
+    version_number = (latest.version_number if latest is not None else 0) + 1
+    version = TaskVersion(
+        task_id=task.id,
+        version_number=version_number,
+        created_by_user_id=user_id,
+        **payload,
+    )
+    db.add(version)
+    db.flush()
+    if version not in task.versions:
+        task.versions.append(version)
+    return version
+
+
+def to_task_version_out(version: TaskVersion) -> TaskVersionOut:
+    return TaskVersionOut(
+        id=version.id,
+        task_id=version.task_id,
+        version_number=version.version_number,
+        title=version.title,
+        statement=version.statement,
+        input_format=version.input_format,
+        output_format=version.output_format,
+        samples=json.loads(version.samples or "[]"),
+        time_limit_ms=version.time_limit_ms,
+        memory_limit_mb=version.memory_limit_mb,
+        points=version.points,
+        partial_scoring=version.partial_scoring,
+        tests_snapshot=json.loads(version.tests_snapshot or "[]"),
+        created_at=version.created_at,
+        created_by_user_id=version.created_by_user_id,
+    )
 
 
 def to_team_out(team: Team) -> TeamOut:
@@ -353,7 +530,11 @@ def get_contest_or_404(db: Session, contest_id: int) -> Contest:
 
 
 def get_task_or_404(db: Session, task_id: int) -> Task:
-    task = db.scalar(select(Task).where(Task.id == task_id).options(selectinload(Task.tests), selectinload(Task.contests)))
+    task = db.scalar(
+        select(Task)
+        .where(Task.id == task_id)
+        .options(selectinload(Task.tests), selectinload(Task.contests), selectinload(Task.versions))
+    )
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return task
@@ -406,6 +587,19 @@ def participant_has_contest_access(db: Session, contest_id: int, user_id: int) -
     )
 
 
+def participant_has_approved_registration(db: Session, contest_id: int, user_id: int) -> bool:
+    return (
+        db.scalar(
+            select(ContestRegistration.id).where(
+                ContestRegistration.contest_id == contest_id,
+                ContestRegistration.user_id == user_id,
+                ContestRegistration.status == ContestRegistrationStatus.approved,
+            )
+        )
+        is not None
+    )
+
+
 def get_assigned_contest_team_ids_for_user(db: Session, contest_id: int, user_id: int) -> list[int]:
     return list(
         db.scalars(
@@ -418,10 +612,35 @@ def get_assigned_contest_team_ids_for_user(db: Session, contest_id: int, user_id
     )
 
 
+def get_approved_registered_team_ids_for_user(db: Session, contest_id: int, user_id: int) -> list[int]:
+    return list(
+        db.scalars(
+            select(Team.id)
+            .join(TeamMember, TeamMember.team_id == Team.id)
+            .join(ContestRegistration, ContestRegistration.team_id == Team.id)
+            .where(
+                ContestRegistration.contest_id == contest_id,
+                ContestRegistration.status == ContestRegistrationStatus.approved,
+                TeamMember.user_id == user_id,
+            )
+            .order_by(Team.id)
+        )
+    )
+
+
+def get_accessible_team_ids_for_user(db: Session, contest_id: int, user_id: int) -> list[int]:
+    return sorted(
+        {
+            *get_assigned_contest_team_ids_for_user(db, contest_id, user_id),
+            *get_approved_registered_team_ids_for_user(db, contest_id, user_id),
+        }
+    )
+
+
 def participant_has_team_contest_access(db: Session, contest: Contest, user_id: int) -> bool:
     if contest.participation_mode != ContestParticipationMode.team:
         return False
-    return bool(get_assigned_contest_team_ids_for_user(db, contest.id, user_id))
+    return bool(get_accessible_team_ids_for_user(db, contest.id, user_id))
 
 
 def assert_contest_access(db: Session, contest: Contest, user: User) -> None:
@@ -433,17 +652,48 @@ def assert_contest_access(db: Session, contest: Contest, user: User) -> None:
         return
     if participant_has_team_contest_access(db, contest, user.id):
         return
+    if participant_has_approved_registration(db, contest.id, user.id):
+        return
     raise HTTPException(status_code=403, detail="Contest is not available")
+
+
+def assert_contest_visible_for_registration(db: Session, contest: Contest, user: User) -> None:
+    if contest.registration_enabled:
+        return
+    assert_contest_access(db, contest, user)
+
+
+def get_user_team_ids(db: Session, user_id: int) -> list[int]:
+    return list(
+        db.scalars(
+            select(Team.id)
+            .join(TeamMember, TeamMember.team_id == Team.id)
+            .where(TeamMember.user_id == user_id)
+            .order_by(Team.id)
+        )
+    )
+
+
+def resolve_registration_team_id(db: Session, contest: Contest, user: User) -> int | None:
+    if contest.participation_mode == ContestParticipationMode.individual:
+        return None
+    team_ids = get_user_team_ids(db, user.id)
+    if len(team_ids) != 1:
+        detail = "Team contest registration requires exactly one team membership"
+        if len(team_ids) > 1:
+            detail = "Team contest registration requires exactly one team membership; multiple teams found"
+        raise HTTPException(status_code=403, detail=detail)
+    return team_ids[0]
 
 
 def resolve_submission_team_id(db: Session, contest: Contest, user: User) -> int | None:
     if contest.participation_mode == ContestParticipationMode.individual:
         return None
-    team_ids = get_assigned_contest_team_ids_for_user(db, contest.id, user.id)
+    team_ids = get_accessible_team_ids_for_user(db, contest.id, user.id)
     if len(team_ids) != 1:
-        detail = "Team contest requires exactly one assigned team membership"
+        detail = "Team contest requires exactly one approved team membership"
         if len(team_ids) > 1:
-            detail = "Team contest requires exactly one assigned team membership; multiple assigned teams found"
+            detail = "Team contest requires exactly one approved team membership; multiple approved teams found"
         raise HTTPException(status_code=403, detail=detail)
     return team_ids[0]
 
@@ -471,6 +721,58 @@ def replace_contest_participants(db: Session, contest: Contest, user_ids: list[i
             db.add(ParticipantContest(contest_id=contest.id, user_id=user_id))
     db.commit()
     return list_contest_participants(contest.id, db=db)
+
+
+def to_registration_detail_out(db: Session, registration: ContestRegistration, user: User | None = None) -> ContestRegistrationDetailOut:
+    contest = get_contest_or_404(db, registration.contest_id)
+    registrant = db.get(User, registration.user_id) if registration.user_id else None
+    team = db.get(Team, registration.team_id) if registration.team_id else None
+    decided_by = db.get(User, registration.decided_by_user_id) if registration.decided_by_user_id else None
+    can_access = False
+    if user is not None:
+        try:
+            assert_contest_access(db, contest, user)
+            can_access = True
+        except HTTPException:
+            can_access = False
+    return ContestRegistrationDetailOut(
+        id=registration.id,
+        contest_id=registration.contest_id,
+        user_id=registration.user_id,
+        team_id=registration.team_id,
+        status=registration.status,
+        requested_at=registration.requested_at,
+        decided_at=registration.decided_at,
+        decided_by_user_id=registration.decided_by_user_id,
+        contest_title=contest.title,
+        username=registrant.username if registrant else None,
+        user_display_name=registrant.display_name if registrant else None,
+        team_name=team.name if team else None,
+        decided_by_username=decided_by.username if decided_by else None,
+        can_access=can_access,
+    )
+
+
+def get_current_registration(db: Session, contest: Contest, user: User) -> ContestRegistration | None:
+    if contest.participation_mode == ContestParticipationMode.team:
+        team_ids = get_user_team_ids(db, user.id)
+        if not team_ids:
+            return None
+        return db.scalar(
+            select(ContestRegistration)
+            .where(
+                ContestRegistration.contest_id == contest.id,
+                ContestRegistration.team_id.in_(team_ids),
+            )
+            .order_by(ContestRegistration.requested_at.desc(), ContestRegistration.id.desc())
+            .limit(1)
+        )
+    return db.scalar(
+        select(ContestRegistration).where(
+            ContestRegistration.contest_id == contest.id,
+            ContestRegistration.user_id == user.id,
+        )
+    )
 
 
 def get_or_start_participant_contest(db: Session, contest: Contest, user: User) -> ParticipantContest:
@@ -1014,7 +1316,7 @@ def list_contest_tasks(db: Session, contest_id: int) -> list[TaskOut]:
         select(Task)
         .join(ContestTask, ContestTask.task_id == Task.id)
         .where(ContestTask.contest_id == contest_id)
-        .options(selectinload(Task.tests), selectinload(Task.contests))
+        .options(selectinload(Task.tests), selectinload(Task.contests), selectinload(Task.versions))
         .order_by(ContestTask.position, Task.id)
     ).all()
     return [to_task_out(task) for task in tasks]
@@ -1176,6 +1478,8 @@ def create_contest_package_zip(contest: Contest) -> bytes:
             "contest": {
                 "title": contest.title,
                 "description": contest.description,
+                "registration_enabled": contest.registration_enabled,
+                "registration_requires_approval": contest.registration_requires_approval,
                 "time_mode": contest.time_mode.value if hasattr(contest.time_mode, "value") else contest.time_mode,
                 "participation_mode": contest.participation_mode.value if hasattr(contest.participation_mode, "value") else contest.participation_mode,
                 "starts_at": contest.starts_at.isoformat(),
@@ -1265,6 +1569,7 @@ def import_task_package_zip(db: Session, content: bytes) -> PackageImportReport:
         raise HTTPException(status_code=400, detail="Package is not a task package")
     statement = decode_package_text(files, "statement.md", required=False) or decode_package_text(files, "statement.txt", required=False)
     task, created_tests = create_task_from_package_metadata(db, metadata, statement, files)
+    create_task_version_if_changed(db, task)
     db.commit()
     db.refresh(task)
     return PackageImportReport(created_tasks=1, created_tests=created_tests, task_ids=[task.id])
@@ -1300,6 +1605,8 @@ def import_contest_package_zip(db: Session, content: bytes) -> PackageImportRepo
         description=str(contest_data.get("description") or ""),
         status=ContestStatus.draft,
         is_public=False,
+        registration_enabled=bool(contest_data.get("registration_enabled", False)),
+        registration_requires_approval=bool(contest_data.get("registration_requires_approval", True)),
         time_mode=time_mode,
         participation_mode=participation_mode,
         starts_at=starts_at,
@@ -1327,6 +1634,7 @@ def import_contest_package_zip(db: Session, content: bytes) -> PackageImportRepo
         statement = decode_package_text(files, f"{prefix}statement.md", required=False) or decode_package_text(files, f"{prefix}statement.txt", required=False)
         task, test_count = create_task_from_package_metadata(db, task_metadata, statement, files, prefix)
         db.add(ContestTask(contest_id=contest.id, task_id=task.id, position=int(item.get("position", position))))
+        create_task_version_if_changed(db, task)
         task_ids.append(task.id)
         created_tests += test_count
 
@@ -1380,6 +1688,9 @@ def import_task_tests_zip(db: Session, task_id: int, content: bytes) -> TestArch
     unmatched_outputs = sorted(set(outputs) - set(inputs))
     skipped.extend(f"{base}.in: missing matching .out" for base in unmatched_inputs)
     skipped.extend(f"{base}.out: missing matching .in" for base in unmatched_outputs)
+    if created:
+        task = get_task_or_404(db, task_id)
+        create_task_version_if_changed(db, task)
     db.commit()
     return TestArchiveImportReport(created=created, skipped=skipped, errors=errors)
 
@@ -1432,16 +1743,31 @@ def list_contests(db: Session = Depends(get_db), user: User = Depends(get_curren
     stmt = select(Contest).order_by(Contest.starts_at.desc())
     if user.role != UserRole.admin:
         accessible_contests = select(ParticipantContest.contest_id).where(ParticipantContest.user_id == user.id)
+        registered_contests = select(ContestRegistration.contest_id).where(
+            ContestRegistration.user_id == user.id,
+            ContestRegistration.status == ContestRegistrationStatus.approved,
+        )
         accessible_team_contests = (
             select(ContestTeam.contest_id)
             .join(TeamMember, TeamMember.team_id == ContestTeam.team_id)
             .where(TeamMember.user_id == user.id)
         )
+        registered_team_contests = (
+            select(ContestRegistration.contest_id)
+            .join(TeamMember, TeamMember.team_id == ContestRegistration.team_id)
+            .where(
+                TeamMember.user_id == user.id,
+                ContestRegistration.status == ContestRegistrationStatus.approved,
+            )
+        )
         stmt = stmt.where(
             or_(
                 Contest.is_public.is_(True),
+                Contest.registration_enabled.is_(True),
                 Contest.id.in_(accessible_contests),
+                Contest.id.in_(registered_contests),
                 and_(Contest.participation_mode == ContestParticipationMode.team, Contest.id.in_(accessible_team_contests)),
+                and_(Contest.participation_mode == ContestParticipationMode.team, Contest.id.in_(registered_team_contests)),
             )
         )
     return list(db.scalars(stmt))
@@ -1483,7 +1809,7 @@ async def import_contest_package(
 @app.get("/api/contests/{contest_id}", response_model=ContestOut)
 def get_contest(contest_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> Contest:
     contest = get_contest_or_404(db, contest_id)
-    assert_contest_access(db, contest, user)
+    assert_contest_visible_for_registration(db, contest, user)
     return contest
 
 
@@ -1526,7 +1852,7 @@ def delete_contest(contest_id: int, _: User = Depends(require_admin), db: Sessio
 
 
 @app.get("/api/contests/{contest_id}/package")
-def export_contest_package(contest_id: int, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> StreamingResponse:
+def export_contest_package(contest_id: int, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> Response:
     contest = db.scalar(
         select(Contest)
         .where(Contest.id == contest_id)
@@ -1536,8 +1862,8 @@ def export_contest_package(contest_id: int, _: User = Depends(require_admin), db
         raise HTTPException(status_code=404, detail="Contest not found")
     data = create_contest_package_zip(contest)
     filename = f"contest-{contest.id}-{slug_filename(contest.title, 'contest')}.zip"
-    return StreamingResponse(
-        io.BytesIO(data),
+    return Response(
+        content=data,
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
@@ -1548,6 +1874,100 @@ def start_contest(contest_id: int, db: Session = Depends(get_db), user: User = D
     contest = get_contest_or_404(db, contest_id)
     assert_contest_access(db, contest, user)
     return get_or_start_participant_contest(db, contest, user)
+
+
+@app.get("/api/contests/{contest_id}/registration", response_model=ContestRegistrationDetailOut | None)
+def get_contest_registration(
+    contest_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ContestRegistrationDetailOut | None:
+    contest = get_contest_or_404(db, contest_id)
+    assert_contest_visible_for_registration(db, contest, user)
+    registration = get_current_registration(db, contest, user)
+    if registration is None:
+        return None
+    return to_registration_detail_out(db, registration, user)
+
+
+@app.post("/api/contests/{contest_id}/registration", response_model=ContestRegistrationOut)
+def request_contest_registration(
+    contest_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ContestRegistration:
+    contest = get_contest_or_404(db, contest_id)
+    if user.role != UserRole.participant:
+        raise HTTPException(status_code=403, detail="Only participants can request contest registration")
+    if not contest.registration_enabled:
+        raise HTTPException(status_code=403, detail="Contest registration is not enabled")
+    try:
+        assert_contest_access(db, contest, user)
+        already_accessible = True
+    except HTTPException:
+        already_accessible = False
+    if already_accessible:
+        raise HTTPException(status_code=409, detail="Contest is already available")
+    team_id = resolve_registration_team_id(db, contest, user)
+    existing = get_current_registration(db, contest, user)
+    if existing is not None:
+        return existing
+    current = now_utc()
+    registration = ContestRegistration(
+        contest_id=contest.id,
+        user_id=user.id if team_id is None else None,
+        team_id=team_id,
+        status=ContestRegistrationStatus.pending,
+        requested_at=current,
+    )
+    if not contest.registration_requires_approval:
+        registration.status = ContestRegistrationStatus.approved
+        registration.decided_at = current
+    db.add(registration)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Contest registration already exists") from exc
+    db.refresh(registration)
+    return registration
+
+
+@app.get("/api/admin/contest-registrations", response_model=list[ContestRegistrationDetailOut])
+def list_admin_contest_registrations(
+    status_filter: str | None = Query(default=ContestRegistrationStatus.pending.value, alias="status"),
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> list[ContestRegistrationDetailOut]:
+    stmt = select(ContestRegistration).order_by(ContestRegistration.requested_at.desc(), ContestRegistration.id.desc())
+    if status_filter not in {None, "", "all"}:
+        try:
+            parsed_status = ContestRegistrationStatus(status_filter)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Invalid registration status") from exc
+        stmt = stmt.where(ContestRegistration.status == parsed_status)
+    registrations = db.scalars(stmt).all()
+    return [to_registration_detail_out(db, registration) for registration in registrations]
+
+
+@app.patch("/api/admin/contest-registrations/{registration_id}", response_model=ContestRegistrationDetailOut)
+def decide_admin_contest_registration(
+    registration_id: int,
+    decision: ContestRegistrationStatus = Query(...),
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> ContestRegistrationDetailOut:
+    if decision not in {ContestRegistrationStatus.approved, ContestRegistrationStatus.rejected}:
+        raise HTTPException(status_code=400, detail="decision must be approved or rejected")
+    registration = db.get(ContestRegistration, registration_id)
+    if registration is None:
+        raise HTTPException(status_code=404, detail="Contest registration not found")
+    registration.status = decision
+    registration.decided_at = now_utc()
+    registration.decided_by_user_id = admin.id
+    db.commit()
+    db.refresh(registration)
+    return to_registration_detail_out(db, registration)
 
 
 @app.get("/api/contests/{contest_id}/participants", response_model=list[UserOut])
@@ -1714,7 +2134,9 @@ def set_contest_tasks(
 
 @app.get("/api/tasks", response_model=list[TaskOut])
 def list_all_tasks(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> list[TaskOut]:
-    tasks = db.scalars(select(Task).options(selectinload(Task.tests), selectinload(Task.contests)).order_by(Task.id)).all()
+    tasks = db.scalars(
+        select(Task).options(selectinload(Task.tests), selectinload(Task.contests), selectinload(Task.versions)).order_by(Task.id)
+    ).all()
     return [to_task_out(task) for task in tasks]
 
 
@@ -1731,7 +2153,7 @@ async def import_task_package(
 
 
 @app.post("/api/tasks", response_model=TaskOut)
-def create_task(data: TaskCreate, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> TaskOut:
+def create_task(data: TaskCreate, admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> TaskOut:
     task = Task(
         contest_id=data.contest_id,
         title=data.title,
@@ -1758,9 +2180,14 @@ def create_task(data: TaskCreate, _: User = Depends(require_admin), db: Session 
                 group_name=normalize_optional_string(test.group_name),
             )
         )
+    create_task_version_if_changed(db, task, admin.id)
     db.commit()
     db.refresh(task)
-    task = db.scalar(select(Task).where(Task.id == task.id).options(selectinload(Task.tests), selectinload(Task.contests)))
+    task = db.scalar(
+        select(Task)
+        .where(Task.id == task.id)
+        .options(selectinload(Task.tests), selectinload(Task.contests), selectinload(Task.versions))
+    )
     return to_task_out(task)
 
 
@@ -1772,10 +2199,15 @@ def get_task(task_id: int, db: Session = Depends(get_db), user: User = Depends(g
         if task.contest_id is not None:
             contest_ids.add(task.contest_id)
         contests = db.scalars(select(Contest).where(Contest.id.in_(contest_ids))).all() if contest_ids else []
-        if not any(
-            contest.is_public or participant_has_contest_access(db, contest.id, user.id) or participant_has_team_contest_access(db, contest, user.id)
-            for contest in contests
-        ):
+        has_access = False
+        for contest in contests:
+            try:
+                assert_contest_access(db, contest, user)
+                has_access = True
+                break
+            except HTTPException:
+                continue
+        if not has_access:
             raise HTTPException(status_code=403, detail="Task is not available")
     return to_task_detail_out(task, include_tests=user.role == UserRole.admin)
 
@@ -1789,8 +2221,31 @@ def update_task(task_id: int, data: TaskUpdate, _: User = Depends(require_admin)
         setattr(task, key, value)
     if samples is not None:
         task.samples = json.dumps(samples)
+    create_task_version_if_changed(db, task, _.id)
     db.commit()
     return to_task_out(get_task_or_404(db, task_id))
+
+
+@app.get("/api/tasks/{task_id}/versions", response_model=list[TaskVersionOut])
+def list_task_versions(task_id: int, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> list[TaskVersionOut]:
+    get_task_or_404(db, task_id)
+    versions = db.scalars(
+        select(TaskVersion).where(TaskVersion.task_id == task_id).order_by(TaskVersion.version_number.desc())
+    ).all()
+    return [to_task_version_out(version) for version in versions]
+
+
+@app.get("/api/tasks/{task_id}/versions/{version_id}", response_model=TaskVersionOut)
+def get_task_version(
+    task_id: int,
+    version_id: int,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> TaskVersionOut:
+    version = db.scalar(select(TaskVersion).where(TaskVersion.task_id == task_id, TaskVersion.id == version_id))
+    if version is None:
+        raise HTTPException(status_code=404, detail="Task version not found")
+    return to_task_version_out(version)
 
 
 @app.delete("/api/tasks/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -1802,12 +2257,12 @@ def delete_task(task_id: int, _: User = Depends(require_admin), db: Session = De
 
 
 @app.get("/api/tasks/{task_id}/package")
-def export_task_package(task_id: int, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> StreamingResponse:
+def export_task_package(task_id: int, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> Response:
     task = get_task_or_404(db, task_id)
     data = create_task_package_zip(task)
     filename = f"task-{task.id}-{slug_filename(task.title, 'task')}.zip"
-    return StreamingResponse(
-        io.BytesIO(data),
+    return Response(
+        content=data,
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
@@ -1826,7 +2281,7 @@ def create_task_test(
     _: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> TaskTest:
-    get_task_or_404(db, task_id)
+    task = get_task_or_404(db, task_id)
     test = TaskTest(
         task_id=task_id,
         input_data=data.input_data,
@@ -1836,6 +2291,7 @@ def create_task_test(
         group_name=normalize_optional_string(data.group_name),
     )
     db.add(test)
+    create_task_version_if_changed(db, task, _.id)
     db.commit()
     db.refresh(test)
     return test
@@ -1872,6 +2328,8 @@ def update_task_test(
         if key == "group_name":
             value = normalize_optional_string(value)
         setattr(test, key, value)
+    task = get_task_or_404(db, test.task_id)
+    create_task_version_if_changed(db, task, _.id)
     db.commit()
     db.refresh(test)
     return test
@@ -1880,7 +2338,10 @@ def update_task_test(
 @app.delete("/api/tests/{test_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_task_test(test_id: int, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> Response:
     test = get_test_or_404(db, test_id)
+    task_id = test.task_id
     db.delete(test)
+    task = get_task_or_404(db, task_id)
+    create_task_version_if_changed(db, task, _.id)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -1898,10 +2359,15 @@ def create_submission(
     if contest is None or task is None or not task_belongs_to_contest(db, contest_id, task_id):
         raise HTTPException(status_code=404, detail="Contest task not found")
     assert_contest_allows_submission(db, contest, user)
+    task = get_task_or_404(db, task_id)
+    task_version = max(task.versions, key=lambda version: version.version_number, default=None)
+    if task_version is None:
+        task_version = create_task_version_if_changed(db, task)
     team_id = resolve_submission_team_id(db, contest, user)
     submission = Submission(
         contest_id=contest_id,
         task_id=task_id,
+        task_version_id=task_version.id,
         user_id=user.id,
         team_id=team_id,
         language=data.language,
@@ -1931,12 +2397,16 @@ def list_submissions(
         if contest_id is not None:
             contest = get_contest_or_404(db, contest_id)
             if contest.participation_mode == ContestParticipationMode.team:
-                team_ids = get_assigned_contest_team_ids_for_user(db, contest_id, user.id)
+                team_ids = get_accessible_team_ids_for_user(db, contest_id, user.id)
         ownership_filter = Submission.user_id == user.id
         if team_ids:
             ownership_filter = or_(ownership_filter, Submission.team_id.in_(team_ids))
         filters.append(ownership_filter)
         accessible_contests = select(ParticipantContest.contest_id).where(ParticipantContest.user_id == user.id)
+        registered_contests = select(ContestRegistration.contest_id).where(
+            ContestRegistration.user_id == user.id,
+            ContestRegistration.status == ContestRegistrationStatus.approved,
+        )
         accessible_team_contests = (
             select(ContestTeam.contest_id)
             .join(TeamMember, TeamMember.team_id == ContestTeam.team_id)
@@ -1944,8 +2414,24 @@ def list_submissions(
             .where(TeamMember.user_id == user.id)
             .where(Contest.participation_mode == ContestParticipationMode.team)
         )
+        registered_team_contests = (
+            select(ContestRegistration.contest_id)
+            .join(TeamMember, TeamMember.team_id == ContestRegistration.team_id)
+            .join(Contest, Contest.id == ContestRegistration.contest_id)
+            .where(TeamMember.user_id == user.id)
+            .where(ContestRegistration.status == ContestRegistrationStatus.approved)
+            .where(Contest.participation_mode == ContestParticipationMode.team)
+        )
         public_contests = select(Contest.id).where(Contest.is_public.is_(True))
-        filters.append(or_(Submission.contest_id.in_(accessible_contests), Submission.contest_id.in_(accessible_team_contests), Submission.contest_id.in_(public_contests)))
+        filters.append(
+            or_(
+                Submission.contest_id.in_(accessible_contests),
+                Submission.contest_id.in_(registered_contests),
+                Submission.contest_id.in_(accessible_team_contests),
+                Submission.contest_id.in_(registered_team_contests),
+                Submission.contest_id.in_(public_contests),
+            )
+        )
     if filters:
         stmt = stmt.where(and_(*filters))
     return list(db.scalars(stmt))
@@ -1959,7 +2445,7 @@ def get_submission(submission_id: int, db: Session = Depends(get_db), user: User
     contest = get_contest_or_404(db, submission.contest_id)
     assert_contest_access(db, contest, user)
     if user.role != UserRole.admin:
-        team_ids = get_assigned_contest_team_ids_for_user(db, contest.id, user.id) if contest.participation_mode == ContestParticipationMode.team else []
+        team_ids = get_accessible_team_ids_for_user(db, contest.id, user.id) if contest.participation_mode == ContestParticipationMode.team else []
         if submission.user_id != user.id and (submission.team_id is None or submission.team_id not in team_ids):
             raise HTTPException(status_code=403, detail="Submission is not available")
     return submission
@@ -2058,12 +2544,21 @@ def scoreboard(contest_id: int, db: Session = Depends(get_db), user: User = Depe
         .order_by(ContestTask.position, Task.id)
     ).all()
     if contest.participation_mode == ContestParticipationMode.team:
-        teams = db.scalars(
+        assigned_teams = db.scalars(
             select(Team)
             .join(ContestTeam, ContestTeam.team_id == Team.id)
             .where(ContestTeam.contest_id == contest_id)
-            .order_by(Team.name)
         ).all()
+        registered_teams = db.scalars(
+            select(Team)
+            .join(ContestRegistration, ContestRegistration.team_id == Team.id)
+            .where(
+                ContestRegistration.contest_id == contest_id,
+                ContestRegistration.status == ContestRegistrationStatus.approved,
+            )
+        ).all()
+        teams_by_id = {team.id: team for team in [*assigned_teams, *registered_teams]}
+        teams = sorted(teams_by_id.values(), key=lambda team: team.name)
         team_ids = [team.id for team in teams]
         submission_stmt = select(Submission).where(Submission.contest_id == contest_id).order_by(Submission.created_at)
         if is_scoreboard_frozen_for_user(contest, user):
@@ -2107,13 +2602,23 @@ def scoreboard(contest_id: int, db: Session = Depends(get_db), user: User = Depe
             )
         return sorted(rows, key=lambda row: (-row.score, row.penalty, row.team_name or row.username))
 
-    participants = {
+    participant_windows = {
         row.user_id: row
         for row in db.scalars(select(ParticipantContest).where(ParticipantContest.contest_id == contest_id)).all()
     }
+    registered_user_ids = set(
+        db.scalars(
+            select(ContestRegistration.user_id).where(
+                ContestRegistration.contest_id == contest_id,
+                ContestRegistration.user_id.is_not(None),
+                ContestRegistration.status == ContestRegistrationStatus.approved,
+            )
+        ).all()
+    )
+    participant_ids = set(participant_windows) | registered_user_ids
     user_stmt = select(User).where(User.role == UserRole.participant, User.is_active.is_(True)).order_by(User.username)
     if not contest.is_public:
-        user_stmt = user_stmt.where(User.id.in_(participants))
+        user_stmt = user_stmt.where(User.id.in_(participant_ids))
     users = db.scalars(user_stmt).all()
     user_ids = [participant.id for participant in users]
     submission_stmt = select(Submission).where(Submission.contest_id == contest_id).order_by(Submission.created_at)
@@ -2127,7 +2632,7 @@ def scoreboard(contest_id: int, db: Session = Depends(get_db), user: User = Depe
 
     rows: list[ScoreboardRow] = []
     for participant in users:
-        participant_window = participants.get(participant.id)
+        participant_window = participant_windows.get(participant.id)
         cells: list[ScoreboardCell] = []
         score = 0.0
         penalty = 0

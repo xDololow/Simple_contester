@@ -1,11 +1,20 @@
+import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Callable
 
 from sqlalchemy import select
 
 from app.database import SessionLocal
-from app.models import ParticipantContest, Submission, SubmissionVerdict, TaskTest, TestResult
+from app.models import ContestRegistration, ContestRegistrationStatus, ParticipantContest, Submission, SubmissionVerdict, TaskTest, TaskVersion, TestResult
 from conftest import APIClient
+
+
+JUDGER_PATH = Path(__file__).resolve().parents[1] / "judger"
+if str(JUDGER_PATH) not in sys.path:
+    sys.path.insert(0, str(JUDGER_PATH))
+
+import worker  # noqa: E402
 
 
 def create_running_contest(client: APIClient, admin_headers: dict[str, str], title: str, is_public: bool = False) -> dict[str, Any]:
@@ -308,6 +317,269 @@ def test_participant_without_private_contest_access_cannot_submit_or_scoreboard(
     assert scoreboard.json()["detail"] == "Contest is not available"
 
 
+def test_participant_can_request_registration_for_private_contest(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant: dict,
+    participant_headers: dict[str, str],
+) -> None:
+    contest = create_running_contest(client, admin_headers, "Registration")
+    enabled = client.patch(
+        f"/api/contests/{contest['id']}",
+        headers=admin_headers,
+        json={"registration_enabled": True, "registration_requires_approval": True},
+    )
+    assert enabled.status_code == 200, enabled.text
+
+    listed = client.get("/api/contests", headers=participant_headers)
+    assert listed.status_code == 200, listed.text
+    assert contest["id"] in [item["id"] for item in listed.json()]
+
+    opened = client.get(f"/api/contests/{contest['id']}", headers=participant_headers)
+    assert opened.status_code == 200, opened.text
+
+    requested = client.post(f"/api/contests/{contest['id']}/registration", headers=participant_headers)
+    assert requested.status_code == 200, requested.text
+    assert requested.json()["contest_id"] == contest["id"]
+    assert requested.json()["user_id"] == participant["id"]
+    assert requested.json()["team_id"] is None
+    assert requested.json()["status"] == "pending"
+
+    scoreboard = client.get(f"/api/contests/{contest['id']}/scoreboard", headers=participant_headers)
+    assert scoreboard.status_code == 403
+    assert scoreboard.json()["detail"] == "Contest is not available"
+
+
+def test_registration_auto_approve_grants_individual_access(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant: dict,
+    participant_headers: dict[str, str],
+) -> None:
+    contest = create_running_contest(client, admin_headers, "Auto Registration")
+    task = create_contest_task(client, admin_headers, contest["id"])
+    enabled = client.patch(
+        f"/api/contests/{contest['id']}",
+        headers=admin_headers,
+        json={"registration_enabled": True, "registration_requires_approval": False},
+    )
+    assert enabled.status_code == 200, enabled.text
+
+    requested = client.post(f"/api/contests/{contest['id']}/registration", headers=participant_headers)
+    assert requested.status_code == 200, requested.text
+    assert requested.json()["status"] == "approved"
+
+    created = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(input())"},
+    )
+    assert created.status_code == 200, created.text
+
+    with SessionLocal() as db:
+        participant_access = db.scalar(
+            select(ParticipantContest).where(
+                ParticipantContest.contest_id == contest["id"],
+                ParticipantContest.user_id == participant["id"],
+            )
+        )
+        assert participant_access is not None
+
+
+def test_admin_approval_flow_grants_access(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant_headers: dict[str, str],
+) -> None:
+    contest = create_running_contest(client, admin_headers, "Approval Registration")
+    task = create_contest_task(client, admin_headers, contest["id"])
+    enabled = client.patch(
+        f"/api/contests/{contest['id']}",
+        headers=admin_headers,
+        json={"registration_enabled": True, "registration_requires_approval": True},
+    )
+    assert enabled.status_code == 200, enabled.text
+    requested = client.post(f"/api/contests/{contest['id']}/registration", headers=participant_headers)
+    assert requested.status_code == 200, requested.text
+
+    pending = client.get("/api/admin/contest-registrations?status=pending", headers=admin_headers)
+    assert pending.status_code == 200, pending.text
+    assert [item["id"] for item in pending.json()] == [requested.json()["id"]]
+
+    approved = client.patch(
+        f"/api/admin/contest-registrations/{requested.json()['id']}?decision=approved",
+        headers=admin_headers,
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["status"] == "approved"
+    assert approved.json()["decided_by_user_id"] is not None
+
+    created = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(input())"},
+    )
+    assert created.status_code == 200, created.text
+
+
+def test_admin_can_list_all_registration_statuses(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    create_user: Callable[..., dict[str, Any]],
+    auth_headers: Callable[[str, str], dict[str, str]],
+) -> None:
+    pending_user = create_user(username="reg_pending", password="reg-pass")
+    rejected_user = create_user(username="reg_rejected", password="reg-pass")
+    pending_headers = auth_headers(pending_user["username"], "reg-pass")
+    rejected_headers = auth_headers(rejected_user["username"], "reg-pass")
+    contest = create_running_contest(client, admin_headers, "All Registration Statuses")
+    enabled = client.patch(
+        f"/api/contests/{contest['id']}",
+        headers=admin_headers,
+        json={"registration_enabled": True, "registration_requires_approval": True},
+    )
+    assert enabled.status_code == 200, enabled.text
+    pending = client.post(f"/api/contests/{contest['id']}/registration", headers=pending_headers)
+    rejected = client.post(f"/api/contests/{contest['id']}/registration", headers=rejected_headers)
+    assert pending.status_code == 200, pending.text
+    assert rejected.status_code == 200, rejected.text
+    rejected_decision = client.patch(
+        f"/api/admin/contest-registrations/{rejected.json()['id']}?decision=rejected",
+        headers=admin_headers,
+    )
+    assert rejected_decision.status_code == 200, rejected_decision.text
+
+    default_list = client.get("/api/admin/contest-registrations", headers=admin_headers)
+    all_list = client.get("/api/admin/contest-registrations?status=all", headers=admin_headers)
+
+    assert [item["id"] for item in default_list.json()] == [pending.json()["id"]]
+    assert {item["id"] for item in all_list.json()} == {pending.json()["id"], rejected.json()["id"]}
+
+
+def test_approved_registration_allows_task_detail_but_pending_does_not(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant_headers: dict[str, str],
+) -> None:
+    contest = create_running_contest(client, admin_headers, "Registration Task Detail")
+    task = create_contest_task(client, admin_headers, contest["id"])
+    enabled = client.patch(
+        f"/api/contests/{contest['id']}",
+        headers=admin_headers,
+        json={"registration_enabled": True, "registration_requires_approval": True},
+    )
+    assert enabled.status_code == 200, enabled.text
+
+    requested = client.post(f"/api/contests/{contest['id']}/registration", headers=participant_headers)
+    assert requested.status_code == 200, requested.text
+    pending_detail = client.get(f"/api/tasks/{task['id']}", headers=participant_headers)
+    assert pending_detail.status_code == 403
+
+    approved = client.patch(
+        f"/api/admin/contest-registrations/{requested.json()['id']}?decision=approved",
+        headers=admin_headers,
+    )
+    assert approved.status_code == 200, approved.text
+    approved_detail = client.get(f"/api/tasks/{task['id']}", headers=participant_headers)
+    assert approved_detail.status_code == 200, approved_detail.text
+    assert approved_detail.json()["id"] == task["id"]
+
+
+def test_rejected_registration_keeps_private_contest_denied(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant_headers: dict[str, str],
+) -> None:
+    contest = create_running_contest(client, admin_headers, "Rejected Registration")
+    task = create_contest_task(client, admin_headers, contest["id"])
+    enabled = client.patch(
+        f"/api/contests/{contest['id']}",
+        headers=admin_headers,
+        json={"registration_enabled": True, "registration_requires_approval": True},
+    )
+    assert enabled.status_code == 200, enabled.text
+    requested = client.post(f"/api/contests/{contest['id']}/registration", headers=participant_headers)
+    assert requested.status_code == 200, requested.text
+
+    rejected = client.patch(
+        f"/api/admin/contest-registrations/{requested.json()['id']}?decision=rejected",
+        headers=admin_headers,
+    )
+    assert rejected.status_code == 200, rejected.text
+    assert rejected.json()["status"] == "rejected"
+
+    created = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(input())"},
+    )
+    assert created.status_code == 403
+    assert created.json()["detail"] == "Contest is not available"
+
+    status_response = client.get(f"/api/contests/{contest['id']}/registration", headers=participant_headers)
+    assert status_response.status_code == 200, status_response.text
+    assert status_response.json()["status"] == "rejected"
+
+
+def test_team_registration_simple_case_grants_team_access(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant: dict,
+    participant_headers: dict[str, str],
+) -> None:
+    contest = create_running_team_contest(client, admin_headers, "Team Registration")
+    task = create_contest_task(client, admin_headers, contest["id"])
+    team = create_team(client, admin_headers, "Registration Team", [participant["id"]])
+    enabled = client.patch(
+        f"/api/contests/{contest['id']}",
+        headers=admin_headers,
+        json={"registration_enabled": True, "registration_requires_approval": False},
+    )
+    assert enabled.status_code == 200, enabled.text
+
+    requested = client.post(f"/api/contests/{contest['id']}/registration", headers=participant_headers)
+    assert requested.status_code == 200, requested.text
+    assert requested.json()["status"] == "approved"
+    assert requested.json()["user_id"] is None
+    assert requested.json()["team_id"] == team["id"]
+
+    created = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(input())"},
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["team_id"] == team["id"]
+
+    with SessionLocal() as db:
+        registration = db.scalar(select(ContestRegistration).where(ContestRegistration.contest_id == contest["id"]))
+        assert registration is not None
+        assert registration.status == ContestRegistrationStatus.approved
+
+
+def test_team_registration_requires_exactly_one_team_membership(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant: dict,
+    participant_headers: dict[str, str],
+) -> None:
+    contest = create_running_team_contest(client, admin_headers, "Ambiguous Team Registration")
+    first = create_team(client, admin_headers, "First Registration Team", [participant["id"]])
+    second = create_team(client, admin_headers, "Second Registration Team", [participant["id"]])
+    assert first["id"] != second["id"]
+    enabled = client.patch(
+        f"/api/contests/{contest['id']}",
+        headers=admin_headers,
+        json={"registration_enabled": True, "registration_requires_approval": False},
+    )
+    assert enabled.status_code == 200, enabled.text
+
+    requested = client.post(f"/api/contests/{contest['id']}/registration", headers=participant_headers)
+
+    assert requested.status_code == 403
+    assert requested.json()["detail"] == "Team contest registration requires exactly one team membership; multiple teams found"
+
+
 def test_admin_can_manage_contest_participant_access(
     client: APIClient,
     admin_headers: dict[str, str],
@@ -474,6 +746,123 @@ def test_admin_can_create_and_edit_test_scoring_metadata(
     stored = next(test for test in tests.json() if test["id"] == created.json()["id"])
     assert stored["points"] is None
     assert stored["group_name"] == "main"
+
+
+def test_task_versions_created_on_task_create_update_and_test_changes(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    demo_task: dict,
+) -> None:
+    assert demo_task["current_version_number"] == 1
+
+    versions = client.get(f"/api/tasks/{demo_task['id']}/versions", headers=admin_headers)
+    assert versions.status_code == 200, versions.text
+    assert [version["version_number"] for version in versions.json()] == [1]
+    assert len(versions.json()[0]["tests_snapshot"]) == 2
+
+    no_op = client.patch(f"/api/tasks/{demo_task['id']}", headers=admin_headers, json={"title": demo_task["title"]})
+    assert no_op.status_code == 200, no_op.text
+    assert no_op.json()["current_version_number"] == 1
+
+    updated = client.patch(f"/api/tasks/{demo_task['id']}", headers=admin_headers, json={"points": 75})
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["current_version_number"] == 2
+
+    created_test = client.post(
+        f"/api/tasks/{demo_task['id']}/tests",
+        headers=admin_headers,
+        json={"input_data": "1 1\n", "output_data": "2\n", "is_sample": False},
+    )
+    assert created_test.status_code == 200, created_test.text
+
+    versions = client.get(f"/api/tasks/{demo_task['id']}/versions", headers=admin_headers)
+    assert [version["version_number"] for version in versions.json()] == [3, 2, 1]
+    assert len(versions.json()[0]["tests_snapshot"]) == 3
+
+
+def test_submission_stores_current_task_version(
+    client: APIClient,
+    participant_headers: dict[str, str],
+    demo_contest: dict,
+    demo_task: dict,
+) -> None:
+    created = client.post(
+        f"/api/contests/{demo_contest['id']}/tasks/{demo_task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(sum(map(int, input().split())))"},
+    )
+
+    assert created.status_code == 200, created.text
+    assert created.json()["task_version_id"] is not None
+
+    with SessionLocal() as db:
+        version = db.get(TaskVersion, created.json()["task_version_id"])
+        assert version is not None
+        assert version.task_id == demo_task["id"]
+        assert version.version_number == 1
+
+
+def test_worker_uses_submission_task_version_snapshot_after_tests_change(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant_headers: dict[str, str],
+    demo_contest: dict,
+    demo_task: dict,
+    monkeypatch,
+) -> None:
+    created = client.post(
+        f"/api/contests/{demo_contest['id']}/tasks/{demo_task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(sum(map(int, input().split())))"},
+    )
+    assert created.status_code == 200, created.text
+    submission_id = created.json()["id"]
+
+    tests = client.get(f"/api/tasks/{demo_task['id']}/tests", headers=admin_headers).json()
+    changed = client.patch(
+        f"/api/tests/{tests[1]['id']}",
+        headers=admin_headers,
+        json={"output_data": "wrong-now\n"},
+    )
+    assert changed.status_code == 200, changed.text
+
+    monkeypatch.setattr(worker, "JUDGER_ID", "snapshot-worker")
+    worker.engine.dispose()
+    claimed = worker.acquire_submission()
+    assert claimed is not None
+    assert claimed["id"] == submission_id
+    assert claimed["task_version_id"] == created.json()["task_version_id"]
+    snapshot_tests = worker.fetch_tests(claimed["task_id"], claimed["tests_snapshot"])
+    assert [test["output_data"] for test in snapshot_tests] == ["5\n", "42\n"]
+    assert worker.fetch_tests(claimed["task_id"])[1]["output_data"] == "wrong-now\n"
+
+
+def test_worker_falls_back_to_live_task_for_old_submission_without_version(
+    client: APIClient,
+    participant_headers: dict[str, str],
+    demo_contest: dict,
+    demo_task: dict,
+    monkeypatch,
+) -> None:
+    created = client.post(
+        f"/api/contests/{demo_contest['id']}/tasks/{demo_task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(sum(map(int, input().split())))"},
+    )
+    assert created.status_code == 200, created.text
+    with SessionLocal() as db:
+        submission = db.get(Submission, created.json()["id"])
+        assert submission is not None
+        submission.task_version_id = None
+        db.commit()
+
+    monkeypatch.setattr(worker, "JUDGER_ID", "fallback-worker")
+    worker.engine.dispose()
+    claimed = worker.acquire_submission()
+    assert claimed is not None
+    assert claimed["task_version_id"] is None
+    assert claimed["tests_snapshot"] is None
+    assert [test["output_data"] for test in worker.fetch_tests(claimed["task_id"])] == ["5\n", "42\n"]
 
 
 def test_participant_cannot_see_foreign_submission_or_hidden_results(
@@ -705,7 +1094,7 @@ def test_team_contest_submit_without_assigned_team_denied(
     )
 
     assert created.status_code == 403
-    assert created.json()["detail"] == "Team contest requires exactly one assigned team membership"
+    assert created.json()["detail"] == "Team contest requires exactly one approved team membership"
 
 
 def test_individual_mode_submissions_remain_user_owned(

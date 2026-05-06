@@ -223,10 +223,15 @@ def acquire_submission() -> dict | None:
             text(
                 f"""
                 SELECT submissions.id, submissions.language, submissions.source_code, submissions.task_id,
-                       submissions.attempt_number,
-                       tasks.time_limit_ms, tasks.memory_limit_mb, tasks.points, tasks.partial_scoring
+                       submissions.task_version_id, submissions.attempt_number,
+                       COALESCE(task_versions.time_limit_ms, tasks.time_limit_ms) AS time_limit_ms,
+                       COALESCE(task_versions.memory_limit_mb, tasks.memory_limit_mb) AS memory_limit_mb,
+                       COALESCE(task_versions.points, tasks.points) AS points,
+                       COALESCE(task_versions.partial_scoring, tasks.partial_scoring) AS partial_scoring,
+                       task_versions.tests_snapshot AS tests_snapshot
                 FROM submissions
                 JOIN tasks ON tasks.id = submissions.task_id
+                LEFT JOIN task_versions ON task_versions.id = submissions.task_version_id
                 WHERE submissions.verdict = 'queued'
                 ORDER BY submissions.created_at
                 LIMIT 1
@@ -355,7 +360,27 @@ def reclaim_expired_submissions() -> int:
         return reclaimed
 
 
-def fetch_tests(task_id: int) -> list[dict]:
+def fetch_tests(task_id: int, tests_snapshot: str | None = None) -> list[dict]:
+    if tests_snapshot:
+        try:
+            data = json.loads(tests_snapshot)
+        except json.JSONDecodeError:
+            data = []
+        if isinstance(data, list):
+            tests: list[dict] = []
+            for index, item in enumerate(data, start=1):
+                if not isinstance(item, dict):
+                    continue
+                tests.append(
+                    {
+                        "id": item.get("id") or -index,
+                        "input_data": str(item.get("input_data") or ""),
+                        "output_data": str(item.get("output_data") or ""),
+                        "is_sample": bool(item.get("is_sample", False)),
+                        "points": item.get("points"),
+                    }
+                )
+            return tests
     with engine.begin() as conn:
         return list(
             conn.execute(
@@ -453,6 +478,9 @@ def insert_result(submission_id: int, test_id: int, verdict: str, time_ms: int, 
             ).first()
             if current is None:
                 return False
+        test_exists = conn.execute(text("SELECT 1 FROM task_tests WHERE id = :test_id"), {"test_id": test_id}).first()
+        if test_exists is None:
+            return True
         conn.execute(
             text(
                 """
@@ -475,7 +503,7 @@ def insert_result(submission_id: int, test_id: int, verdict: str, time_ms: int, 
 def judge(submission: dict) -> None:
     claim_token = submission["claim_token"]
     event_payload = {"claim_token": claim_token, "attempt_number": submission.get("attempt_number")}
-    tests = fetch_tests(submission["task_id"])
+    tests = fetch_tests(submission["task_id"], submission.get("tests_snapshot") if submission.get("task_version_id") else None)
     if not tests:
         set_judger_state("reporting", submission["id"])
         finish_submission(submission["id"], VERDICT_INTERNAL_ERROR, 0, "Task has no tests", claim_token)

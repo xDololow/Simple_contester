@@ -2,6 +2,7 @@ export type Role = "admin" | "participant";
 export type ContestStatus = "draft" | "scheduled" | "running" | "finished" | "archived";
 export type TimeMode = "fixed" | "individual";
 export type ParticipationMode = "individual" | "team";
+export type ContestRegistrationStatus = "pending" | "approved" | "rejected";
 export type ClarificationStatus = "open" | "answered" | "closed";
 export type ClarificationVisibility = "private" | "broadcast";
 export type Language =
@@ -42,6 +43,8 @@ export type Contest = {
   description: string;
   status: ContestStatus;
   is_public: boolean;
+  registration_enabled: boolean;
+  registration_requires_approval: boolean;
   time_mode: TimeMode;
   participation_mode: ParticipationMode;
   starts_at: string;
@@ -52,10 +55,28 @@ export type Contest = {
   created_at?: string | null;
 };
 
+export type ContestRegistration = {
+  id: number;
+  contest_id: number;
+  user_id: number | null;
+  team_id: number | null;
+  status: ContestRegistrationStatus;
+  requested_at: string;
+  decided_at: string | null;
+  decided_by_user_id: number | null;
+  contest_title?: string;
+  username?: string | null;
+  user_display_name?: string | null;
+  team_name?: string | null;
+  decided_by_username?: string | null;
+  can_access?: boolean;
+};
+
 export type Task = {
   id: number;
   contest_id?: number | null;
   contest_ids: number[];
+  current_version_number: number | null;
   title: string;
   statement: string;
   input_format: string;
@@ -67,6 +88,24 @@ export type Task = {
   partial_scoring: boolean;
   test_count: number;
   tests?: Array<{ id: number; is_sample: boolean }> | null;
+};
+
+export type TaskVersion = {
+  id: number;
+  task_id: number;
+  version_number: number;
+  title: string;
+  statement: string;
+  input_format: string;
+  output_format: string;
+  samples: Array<Record<string, unknown>>;
+  time_limit_ms: number;
+  memory_limit_mb: number;
+  points: number;
+  partial_scoring: boolean;
+  tests_snapshot: Array<Record<string, unknown>>;
+  created_at: string;
+  created_by_user_id: number | null;
 };
 
 export type TaskTest = {
@@ -83,6 +122,7 @@ export type Submission = {
   id: number;
   contest_id: number;
   task_id: number;
+  task_version_id?: number | null;
   user_id: number;
   team_id?: number | null;
   language: Language;

@@ -165,6 +165,22 @@ and is capped by the task's maximum points. Tests without explicit points
 contribute `0` in this mode. `group_name` is stored with tests for future group
 policies, but the MVP does not apply group min/max rules.
 
+## Task Versions
+
+Standalone tasks keep immutable task version snapshots for reproducible judging.
+The backend creates version `1` when a task is created, then creates a new
+version when task text, limits, scoring metadata, or tests change. New
+submissions store `task_version_id` and the judger uses that snapshot for tests,
+limits, and scoring even if admins later edit the live task.
+
+Existing submissions with no `task_version_id` are treated as legacy rows and
+are judged against the current live task. The admin API exposes task history at
+`GET /api/tasks/{task_id}/versions` and version details at
+`GET /api/tasks/{task_id}/versions/{version_id}`. The admin UI currently shows
+the current version number only; restoring an old version is intentionally not
+implemented in this MVP. Task and contest packages still export/import the
+current task state, not the full version history.
+
 ## Clarifications
 
 Contest participants can ask jury questions from the contest `Questions` tab.
@@ -229,6 +245,19 @@ MVP membership rule: a participant must belong to exactly one team assigned to
 the contest before submitting. Participants with no assigned team, or with more
 than one assigned team for the same contest, receive a 403 response explaining
 that exactly one assigned team membership is required.
+
+## Contest Registration
+
+Private contests can optionally enable participant registration without email.
+Admins keep the existing public/private switch and allowlists, then can turn on
+`registration_enabled` and choose whether `registration_requires_approval` is
+needed. Participants can see registration-enabled contests and request access.
+
+For individual contests, an approved or auto-approved request adds the user to
+the existing participant allowlist. For team contests, the request is made by
+the participant's single current team; users with zero or multiple teams receive
+a 403 response. Approved team requests add that team to the contest team
+allowlist. Rejected requests remain visible as rejected and do not grant access.
 
 ## Scoreboard Freeze MVP
 

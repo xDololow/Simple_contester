@@ -34,6 +34,12 @@ class ContestParticipationMode(str, Enum):
     team = "team"
 
 
+class ContestRegistrationStatus(str, Enum):
+    pending = "pending"
+    approved = "approved"
+    rejected = "rejected"
+
+
 class SubmissionVerdict(str, Enum):
     queued = "Queued"
     running = "Running"
@@ -129,6 +135,8 @@ class Contest(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[ContestStatus] = mapped_column(SAEnum(ContestStatus), default=ContestStatus.draft)
     is_public: Mapped[bool] = mapped_column(Boolean, default=False)
+    registration_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    registration_requires_approval: Mapped[bool] = mapped_column(Boolean, default=True)
     time_mode: Mapped[ContestTimeMode] = mapped_column(SAEnum(ContestTimeMode), default=ContestTimeMode.fixed)
     participation_mode: Mapped[ContestParticipationMode] = mapped_column(
         SAEnum(ContestParticipationMode),
@@ -143,6 +151,7 @@ class Contest(Base):
 
     tasks: Mapped[list["ContestTask"]] = relationship(back_populates="contest", cascade="all, delete-orphan")
     teams: Mapped[list["ContestTeam"]] = relationship(back_populates="contest", cascade="all, delete-orphan")
+    registrations: Mapped[list["ContestRegistration"]] = relationship(back_populates="contest", cascade="all, delete-orphan")
 
 
 class ContestTeam(Base):
@@ -166,6 +175,29 @@ class ParticipantContest(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ContestRegistration(Base):
+    __tablename__ = "contest_registrations"
+    __table_args__ = (
+        UniqueConstraint("contest_id", "user_id", name="uq_contest_registration_user"),
+        UniqueConstraint("contest_id", "team_id", name="uq_contest_registration_team"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    contest_id: Mapped[int] = mapped_column(ForeignKey("contests.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    team_id: Mapped[int | None] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), nullable=True, index=True)
+    status: Mapped[ContestRegistrationStatus] = mapped_column(
+        SAEnum(ContestRegistrationStatus),
+        default=ContestRegistrationStatus.pending,
+        index=True,
+    )
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    decided_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    contest: Mapped[Contest] = relationship(back_populates="registrations")
 
 
 class ContestTask(Base):
@@ -198,6 +230,30 @@ class Task(Base):
 
     contests: Mapped[list[ContestTask]] = relationship(back_populates="task", cascade="all, delete-orphan")
     tests: Mapped[list["TaskTest"]] = relationship(back_populates="task", cascade="all, delete-orphan")
+    versions: Mapped[list["TaskVersion"]] = relationship(back_populates="task", cascade="all, delete-orphan")
+
+
+class TaskVersion(Base):
+    __tablename__ = "task_versions"
+    __table_args__ = (UniqueConstraint("task_id", "version_number", name="uq_task_version_number"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
+    version_number: Mapped[int] = mapped_column(Integer)
+    title: Mapped[str] = mapped_column(String(200))
+    statement: Mapped[str] = mapped_column(Text)
+    input_format: Mapped[str] = mapped_column(Text, default="")
+    output_format: Mapped[str] = mapped_column(Text, default="")
+    samples: Mapped[str] = mapped_column(Text, default="[]")
+    time_limit_ms: Mapped[int] = mapped_column(Integer, default=2000)
+    memory_limit_mb: Mapped[int] = mapped_column(Integer, default=256)
+    points: Mapped[float] = mapped_column(Float, default=100.0)
+    partial_scoring: Mapped[bool] = mapped_column(Boolean, default=False)
+    tests_snapshot: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    created_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    task: Mapped[Task] = relationship(back_populates="versions")
 
 
 class TaskTest(Base):
@@ -223,6 +279,7 @@ class Submission(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     contest_id: Mapped[int] = mapped_column(ForeignKey("contests.id", ondelete="CASCADE"), index=True)
     task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
+    task_version_id: Mapped[int | None] = mapped_column(ForeignKey("task_versions.id", ondelete="SET NULL"), nullable=True, index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     team_id: Mapped[int | None] = mapped_column(ForeignKey("teams.id", ondelete="SET NULL"), nullable=True, index=True)
     language: Mapped[Language] = mapped_column(SAEnum(Language))

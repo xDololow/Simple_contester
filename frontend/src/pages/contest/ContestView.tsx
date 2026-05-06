@@ -3,7 +3,7 @@ import type { FormEvent } from "react";
 import { API_BASE } from "../../api/client";
 import { FlashMessage, Header, SubmissionDetailView } from "../../components/shared";
 import { useI18n } from "../../i18n";
-import type { ApiClient, Clarification, Contest, ContestLiveEvent, Flash, Language, ScoreboardRow, Submission, SubmissionDetail, Task, User } from "../../types";
+import type { ApiClient, Clarification, Contest, ContestLiveEvent, ContestRegistration, Flash, Language, ScoreboardRow, Submission, SubmissionDetail, Task, User } from "../../types";
 import { emptyFlash, errorText, formatDate, formatScore, verdictClass } from "../../utils/format";
 
 type ContestTab = "overview" | "tasks" | "submissions" | "scoreboard" | "clarifications";
@@ -35,12 +35,27 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
       Date.now() >= new Date(contest.scoreboard_freeze_at || "").getTime()
   );
   const [clarifications, setClarifications] = useState<Clarification[]>([]);
+  const [registration, setRegistration] = useState<ContestRegistration | null>(null);
+  const [hasContestAccess, setHasContestAccess] = useState(true);
+  const [registrationLoading, setRegistrationLoading] = useState(false);
   const [tab, setTab] = useState<ContestTab>("tasks");
   const [selectedTaskId, setSelectedTaskId] = useState<number | null>(null);
   const [selectedSubmissionId, setSelectedSubmissionId] = useState<number | null>(null);
   const [detail, setDetail] = useState<SubmissionDetail | null>(null);
   const [flash, setFlash] = useState<Flash>(emptyFlash);
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) || tasks[0] || null;
+
+  const refreshRegistration = useCallback(async () => {
+    if (!contest.registration_enabled || me.role === "admin") {
+      setRegistration(null);
+      return;
+    }
+    const nextRegistration = await api<ContestRegistration | null>(`/api/contests/${contest.id}/registration`);
+    setRegistration(nextRegistration);
+    if (nextRegistration?.can_access) {
+      setHasContestAccess(true);
+    }
+  }, [api, contest.id, contest.registration_enabled, me.role]);
 
   const refresh = useCallback(async () => {
     const [nextTasks, live, nextClarifications] = await Promise.all([
@@ -54,6 +69,7 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
     setScoreboardFrozen(Boolean(live.scoreboard_frozen));
     setClarifications(nextClarifications);
     setSelectedTaskId((current) => current ?? nextTasks[0]?.id ?? null);
+    setHasContestAccess(true);
   }, [api, contest.id]);
 
   const refreshLiveData = useCallback(async () => {
@@ -64,7 +80,23 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
   }, [api, contest.id]);
 
   useEffect(() => {
-    refresh().catch((error) => setFlash({ kind: "error", text: errorText(error) }));
+    let cancelled = false;
+    if (hasContestAccess) {
+      refresh()
+        .then(() => refreshRegistration())
+        .catch((error) => {
+          if (cancelled) return;
+          const message = errorText(error);
+          if (contest.registration_enabled && message === "Contest is not available") {
+            setHasContestAccess(false);
+            refreshRegistration().catch((registrationError) => setFlash({ kind: "error", text: errorText(registrationError) }));
+            return;
+          }
+          setFlash({ kind: "error", text: message });
+        });
+    } else {
+      refreshRegistration().catch((registrationError) => setFlash({ kind: "error", text: errorText(registrationError) }));
+    }
 
     let eventSource: EventSource | null = null;
     let fallbackInterval: number | null = null;
@@ -73,9 +105,17 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
       fallbackInterval = window.setInterval(() => refreshLiveData().catch(console.error), 5000);
     };
 
+    if (!hasContestAccess) {
+      return () => {
+        cancelled = true;
+        if (fallbackInterval !== null) window.clearInterval(fallbackInterval);
+      };
+    }
+
     if (!token || typeof EventSource === "undefined") {
       startFallback();
       return () => {
+        cancelled = true;
         if (fallbackInterval !== null) window.clearInterval(fallbackInterval);
       };
     }
@@ -94,10 +134,28 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
     };
 
     return () => {
+      cancelled = true;
       eventSource?.close();
       if (fallbackInterval !== null) window.clearInterval(fallbackInterval);
     };
-  }, [contest.id, refresh, refreshLiveData, token]);
+  }, [contest.id, contest.registration_enabled, hasContestAccess, refresh, refreshLiveData, refreshRegistration, token]);
+
+  async function requestRegistration() {
+    setRegistrationLoading(true);
+    setFlash(emptyFlash);
+    try {
+      const nextRegistration = await api<ContestRegistration>(`/api/contests/${contest.id}/registration`, { method: "POST" });
+      setRegistration(nextRegistration);
+      if (nextRegistration.status === "approved") {
+        setHasContestAccess(true);
+        await refresh();
+      }
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    } finally {
+      setRegistrationLoading(false);
+    }
+  }
 
   useEffect(() => {
     if (!selectedSubmissionId || me.role !== "admin") {
@@ -125,6 +183,17 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
         </div>
       </section>
       <FlashMessage flash={flash} />
+      {!hasContestAccess && (
+        <section className="panel">
+          <Header title={t("registration.requestAccess")} subtitle={t("registration.participantSubtitle")} />
+          <div className="toolbar">
+            {registration ? <span className={registration.status === "rejected" ? "pill warn" : "pill"}>{t(`registration.status.${registration.status}`)}</span> : <span className="pill">{t("registration.notRequested")}</span>}
+            {!registration && <button onClick={requestRegistration} disabled={registrationLoading}>{registrationLoading ? t("status.refreshing") : t("registration.requestAccess")}</button>}
+          </div>
+        </section>
+      )}
+      {!hasContestAccess ? null : (
+      <>
       <nav className="tabs contest-tabs" aria-label={t("nav.contestSections")}>
         {[
           ["overview", t("tab.overview")],
@@ -237,6 +306,8 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
           clarifications={clarifications}
           onRefresh={async () => setClarifications(await api<Clarification[]>(`/api/contests/${contest.id}/clarifications`))}
         />
+      )}
+      </>
       )}
     </div>
   );

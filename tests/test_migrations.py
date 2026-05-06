@@ -17,6 +17,7 @@ def test_alembic_upgrade_creates_current_schema(tmp_path, monkeypatch) -> None:
         inspector = inspect(engine)
         tables = set(inspector.get_table_names())
         contest_columns = {column["name"]: column for column in inspector.get_columns("contests")}
+        registration_columns = {column["name"]: column for column in inspector.get_columns("contest_registrations")}
         task_test_columns = {column["name"]: column for column in inspector.get_columns("task_tests")}
         participant_columns = {column["name"]: column for column in inspector.get_columns("participant_contests")}
         submission_columns = {column["name"]: column for column in inspector.get_columns("submissions")}
@@ -32,6 +33,7 @@ def test_alembic_upgrade_creates_current_schema(tmp_path, monkeypatch) -> None:
         "contests",
         "contest_teams",
         "participant_contests",
+        "contest_registrations",
         "contest_tasks",
         "tasks",
         "task_tests",
@@ -42,8 +44,19 @@ def test_alembic_upgrade_creates_current_schema(tmp_path, monkeypatch) -> None:
         "clarifications",
     }.issubset(tables)
     assert "is_public" in contest_columns
+    assert "registration_enabled" in contest_columns
+    assert "registration_requires_approval" in contest_columns
     assert "scoreboard_freeze_at" in contest_columns
     assert "scoreboard_unfrozen" in contest_columns
+    assert {
+        "contest_id",
+        "user_id",
+        "team_id",
+        "status",
+        "requested_at",
+        "decided_at",
+        "decided_by_user_id",
+    }.issubset(registration_columns)
     assert "points" in task_test_columns
     assert "group_name" in task_test_columns
     assert participant_columns["started_at"]["nullable"] is True

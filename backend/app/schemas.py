@@ -7,6 +7,7 @@ from .models import (
     ClarificationStatus,
     ClarificationVisibility,
     ContestParticipationMode,
+    ContestRegistrationStatus,
     ContestStatus,
     ContestTimeMode,
     JudgerStatus,
@@ -185,6 +186,8 @@ class ContestCreate(BaseModel):
     description: str = ""
     status: ContestStatus = ContestStatus.draft
     is_public: bool = False
+    registration_enabled: bool = False
+    registration_requires_approval: bool = True
     time_mode: ContestTimeMode = ContestTimeMode.fixed
     participation_mode: ContestParticipationMode = ContestParticipationMode.individual
     starts_at: datetime
@@ -199,6 +202,8 @@ class ContestUpdate(BaseModel):
     description: str | None = None
     status: ContestStatus | None = None
     is_public: bool | None = None
+    registration_enabled: bool | None = None
+    registration_requires_approval: bool | None = None
     time_mode: ContestTimeMode | None = None
     participation_mode: ContestParticipationMode | None = None
     starts_at: datetime | None = None
@@ -223,6 +228,28 @@ class ParticipantContestOut(BaseModel):
     user_id: int
     started_at: datetime | None
     deadline_at: datetime | None
+
+
+class ContestRegistrationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    contest_id: int
+    user_id: int | None
+    team_id: int | None
+    status: ContestRegistrationStatus
+    requested_at: datetime
+    decided_at: datetime | None = None
+    decided_by_user_id: int | None = None
+
+
+class ContestRegistrationDetailOut(ContestRegistrationOut):
+    contest_title: str
+    username: str | None = None
+    user_display_name: str | None = None
+    team_name: str | None = None
+    decided_by_username: str | None = None
+    can_access: bool = False
 
 
 class TaskTestCreate(BaseModel):
@@ -289,6 +316,7 @@ class TaskOut(BaseModel):
     id: int
     contest_id: int | None = None
     contest_ids: list[int] = Field(default_factory=list)
+    current_version_number: int | None = None
     title: str
     statement: str
     input_format: str
@@ -303,6 +331,24 @@ class TaskOut(BaseModel):
 
 class TaskDetailOut(TaskOut):
     tests: list[TaskTestPublicOut] | None = None
+
+
+class TaskVersionOut(BaseModel):
+    id: int
+    task_id: int
+    version_number: int
+    title: str
+    statement: str
+    input_format: str
+    output_format: str
+    samples: list[dict[str, Any]]
+    time_limit_ms: int
+    memory_limit_mb: int
+    points: float
+    partial_scoring: bool
+    tests_snapshot: list[dict[str, Any]]
+    created_at: datetime
+    created_by_user_id: int | None = None
 
 
 class TestArchiveImportReport(BaseModel):
@@ -358,6 +404,7 @@ class SubmissionOut(BaseModel):
     id: int
     contest_id: int
     task_id: int
+    task_version_id: int | None = None
     user_id: int
     team_id: int | None = None
     language: Language

@@ -69,6 +69,7 @@ def test_task_package_import_creates_standalone_task_and_tests(
     assert task["title"] == "A + B"
     assert task["contest_id"] is None
     assert task["contest_ids"] == []
+    assert task["current_version_number"] == 1
     tests = client.get(f"/api/tasks/{imported_task_id}/tests", headers=admin_headers).json()
     assert [test["is_sample"] for test in tests] == [True, False]
     assert [test["points"] for test in tests] == [None, None]
@@ -117,12 +118,21 @@ def test_contest_package_export_import_roundtrip(
     demo_contest: dict[str, Any],
     demo_task: dict[str, Any],
 ) -> None:
+    updated = client.patch(
+        f"/api/contests/{demo_contest['id']}",
+        headers=admin_headers,
+        json={"registration_enabled": True, "registration_requires_approval": False},
+    )
+    assert updated.status_code == 200, updated.text
     exported = client.get(f"/api/contests/{demo_contest['id']}/package", headers=admin_headers)
     assert exported.status_code == 200, exported.text
     files = zip_files(exported.content)
     assert "metadata.json" in files
     assert "tasks/001/metadata.json" in files
     assert "tasks/001/tests/002.out" in files
+    metadata = json.loads(files["metadata.json"].decode("utf-8"))
+    assert metadata["contest"]["registration_enabled"] is True
+    assert metadata["contest"]["registration_requires_approval"] is False
 
     response = client.post(
         "/api/contests/import-package",
@@ -138,9 +148,12 @@ def test_contest_package_export_import_roundtrip(
     assert imported_contest["title"] == demo_contest["title"]
     assert imported_contest["status"] == "draft"
     assert imported_contest["is_public"] is False
+    assert imported_contest["registration_enabled"] is True
+    assert imported_contest["registration_requires_approval"] is False
     imported_tasks = client.get(f"/api/contests/{report['contest_id']}/tasks", headers=admin_headers).json()
     assert len(imported_tasks) == 1
     assert imported_tasks[0]["title"] == demo_task["title"]
+    assert imported_tasks[0]["current_version_number"] == 1
     tests = client.get(f"/api/tasks/{imported_tasks[0]['id']}/tests", headers=admin_headers).json()
     assert [test["input_data"] for test in tests] == ["2 3\n", "40 2\n"]
 
