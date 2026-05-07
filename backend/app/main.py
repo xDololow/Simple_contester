@@ -94,7 +94,7 @@ from .schemas import (
 )
 
 
-PACKAGE_FORMAT_VERSION = 1
+PACKAGE_FORMAT_VERSION = 2
 PACKAGE_MAX_FILES = 500
 PACKAGE_MAX_TOTAL_BYTES = 20 * 1024 * 1024
 PACKAGE_MAX_FILE_BYTES = 5 * 1024 * 1024
@@ -1370,6 +1370,8 @@ def read_package_zip(content: bytes) -> dict[str, bytes]:
                 raise HTTPException(status_code=400, detail=f"Unsafe package path: {info.filename}")
             if info.file_size > PACKAGE_MAX_FILE_BYTES:
                 raise HTTPException(status_code=400, detail=f"Package file is too large: {safe_name}")
+            if safe_name in files:
+                raise HTTPException(status_code=400, detail=f"Duplicate package file: {safe_name}")
             total_size += info.file_size
             if total_size > PACKAGE_MAX_TOTAL_BYTES:
                 raise HTTPException(status_code=400, detail="Package archive is too large")
@@ -1414,6 +1416,35 @@ def load_package_metadata(files: dict[str, bytes], prefix: str = "") -> dict:
     return metadata
 
 
+def package_format_version(metadata: dict, prefix: str = "") -> int:
+    raw_version = metadata.get("format_version", 1)
+    try:
+        version = int(raw_version)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid package format_version in {prefix or 'package'}") from exc
+    if version < 1:
+        raise HTTPException(status_code=400, detail=f"Invalid package format_version in {prefix or 'package'}")
+    if version > PACKAGE_FORMAT_VERSION:
+        raise HTTPException(status_code=400, detail=f"Unsupported package format_version: {version}")
+    return version
+
+
+def validate_package_metadata(metadata: dict, expected_type: str, prefix: str = "") -> int:
+    version = package_format_version(metadata, prefix)
+    if version >= 2:
+        if metadata.get("format") != "simple-contester-package":
+            raise HTTPException(status_code=400, detail=f"Invalid package format in {prefix or 'package'}")
+        if metadata.get("type") != expected_type:
+            raise HTTPException(status_code=400, detail=f"Package is not a {expected_type} package")
+    return version
+
+
+def require_package_fields(data: dict, fields: list[str], context: str) -> None:
+    missing = [field for field in fields if field not in data]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Missing required {context} fields: {', '.join(missing)}")
+
+
 def parse_package_datetime(value: object, field_name: str) -> datetime:
     if value is None:
         raise HTTPException(status_code=400, detail=f"Contest {field_name} is required")
@@ -1423,6 +1454,16 @@ def parse_package_datetime(value: object, field_name: str) -> datetime:
         raise HTTPException(status_code=400, detail=f"Invalid contest {field_name}") from exc
 
 
+def disabled_tool_metadata() -> dict[str, object]:
+    return {
+        "enabled": False,
+        "type": None,
+        "source": None,
+        "language": None,
+        "entrypoint": None,
+    }
+
+
 def task_package_metadata(task: Task, tests: list[TaskTest], package_type: str = "task") -> dict[str, object]:
     return {
         "format": "simple-contester-package",
@@ -1430,6 +1471,7 @@ def task_package_metadata(task: Task, tests: list[TaskTest], package_type: str =
         "type": package_type,
         "task": {
             "title": task.title,
+            "statement_file": "statement.md",
             "input_format": task.input_format,
             "output_format": task.output_format,
             "samples": json.loads(task.samples or "[]"),
@@ -1437,6 +1479,11 @@ def task_package_metadata(task: Task, tests: list[TaskTest], package_type: str =
             "memory_limit_mb": task.memory_limit_mb,
             "points": task.points,
             "partial_scoring": task.partial_scoring,
+            "scoring_policy": "partial" if task.partial_scoring else "all_or_nothing",
+            "language_templates": {},
+            "checker": disabled_tool_metadata(),
+            "validator": disabled_tool_metadata(),
+            "interactor": disabled_tool_metadata(),
         },
         "tests": [
             {
@@ -1478,6 +1525,8 @@ def create_contest_package_zip(contest: Contest) -> bytes:
             "contest": {
                 "title": contest.title,
                 "description": contest.description,
+                "status": contest.status.value if hasattr(contest.status, "value") else contest.status,
+                "is_public": contest.is_public,
                 "registration_enabled": contest.registration_enabled,
                 "registration_requires_approval": contest.registration_requires_approval,
                 "time_mode": contest.time_mode.value if hasattr(contest.time_mode, "value") else contest.time_mode,
@@ -1489,8 +1538,8 @@ def create_contest_package_zip(contest: Contest) -> bytes:
                 "scoreboard_unfrozen": contest.scoreboard_unfrozen,
             },
             "tasks": [
-                {"dir": f"tasks/{index:03d}", "position": index - 1}
-                for index, _link in enumerate(ordered_links, start=1)
+                {"dir": f"tasks/{index:03d}", "position": index - 1, "title": link.task.title}
+                for index, link in enumerate(ordered_links, start=1)
             ],
         }
         archive.writestr("metadata.json", json.dumps(metadata, ensure_ascii=False, indent=2))
@@ -1500,9 +1549,16 @@ def create_contest_package_zip(contest: Contest) -> bytes:
 
 
 def create_task_from_package_metadata(db: Session, metadata: dict, statement: str, files: dict[str, bytes], prefix: str = "") -> tuple[Task, int]:
+    version = validate_package_metadata(metadata, "task", prefix)
     task_data = metadata.get("task")
     if not isinstance(task_data, dict):
         raise HTTPException(status_code=400, detail=f"Missing task metadata in {prefix or 'package'}")
+    if version >= 2:
+        require_package_fields(
+            task_data,
+            ["title", "input_format", "output_format", "samples", "time_limit_ms", "memory_limit_mb", "points", "partial_scoring"],
+            "task",
+        )
     title = str(task_data.get("title") or "").strip()
     if not title:
         raise HTTPException(status_code=400, detail="Task title is required")
@@ -1534,6 +1590,8 @@ def create_task_from_package_metadata(db: Session, metadata: dict, statement: st
     for item in tests_data:
         if not isinstance(item, dict):
             raise HTTPException(status_code=400, detail="Each test metadata item must be an object")
+        if version >= 2:
+            require_package_fields(item, ["name", "is_sample"], "test")
         name = str(item.get("name") or "").strip()
         safe_name = safe_archive_member_name(f"{name}.in")
         if safe_name is None or safe_name != f"{name}.in":
@@ -1565,6 +1623,7 @@ def create_task_from_package_metadata(db: Session, metadata: dict, statement: st
 def import_task_package_zip(db: Session, content: bytes) -> PackageImportReport:
     files = read_package_zip(content)
     metadata = load_package_metadata(files)
+    validate_package_metadata(metadata, "task")
     if metadata.get("type") not in {"task", None}:
         raise HTTPException(status_code=400, detail="Package is not a task package")
     statement = decode_package_text(files, "statement.md", required=False) or decode_package_text(files, "statement.txt", required=False)
@@ -1578,11 +1637,30 @@ def import_task_package_zip(db: Session, content: bytes) -> PackageImportReport:
 def import_contest_package_zip(db: Session, content: bytes) -> PackageImportReport:
     files = read_package_zip(content)
     metadata = load_package_metadata(files)
+    version = validate_package_metadata(metadata, "contest")
     if metadata.get("type") != "contest":
         raise HTTPException(status_code=400, detail="Package is not a contest package")
     contest_data = metadata.get("contest")
     if not isinstance(contest_data, dict):
         raise HTTPException(status_code=400, detail="Missing contest metadata")
+    if version >= 2:
+        require_package_fields(
+            contest_data,
+            [
+                "title",
+                "description",
+                "registration_enabled",
+                "registration_requires_approval",
+                "time_mode",
+                "participation_mode",
+                "starts_at",
+                "ends_at",
+                "individual_duration_minutes",
+                "scoreboard_freeze_at",
+                "scoreboard_unfrozen",
+            ],
+            "contest",
+        )
     title = str(contest_data.get("title") or "").strip()
     if not title:
         raise HTTPException(status_code=400, detail="Contest title is required")

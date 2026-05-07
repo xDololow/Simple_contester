@@ -211,11 +211,43 @@ tests/002.in
 tests/002.out
 ```
 
-`metadata.json` contains `format`, `format_version`, `type: "task"`, task
-limits/scoring fields, samples, and the test list with numbered names,
-`is_sample`, `points`, and `group_name` fields. `statement.txt` is also accepted on import when
-`statement.md` is absent. Contest packages use a root `metadata.json` with
-`type: "contest"` and task directories:
+`metadata.json` uses the v2 package format:
+
+```json
+{
+  "format": "simple-contester-package",
+  "format_version": 2,
+  "type": "task",
+  "task": {
+    "title": "A + B",
+    "statement_file": "statement.md",
+    "input_format": "",
+    "output_format": "",
+    "samples": [],
+    "time_limit_ms": 2000,
+    "memory_limit_mb": 256,
+    "points": 100,
+    "partial_scoring": false,
+    "scoring_policy": "all_or_nothing",
+    "language_templates": {},
+    "checker": { "enabled": false, "type": null, "source": null, "language": null, "entrypoint": null },
+    "validator": { "enabled": false, "type": null, "source": null, "language": null, "entrypoint": null },
+    "interactor": { "enabled": false, "type": null, "source": null, "language": null, "entrypoint": null }
+  },
+  "tests": [
+    { "name": "001", "is_sample": true, "points": null, "group_name": null }
+  ]
+}
+```
+
+Tests are stored as numbered `tests/NNN.in` and `tests/NNN.out` files. Test
+metadata preserves `is_sample`, nullable `points`, and nullable `group_name`.
+`statement.txt` is also accepted on import when `statement.md` is absent.
+Checker, validator, and interactor objects are future metadata only in this
+MVP; they are imported as inert data and are not executed.
+
+Contest packages use a root `metadata.json` with `type: "contest"` and task
+directories:
 
 ```text
 metadata.json
@@ -225,10 +257,22 @@ tasks/001/tests/001.in
 tasks/001/tests/001.out
 ```
 
-Contest imports intentionally create a draft, private contest by default.
-Users, teams, access lists, participant starts/deadlines, submissions, and
-results are not exported. Task imports always create new standalone tasks; if a
-task or contest with the same title already exists, it is not overwritten.
+The contest metadata preserves title, description, original status/public flag
+for reference, registration flags, time mode, participation mode, contest
+window, individual duration, scoreboard freeze timestamp, unfreeze flag, and
+attached task order. Contest imports intentionally create a draft, private
+contest by default while preserving schedule, mode, registration, freeze, and
+task order settings. Users, teams, access lists, registrations, participant
+starts/deadlines, submissions, and results are not exported. Task imports
+always create new standalone tasks; if a task or contest with the same title
+already exists, it is not overwritten.
+
+The importer accepts v1 task and contest packages for backward compatibility.
+It rejects unsupported future `format_version` values, missing required v2
+metadata fields, invalid ZIP files, duplicate archive member names, unsafe
+absolute/traversal/backslash paths, and non-UTF-8 text files. The package
+format still exports only the current task state, not full task version history
+or executable checker/validator/interactor behavior.
 
 Package archives are limited to 500 files, 20 MiB total uncompressed content,
 and 5 MiB per file. Package import rejects absolute paths, `..` traversal,
