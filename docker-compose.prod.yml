@@ -1,0 +1,25 @@
+# Production-oriented override. Use with:
+# docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# This keeps the development compose file unchanged while avoiding the frontend
+# Vite dev server and host-published MariaDB port in a reverse-proxy deployment.
+
+services:
+  mariadb:
+    restart: unless-stopped
+    ports: !reset []
+
+  backend:
+    restart: unless-stopped
+    ports: !override
+      - "127.0.0.1:${BACKEND_PORT:-8001}:8000"
+
+  frontend:
+    profiles:
+      - dev
+
+  judger:
+    restart: unless-stopped
+
+  judger-docker-sandbox:
+    restart: unless-stopped

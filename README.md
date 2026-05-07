@@ -29,11 +29,109 @@ username: admin
 password: admin
 ```
 
+## Production Deployment MVP
+
+This repository is still an MVP, but the Docker setup can be run behind a
+normal reverse proxy for a small closed installation. Keep the default
+`docker-compose.yml` for local development. For a production-style host, use the
+override file:
+
+```bash
+cp .env.example .env
+$EDITOR .env
+bash scripts/check-env.sh .env
+docker compose -f docker-compose.yml -f docker-compose.prod.yml config
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
+```
+
+First-run checklist:
+
+- Replace `JWT_SECRET`, `ADMIN_PASSWORD`, `MARIADB_PASSWORD`,
+  `MARIADB_ROOT_PASSWORD`, `BACKUP_DB_PASSWORD`, and `RESTORE_DB_PASSWORD`.
+- Set `VITE_API_BASE` to the public HTTPS API origin and `CORS_ORIGINS` to the
+  exact browser origins that should call the API.
+- Run `bash scripts/check-env.sh .env` and treat warnings as deployment blockers.
+- Start the stack, confirm `docker compose ps` shows healthy `mariadb`,
+  `backend`, and `judger`, then log in and change or rotate the bootstrap admin
+  account.
+- Create a backup with `bash scripts/backup.sh` and verify restore on a non-prod
+  Compose project before relying on the deployment.
+
+Secrets policy:
+
+- Do not commit `.env`, SQL dumps, TLS private keys, or generated JWT secrets.
+- Use unique database and admin passwords per environment.
+- Rotate `JWT_SECRET` to invalidate all existing browser tokens after a leak or
+  an admin handoff.
+- Store backups off-host and protect them like production credentials because
+  they contain users, password hashes, contest data, and submissions.
+
+Reverse proxy and TLS:
+
+- Terminate TLS in nginx, Caddy, Traefik, or a similar host-level proxy.
+- Proxy the public API origin to `127.0.0.1:${BACKEND_PORT}` when using
+  `docker-compose.prod.yml`; the override binds backend only to loopback.
+- The frontend image currently runs the Vite development server. For production,
+  serve a built frontend with your reverse proxy or another static server and
+  keep the compose `frontend` service disabled. The prod override assigns it to
+  the `dev` profile so it is skipped unless explicitly requested.
+- Keep MariaDB off the public network. The prod override removes the host
+  MariaDB port mapping.
+
+Docker profiles and compose files:
+
+- Development: `docker compose up --build` starts MariaDB, backend, Vite
+  frontend, and one subprocess-mode judger.
+- Production-style host: `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build`
+  applies restart policies, disables the frontend dev server by default, binds
+  backend to loopback, and avoids publishing MariaDB.
+- Harder judging sandbox: add `--profile docker-sandbox` and run
+  `judger-docker-sandbox` instead of the default worker. See
+  [Hard Docker Sandbox Mode](#hard-docker-sandbox-mode) before enabling it.
+
+Backups and restore:
+
+- See [Backups And Restore](#backups-and-restore) for `scripts/backup.sh`,
+  `scripts/restore.sh`, required confirmations, and off-host backup notes.
+- Do not copy the MariaDB Docker volume while MariaDB is running.
+- Stop `backend`, `judger`, and `judger-docker-sandbox` before restoring an
+  active system.
+
+Scaling judgers:
+
+- Scale internal workers with `docker compose up -d --scale judger=3` for the
+  default subprocess sandbox. See [Scale Judgers](#scale-judgers).
+- Do not publish ports on judger services. They only need database and backend
+  health dependencies.
+- For Docker sandbox mode, scale only on hosts where Docker socket access and
+  `/tmp/simple-contester-judger-work` are intentionally configured.
+
+MariaDB volume caveats:
+
+- The named volume `mariadb_data` is part of the Compose project name. Changing
+  `COMPOSE_PROJECT_NAME` creates a different volume.
+- `docker compose down -v` removes database data. Use it only for throwaway
+  environments.
+- Upgrading MariaDB major versions should be tested with a SQL dump/restore
+  path, not by blindly reusing the same volume.
+
+Healthchecks:
+
+- Compose defines healthchecks for MariaDB, backend, frontend, and judger. Use
+  `docker compose ps` and `docker compose logs -f backend judger` during rollout.
+- The backend healthcheck currently hits `/docs`; if API docs are disabled in a
+  future hardening pass, update the healthcheck to a dedicated health endpoint.
+
 ## Useful Commands
 
 ```bash
 # Validate compose after changing env vars.
 docker compose config
+docker compose -f docker-compose.yml -f docker-compose.prod.yml config
+
+# Warn about demo secrets before deployment.
+bash scripts/check-env.sh .env
 
 # Start or rebuild everything.
 docker compose up --build
@@ -53,6 +151,29 @@ docker compose down
 # Stop containers and remove MariaDB data.
 docker compose down -v
 ```
+
+## Local CI
+
+Run the same practical checks used by GitHub Actions from the repository root:
+
+```bash
+bash scripts/ci.sh
+```
+
+Individual checks can be run when iterating on one area:
+
+```bash
+bash scripts/ci.sh compose
+bash scripts/ci.sh backend
+bash scripts/ci.sh frontend
+bash scripts/ci.sh judger
+```
+
+The CI wrapper checks shell syntax, runs `git diff --check` when the directory is
+inside a Git worktree, validates `docker compose config`, compiles Python modules,
+runs focused in-process backend pytest files, builds the frontend with Bun inside
+Docker, and builds the judger image for Python/C++/JavaScript smoke tests. It
+does not publish images and does not require secrets.
 
 ## Database Migrations
 
@@ -158,21 +279,23 @@ Compose reads `.env` automatically. Start from `.env.example`; the defaults keep
 | `DATABASE_URL` | `mysql+pymysql://contestant:contestant@mariadb:3306/simple_contester` | SQLAlchemy URL used by backend and judger inside Docker. |
 | `JWT_SECRET` | `change-me-in-production` | Token signing secret. Change outside local demo. |
 | `ACCESS_TOKEN_MINUTES` | `1440` | JWT access token lifetime in minutes. Existing login response shape is unchanged. |
+| `ADMIN_USERNAME` | `admin` | Bootstrap admin username. |
+| `ADMIN_PASSWORD` | `admin` | Bootstrap admin password. |
 | `LOGIN_RATE_LIMIT_ENABLED` | `true` | Enables in-memory login throttling by username and client IP. |
 | `LOGIN_RATE_LIMIT_ATTEMPTS` | `8` | Failed login attempts allowed within the rate-limit window before lockout. |
 | `LOGIN_RATE_LIMIT_WINDOW_SECONDS` | `60` | Sliding window for failed login attempts. |
 | `LOGIN_RATE_LIMIT_LOCKOUT_SECONDS` | `300` | Temporary lockout duration after too many failed login attempts. |
-| `ADMIN_USERNAME` | `admin` | Bootstrap admin username. |
-| `ADMIN_PASSWORD` | `admin` | Bootstrap admin password. |
 | `JUDGER_ID` | `docker-judger` | Worker ID written to claimed submissions. |
+| `JUDGER_VERSION` | `local` | Version string reported in judger events/status. |
 | `JUDGER_SANDBOX_MODE` | `subprocess` | Judger execution backend: `subprocess` keeps the compatible in-container runner, `docker` runs compile/run commands in per-invocation Docker containers. |
-| `JUDGER_WORK_ROOT` | unset | Parent directory for judger workspaces. Required for Docker sandbox inside Compose so the host Docker daemon can bind-mount the same path. |
+| `JUDGER_WORK_ROOT` | `/tmp/simple-contester-judger-work` in `.env.example` | Parent directory for judger workspaces. Required for Docker sandbox so the host Docker daemon can bind-mount the same path. |
 | `JUDGER_DOCKER_IMAGE` | `simple-contester-judger:local` | Image used for per-invocation Docker sandbox containers. It must contain the language toolchains from `judger/Dockerfile`. |
 | `JUDGER_DOCKER_USER` | `judge` | Non-root user passed to `docker run --user` for sandbox containers. |
 | `JUDGER_DOCKER_CPUS` | `1` | CPU quota passed to Docker sandbox containers. |
 | `JUDGER_DOCKER_TMPFS_SIZE` | `512m` | Size of the writable tmpfs mounted at `/tmp` in Docker sandbox containers. |
 | `DOCKER_SOCK_GID` | `0` | Supplementary group added to `judger-docker-sandbox` so the non-root worker can access `/var/run/docker.sock`. Set it to `stat -c '%g' /var/run/docker.sock` when needed. |
 | `POLL_INTERVAL_SECONDS` | `1` | Judger polling interval. |
+| `JUDGER_HEARTBEAT_INTERVAL_SECONDS` | `5` | Interval for worker heartbeat/status updates. |
 | `SUBMISSION_LEASE_SECONDS` | `60` | Lease duration for a claimed submission before another worker may reclaim it. |
 | `SUBMISSION_MAX_ATTEMPTS` | `3` | Maximum claim attempts before an expired running submission is marked Internal Error. |
 | `STOP_ON_FIRST_FAILED_TEST` | `1` | Set to `0` to run all tests after a failed test. |
@@ -183,6 +306,13 @@ Compose reads `.env` automatically. Start from `.env.example`; the defaults keep
 | `COMPILE_MEMORY_LIMIT_MB` | `4096` | Compiler address-space limit. |
 | `COMPILE_PROCESS_LIMIT` | `256` | Compiler process limit. |
 | `COMPILE_FILE_SIZE_LIMIT_BYTES` | `268435456` | Maximum compiler output/artifact file size. |
+| `BACKUP_DIR` | `backups` | Directory where `scripts/backup.sh` writes SQL dumps. |
+| `MARIADB_SERVICE` | `mariadb` | Compose service name used by backup/restore scripts. |
+| `BACKUP_DB_USER` | `root` | Database user used by `scripts/backup.sh`. |
+| `BACKUP_DB_PASSWORD` | `root` | Database password used by `scripts/backup.sh`. |
+| `RESTORE_DB_USER` | `root` | Database user used by `scripts/restore.sh`. |
+| `RESTORE_DB_PASSWORD` | `root` | Database password used by `scripts/restore.sh`. |
+| `RESTORE_YES` | unset | Set to `1` to skip interactive restore confirmation. |
 
 ## Healthchecks
 

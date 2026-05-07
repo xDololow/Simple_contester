@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  compose:
+    name: Docker Compose config
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate compose and shell syntax
+        run: bash scripts/ci.sh compose
+
+  backend:
+    name: Backend syntax and tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run backend checks
+        run: bash scripts/ci.sh backend
+
+  frontend:
+    name: Frontend Bun build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run frontend build
+        run: bash scripts/ci.sh frontend
+
+  judger:
+    name: Judger syntax and smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run judger checks
+        run: bash scripts/ci.sh judger
