@@ -9,6 +9,11 @@ const STORAGE_KEY = "simple-contester-language";
 
 const dictionaries: Record<UiLanguage, Dictionary> = {
   ru: {
+    "account.account": "Аккаунт",
+    "account.changePassword": "Сменить пароль",
+    "account.currentPassword": "Текущий пароль",
+    "account.newPassword": "Новый пароль",
+    "account.passwordChanged": "Пароль изменен",
     "common.admin": "Админ",
     "common.allContests": "все соревнования",
     "common.cancel": "Отмена",
@@ -298,6 +303,11 @@ const dictionaries: Record<UiLanguage, Dictionary> = {
     "verdict.Wrong Answer": "Неверный ответ"
   },
   en: {
+    "account.account": "Account",
+    "account.changePassword": "Change password",
+    "account.currentPassword": "Current password",
+    "account.newPassword": "New password",
+    "account.passwordChanged": "Password changed",
     "common.admin": "Admin",
     "common.allContests": "all contests",
     "common.cancel": "Cancel",

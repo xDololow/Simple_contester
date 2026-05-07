@@ -22,7 +22,7 @@ os.environ.setdefault("ADMIN_PASSWORD", "admin")
 
 from app.auth import hash_password  # noqa: E402
 from app.database import Base, SessionLocal, engine  # noqa: E402
-from app.main import app, ensure_admin  # noqa: E402
+from app.main import LOGIN_ATTEMPTS, LOGIN_LOCKED_UNTIL, app, ensure_admin  # noqa: E402
 from app.models import Contest, Task, User, UserRole  # noqa: E402
 
 
@@ -78,6 +78,8 @@ def clean_database() -> Generator[None, None, None]:
     Base.metadata.create_all(bind=engine)
     with SessionLocal() as db:
         ensure_admin(db)
+    LOGIN_ATTEMPTS.clear()
+    LOGIN_LOCKED_UNTIL.clear()
     yield
     Base.metadata.drop_all(bind=engine)
     engine.dispose()

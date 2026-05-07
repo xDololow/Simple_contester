@@ -2,6 +2,7 @@ import asyncio
 import csv
 import io
 import json
+import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
@@ -68,6 +69,7 @@ from .schemas import (
     LoginIn,
     ParticipantContestOut,
     PackageImportReport,
+    PasswordChangeIn,
     ScoreboardCell,
     ScoreboardRow,
     SubmissionAdminDetailOut,
@@ -101,6 +103,8 @@ PACKAGE_MAX_FILE_BYTES = 5 * 1024 * 1024
 STALE_RUNNING_SECONDS = 10 * 60
 JUDGER_ACTIVE_SECONDS = 15
 JUDGER_OFFLINE_SECONDS = 60
+LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+LOGIN_LOCKED_UNTIL: dict[str, float] = {}
 
 app = FastAPI(title="Simple Contester")
 app.add_middleware(
@@ -819,16 +823,65 @@ def get_sse_user(token: str | None, db: Session) -> User:
     return get_user_from_token(token, db)
 
 
+def login_rate_limit_key(request: Request, username: str) -> str:
+    client_host = request.client.host if request.client else "unknown"
+    return f"{client_host}:{username.strip().lower()}"
+
+
+def check_login_rate_limit(request: Request, username: str) -> str:
+    key = login_rate_limit_key(request, username)
+    if not settings.login_rate_limit_enabled:
+        return key
+    current = time.monotonic()
+    locked_until = LOGIN_LOCKED_UNTIL.get(key)
+    if locked_until is not None:
+        if current < locked_until:
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many login attempts")
+        LOGIN_LOCKED_UNTIL.pop(key, None)
+    window_start = current - settings.login_rate_limit_window_seconds
+    LOGIN_ATTEMPTS[key] = [attempt for attempt in LOGIN_ATTEMPTS.get(key, []) if attempt >= window_start]
+    return key
+
+
+def record_login_failure(key: str) -> None:
+    if not settings.login_rate_limit_enabled:
+        return
+    current = time.monotonic()
+    attempts = LOGIN_ATTEMPTS.setdefault(key, [])
+    attempts.append(current)
+    if len(attempts) >= settings.login_rate_limit_attempts:
+        LOGIN_LOCKED_UNTIL[key] = current + settings.login_rate_limit_lockout_seconds
+        LOGIN_ATTEMPTS.pop(key, None)
+
+
+def record_login_success(key: str) -> None:
+    LOGIN_ATTEMPTS.pop(key, None)
+    LOGIN_LOCKED_UNTIL.pop(key, None)
+
+
 @app.post("/api/auth/login", response_model=TokenOut)
-def login(data: LoginIn, db: Session = Depends(get_db)) -> TokenOut:
+def login(data: LoginIn, request: Request, db: Session = Depends(get_db)) -> TokenOut:
+    rate_limit_key = check_login_rate_limit(request, data.username)
     user = db.scalar(select(User).where(User.username == data.username, User.is_active.is_(True)))
     if user is None or not verify_password(data.password, user.password_hash):
+        record_login_failure(rate_limit_key)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    record_login_success(rate_limit_key)
     return TokenOut(access_token=create_access_token(user))
 
 
 @app.get("/api/me", response_model=UserOut)
 def me(user: User = Depends(get_current_user)) -> User:
+    return user
+
+
+@app.post("/api/me/password", response_model=UserOut)
+def change_password(data: PasswordChangeIn, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> User:
+    if not verify_password(data.old_password, user.password_hash):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Current password is incorrect")
+    user.password_hash = hash_password(data.new_password)
+    db.commit()
+    db.refresh(user)
     return user
 
 

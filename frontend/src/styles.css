@@ -137,6 +137,30 @@ p {
   gap: 10px;
 }
 
+.account-menu {
+  position: relative;
+}
+
+.account-popover {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  z-index: 10;
+  width: min(340px, calc(100vw - 32px));
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid #d7e0e5;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 12px 32px rgba(31, 42, 50, 0.16);
+}
+
+.account-popover h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
 .language-switcher {
   display: inline-flex;
   overflow: hidden;

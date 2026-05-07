@@ -86,6 +86,60 @@ The FastAPI startup no longer creates tables. It still keeps the admin bootstrap
 and a small MariaDB compatibility pass for local volumes that were created
 before migrations existed.
 
+## Backups And Restore
+
+Use SQL dumps for MariaDB backups. Do not copy Docker volumes directly while
+MariaDB is running.
+
+Create a timestamped backup from the Compose `mariadb` service:
+
+```bash
+bash scripts/backup.sh
+```
+
+By default the dump is written to `backups/simple_contester_YYYYMMDDTHHMMSSZ.sql`.
+The script reads `.env` defaults when present and supports these overrides:
+
+```bash
+BACKUP_DIR=/safe/path/backups bash scripts/backup.sh
+BACKUP_DB_USER=root BACKUP_DB_PASSWORD=root bash scripts/backup.sh
+COMPOSE_PROJECT_NAME=staging bash scripts/backup.sh
+```
+
+Restore requires an explicit dump file and an interactive confirmation:
+
+```bash
+bash scripts/restore.sh backups/simple_contester_20260507T120000Z.sql
+```
+
+For non-interactive restore, set `RESTORE_YES=1`:
+
+```bash
+RESTORE_YES=1 bash scripts/restore.sh backups/simple_contester_20260507T120000Z.sql
+```
+
+Restore is destructive for the target database because the SQL dump can drop and
+replace existing tables and rows. On active systems, stop API and judger
+services first so workers do not write submissions while the database is being
+replaced:
+
+```bash
+docker compose stop backend judger judger-docker-sandbox
+bash scripts/restore.sh backups/simple_contester_20260507T120000Z.sql
+docker compose up -d backend judger
+```
+
+If you run multiple Compose projects on one host, pass the target project name
+with `COMPOSE_PROJECT_NAME`. The scripts also support `MARIADB_SERVICE` when the
+database service name is changed from the default `mariadb`.
+
+Keep backup files off the application host for real deployments. A cron entry is
+enough for a local MVP, for example:
+
+```cron
+15 2 * * * cd /srv/simple_contester && BACKUP_DIR=/srv/backups/simple_contester bash scripts/backup.sh
+```
+
 ## Configuration
 
 Compose reads `.env` automatically. Start from `.env.example`; the defaults keep `docker compose up --build` working without a local `.env`.
@@ -103,6 +157,11 @@ Compose reads `.env` automatically. Start from `.env.example`; the defaults keep
 | `CORS_ORIGINS` | `http://localhost:5173` | Comma-separated backend CORS origins. Update this when `FRONTEND_PORT` changes. |
 | `DATABASE_URL` | `mysql+pymysql://contestant:contestant@mariadb:3306/simple_contester` | SQLAlchemy URL used by backend and judger inside Docker. |
 | `JWT_SECRET` | `change-me-in-production` | Token signing secret. Change outside local demo. |
+| `ACCESS_TOKEN_MINUTES` | `1440` | JWT access token lifetime in minutes. Existing login response shape is unchanged. |
+| `LOGIN_RATE_LIMIT_ENABLED` | `true` | Enables in-memory login throttling by username and client IP. |
+| `LOGIN_RATE_LIMIT_ATTEMPTS` | `8` | Failed login attempts allowed within the rate-limit window before lockout. |
+| `LOGIN_RATE_LIMIT_WINDOW_SECONDS` | `60` | Sliding window for failed login attempts. |
+| `LOGIN_RATE_LIMIT_LOCKOUT_SECONDS` | `300` | Temporary lockout duration after too many failed login attempts. |
 | `ADMIN_USERNAME` | `admin` | Bootstrap admin username. |
 | `ADMIN_PASSWORD` | `admin` | Bootstrap admin password. |
 | `JUDGER_ID` | `docker-judger` | Worker ID written to claimed submissions. |
@@ -146,6 +205,22 @@ contest access checks as the normal contest endpoints, and streams a compact
 `contest` event whenever submission verdicts/scores change. If the stream is
 unavailable or drops, the contest view falls back to slower polling through
 `GET /api/contests/{contest_id}/live-snapshot`.
+
+## Auth Security Notes
+
+Simple Contester is built for closed local installations without email. Users can
+change their own password from the account menu, and admins can still reset a
+user password through `PATCH /api/users/{id}` with a `password` field. Password
+recovery by email is intentionally not implemented.
+
+JWT access tokens are stateless and expire according to `ACCESS_TOKEN_MINUTES`.
+There is no server-side session revocation list in this MVP, so logout only
+removes the token from the browser. Rotate `JWT_SECRET` to invalidate all
+existing tokens for an installation.
+
+Login throttling is intentionally in-memory. It is useful for one local backend
+process, but it is not shared across multiple backend replicas or hosts; use a
+distributed store or reverse-proxy rate limiting for a distributed deployment.
 
 ## Scoring
 

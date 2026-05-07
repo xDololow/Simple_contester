@@ -6,6 +6,10 @@ class Settings(BaseSettings):
     jwt_secret: str = "dev-secret"
     jwt_algorithm: str = "HS256"
     access_token_minutes: int = 60 * 24
+    login_rate_limit_enabled: bool = True
+    login_rate_limit_attempts: int = 8
+    login_rate_limit_window_seconds: int = 60
+    login_rate_limit_lockout_seconds: int = 300
     admin_username: str = "admin"
     admin_password: str = "admin"
     cors_origins: str = "http://localhost:5173"

@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import { createApiClient } from "../api/client";
-import { LanguageSwitcher } from "../components/shared";
+import { FlashMessage, LanguageSwitcher } from "../components/shared";
 import { useI18n } from "../i18n";
-import type { User } from "../types";
+import type { ApiClient, Flash, User } from "../types";
+import { emptyFlash, errorText } from "../utils/format";
 import { Login } from "./Login";
 import { Workspace } from "./Workspace";
 
@@ -51,10 +52,63 @@ export function App() {
         </div>
         <div className="topbar-actions">
           <LanguageSwitcher />
+          <AccountPanel api={api} />
           <button onClick={clearToken}>{t("login.logout")}</button>
         </div>
       </header>
       <Workspace api={api} me={me} token={token} />
     </main>
+  );
+}
+
+function AccountPanel({ api }: { api: ApiClient }) {
+  const { t } = useI18n();
+  const [open, setOpen] = useState(false);
+  const [oldPassword, setOldPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [flash, setFlash] = useState<Flash>(emptyFlash);
+  const [saving, setSaving] = useState(false);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setSaving(true);
+    setFlash(emptyFlash);
+    try {
+      await api<User>("/api/me/password", {
+        method: "POST",
+        body: JSON.stringify({ old_password: oldPassword, new_password: newPassword })
+      });
+      setOldPassword("");
+      setNewPassword("");
+      setFlash({ kind: "ok", text: t("account.passwordChanged") });
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="account-menu">
+      <button type="button" onClick={() => setOpen((value) => !value)}>{t("account.account")}</button>
+      {open && (
+        <form className="account-popover" onSubmit={submit}>
+          <h3>{t("account.changePassword")}</h3>
+          <label>
+            {t("account.currentPassword")}
+            <input type="password" value={oldPassword} onChange={(event) => setOldPassword(event.target.value)} required />
+          </label>
+          <label>
+            {t("account.newPassword")}
+            <input type="password" minLength={3} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required />
+          </label>
+          <FlashMessage flash={flash} />
+          <div className="row-actions">
+            <button type="submit" disabled={saving}>{saving ? t("common.save") : t("account.changePassword")}</button>
+            <button type="button" onClick={() => setOpen(false)}>{t("common.cancel")}</button>
+          </div>
+        </form>
+      )}
+    </div>
   );
 }
