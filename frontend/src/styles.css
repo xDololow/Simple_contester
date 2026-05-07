@@ -306,12 +306,57 @@ p {
 
 .admin-shell {
   display: grid;
-  gap: 0;
+  grid-template-columns: minmax(180px, 220px) minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.admin-content {
+  min-width: 0;
+}
+
+.admin-nav {
+  position: sticky;
+  top: 16px;
+  display: grid;
+  gap: 12px;
+  align-self: start;
+  border: 1px solid #d7e0e5;
+  border-radius: 8px;
+  padding: 12px;
+  background: #ffffff;
+}
+
+.admin-nav-group {
+  display: grid;
+  gap: 7px;
+}
+
+.admin-nav-group > span {
+  color: #64737e;
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.admin-nav .tabs {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+  margin-bottom: 0;
+}
+
+.admin-nav .tabs button {
+  width: 100%;
+  padding: 7px 9px;
+  text-align: left;
+  font-size: 13px;
 }
 
 .form-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
   gap: 10px;
   align-items: end;
   margin-bottom: 12px;
@@ -473,6 +518,18 @@ p {
 .table-wrap {
   width: 100%;
   overflow: auto;
+}
+
+.table-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 10px;
+  margin: 4px 0 12px;
+}
+
+.table-search {
+  width: min(440px, 100%);
 }
 
 .row-actions {
@@ -685,6 +742,91 @@ p {
   overflow: auto;
 }
 
+.task-detail {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.task-statement,
+.summary-card {
+  border: 1px solid #d7e0e5;
+  border-radius: 8px;
+  background: #fbfcfd;
+}
+
+.task-statement {
+  padding: 14px;
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.task-statement-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.task-statement h3 {
+  margin-bottom: 4px;
+}
+
+.statement-text {
+  max-height: 340px;
+  overflow: auto;
+  white-space: pre-wrap;
+  line-height: 1.5;
+}
+
+.task-format-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.task-format-grid div {
+  min-width: 0;
+  border-top: 1px solid #e1e7eb;
+  padding-top: 10px;
+}
+
+.task-format-grid p {
+  margin: 6px 0 0;
+  color: #52616c;
+  white-space: pre-wrap;
+}
+
+.contest-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.summary-card {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  min-width: 0;
+}
+
+.summary-card span,
+.summary-card small {
+  color: #64737e;
+  font-size: 13px;
+}
+
+.summary-card strong {
+  overflow-wrap: anywhere;
+}
+
+.summary-card.warn {
+  border-color: #efcf9a;
+  background: #fff8ea;
+}
+
 .overview-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
@@ -714,10 +856,25 @@ p {
   display: grid;
   gap: 10px;
   min-width: 0;
+  border: 1px solid #d7e0e5;
+  border-radius: 8px;
+  padding: 14px;
+  background: #ffffff;
 }
 
-.submit h3 {
+.submit .section-title {
   margin-bottom: 0;
+}
+
+.submit-code {
+  min-height: 240px;
+}
+
+.submit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
 }
 
 .limits {
@@ -935,6 +1092,18 @@ pre,
 }
 
 @media (max-width: 1100px) {
+  .admin-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-nav {
+    position: static;
+  }
+
+  .admin-nav .tabs {
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  }
+
   .form-grid,
   .form-grid.wide,
   .access-grid,
@@ -942,7 +1111,9 @@ pre,
   .clarification-form,
   .contest-grid,
   .contest-workspace,
+  .contest-summary-grid,
   .status-grid,
+  .task-format-grid,
   .split {
     grid-template-columns: 1fr;
   }
@@ -981,5 +1152,29 @@ pre,
 
   .overview-grid {
     grid-template-columns: 1fr;
+  }
+
+  .task-statement-head {
+    display: grid;
+  }
+
+  .topbar,
+  .section-title,
+  .table-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .topbar {
+    height: auto;
+    padding: 14px 16px;
+  }
+
+  .content {
+    padding: 12px;
+  }
+
+  .panel {
+    padding: 12px;
   }
 }

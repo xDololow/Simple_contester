@@ -1,44 +1,89 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { API_BASE } from "../../api/client";
 import { FlashMessage, Header, SubmissionDetailView } from "../../components/shared";
 import { useI18n } from "../../i18n";
 import type { AdminStats, ApiClient, Clarification, ClarificationStatus, ClarificationVisibility, Contest, ContestRegistration, ContestStatus, Flash, ImportReport, JudgerEvent, JudgerWorker, PackageImportReport, ParticipationMode, Role, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
 import { emptyFlash, errorText, formatDate, formatScore, fromLocalInputValue, toLocalInputValue, verdictClass } from "../../utils/format";
 
+type AdminTab = "status" | "users" | "import" | "teams" | "contests" | "tasks" | "packages" | "tests" | "submissions" | "clarifications";
+
 export function AdminDashboard({ api, token, reloadContests }: { api: ApiClient; token: string; reloadContests: () => void }) {
   const { t } = useI18n();
-  const [tab, setTab] = useState<"status" | "users" | "import" | "teams" | "contests" | "tasks" | "packages" | "tests" | "submissions" | "clarifications">("status");
+  const [tab, setTab] = useState<AdminTab>("status");
 
   return (
     <div className="admin-shell">
-      <nav className="tabs">
-        {[
-          ["status", t("tab.status")],
-          ["users", t("tab.users")],
-          ["import", t("tab.import")],
-          ["teams", t("tab.teams")],
-          ["contests", t("tab.contests")],
-          ["tasks", t("tab.tasks")],
-          ["packages", t("tab.packages")],
-          ["tests", t("tab.tests")],
-          ["submissions", t("tab.submissions")],
-          ["clarifications", t("tab.clarifications")]
-        ].map(([id, label]) => (
-          <button key={id} className={tab === id ? "active" : ""} onClick={() => setTab(id as typeof tab)}>
-            {label}
-          </button>
-        ))}
-      </nav>
-      {tab === "status" && <StatusAdmin api={api} />}
-      {tab === "users" && <UsersAdmin api={api} />}
-      {tab === "import" && <ImportUsersAdmin token={token} />}
-      {tab === "teams" && <TeamsAdmin api={api} />}
-      {tab === "contests" && <ContestsAdmin api={api} onChanged={reloadContests} />}
-      {tab === "tasks" && <TasksAdmin api={api} />}
-      {tab === "packages" && <PackagesAdmin api={api} token={token} onChanged={reloadContests} />}
-      {tab === "tests" && <TestsAdmin api={api} />}
-      {tab === "submissions" && <SubmissionsAdmin api={api} />}
-      {tab === "clarifications" && <ClarificationsAdmin api={api} />}
+      <AdminNav activeTab={tab} onChange={setTab} />
+      <div className="admin-content">
+        {tab === "status" && <StatusAdmin api={api} />}
+        {tab === "users" && <UsersAdmin api={api} />}
+        {tab === "import" && <ImportUsersAdmin token={token} />}
+        {tab === "teams" && <TeamsAdmin api={api} />}
+        {tab === "contests" && <ContestsAdmin api={api} onChanged={reloadContests} />}
+        {tab === "tasks" && <TasksAdmin api={api} />}
+        {tab === "packages" && <PackagesAdmin api={api} token={token} onChanged={reloadContests} />}
+        {tab === "tests" && <TestsAdmin api={api} />}
+        {tab === "submissions" && <SubmissionsAdmin api={api} />}
+        {tab === "clarifications" && <ClarificationsAdmin api={api} />}
+      </div>
+    </div>
+  );
+}
+
+function AdminNav({ activeTab, onChange }: { activeTab: AdminTab; onChange: (tab: AdminTab) => void }) {
+  const { t } = useI18n();
+  const groups: Array<{ label: string; tabs: AdminTab[] }> = [
+    { label: t("admin.nav.monitoring"), tabs: ["status", "submissions"] },
+    { label: t("admin.nav.accounts"), tabs: ["users", "import", "teams"] },
+    { label: t("admin.nav.content"), tabs: ["contests", "tasks", "packages", "tests"] },
+    { label: t("admin.nav.support"), tabs: ["clarifications"] }
+  ];
+  return (
+    <nav className="admin-nav" aria-label={t("nav.adminWorkspace")}>
+      {groups.map((group) => (
+        <div className="admin-nav-group" key={group.label}>
+          <span>{group.label}</span>
+          <div className="tabs">
+            {group.tabs.map((id) => (
+              <button key={id} className={activeTab === id ? "active" : ""} onClick={() => onChange(id)} type="button">
+                {t(`tab.${id}`)}
+              </button>
+            ))}
+          </div>
+        </div>
+      ))}
+    </nav>
+  );
+}
+
+function matchesSearch(values: Array<string | number | boolean | null | undefined>, query: string) {
+  const normalized = query.trim().toLowerCase();
+  if (!normalized) return true;
+  return values.some((value) => String(value ?? "").toLowerCase().includes(normalized));
+}
+
+function TableToolbar({
+  query,
+  onQueryChange,
+  total,
+  filtered,
+  placeholder
+}: {
+  query: string;
+  onQueryChange: (query: string) => void;
+  total: number;
+  filtered: number;
+  placeholder: string;
+}) {
+  const { t } = useI18n();
+  return (
+    <div className="table-toolbar">
+      <label className="table-search">
+        {t("common.search")}
+        <input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder={placeholder} />
+      </label>
+      <span className="muted">{t("common.showing", { filtered, total })}</span>
+      {query && <button type="button" className="small" onClick={() => onQueryChange("")}>{t("common.clear")}</button>}
     </div>
   );
 }
@@ -395,7 +440,12 @@ function UsersAdmin({ api }: { api: ApiClient }) {
   const { t } = useI18n();
   const [users, setUsers] = useState<User[]>([]);
   const [flash, setFlash] = useState<Flash>(emptyFlash);
+  const [query, setQuery] = useState("");
   const [form, setForm] = useState({ username: "", password: "", display_name: "", role: "participant" as Role });
+  const filteredUsers = useMemo(
+    () => users.filter((user) => matchesSearch([user.id, user.username, user.display_name, user.role, user.is_active], query)),
+    [users, query]
+  );
 
   const load = useCallback(() => api<User[]>("/api/users").then(setUsers), [api]);
 
@@ -451,10 +501,14 @@ function UsersAdmin({ api }: { api: ApiClient }) {
         <button type="submit">{t("common.create")}</button>
       </form>
       <FlashMessage flash={flash} />
+      <TableToolbar query={query} onQueryChange={setQuery} total={users.length} filtered={filteredUsers.length} placeholder={t("user.search")} />
       <div className="table-wrap">
         <table>
           <thead><tr><th>ID</th><th>{t("table.username")}</th><th>{t("table.name")}</th><th>{t("table.role")}</th><th>{t("table.active")}</th><th>{t("table.created")}</th><th></th></tr></thead>
-          <tbody>{users.map((user) => <UserRow key={user.id} user={user} onSave={updateUser} onDelete={deleteUser} />)}</tbody>
+          <tbody>
+            {filteredUsers.map((user) => <UserRow key={user.id} user={user} onSave={updateUser} onDelete={deleteUser} />)}
+            {!filteredUsers.length && <tr><td colSpan={7} className="muted">{t("empty.noMatchesText")}</td></tr>}
+          </tbody>
         </table>
       </div>
     </section>
@@ -635,7 +689,12 @@ function TeamsAdmin({ api }: { api: ApiClient }) {
   const [teams, setTeams] = useState<Team[]>([]);
   const [users, setUsers] = useState<User[]>([]);
   const [flash, setFlash] = useState<Flash>(emptyFlash);
+  const [query, setQuery] = useState("");
   const [form, setForm] = useState({ name: "", user_ids: [] as number[] });
+  const filteredTeams = useMemo(
+    () => teams.filter((team) => matchesSearch([team.id, team.name, team.member_ids.join(" "), formatUserIds(team.member_ids, users)], query)),
+    [teams, users, query]
+  );
 
   const load = useCallback(async () => {
     const [nextTeams, nextUsers] = await Promise.all([api<Team[]>("/api/teams"), api<User[]>("/api/users")]);
@@ -689,10 +748,14 @@ function TeamsAdmin({ api }: { api: ApiClient }) {
         <button type="submit">{t("common.create")}</button>
       </form>
       <FlashMessage flash={flash} />
+      <TableToolbar query={query} onQueryChange={setQuery} total={teams.length} filtered={filteredTeams.length} placeholder={t("team.search")} />
       <div className="table-wrap">
         <table>
           <thead><tr><th>{t("table.id")}</th><th>{t("table.name")}</th><th>{t("table.members")}</th><th>{t("table.created")}</th><th></th></tr></thead>
-          <tbody>{teams.map((team) => <TeamRow key={team.id} team={team} users={users.filter((user) => user.role === "participant")} onSave={saveTeam} onDelete={deleteTeam} />)}</tbody>
+          <tbody>
+            {filteredTeams.map((team) => <TeamRow key={team.id} team={team} users={users.filter((user) => user.role === "participant")} onSave={saveTeam} onDelete={deleteTeam} />)}
+            {!filteredTeams.length && <tr><td colSpan={5} className="muted">{t("empty.noMatchesText")}</td></tr>}
+          </tbody>
         </table>
       </div>
     </section>
@@ -740,6 +803,7 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
   const [registrations, setRegistrations] = useState<ContestRegistration[]>([]);
   const [registrationFilter, setRegistrationFilter] = useState<"pending" | "all">("pending");
   const [flash, setFlash] = useState<Flash>(emptyFlash);
+  const [query, setQuery] = useState("");
   const now = new Date();
   const later = new Date(Date.now() + 3 * 60 * 60_000);
   const [form, setForm] = useState({
@@ -760,6 +824,22 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
     participant_ids: [] as number[],
     team_ids: [] as number[]
   });
+  const filteredContests = useMemo(
+    () => contests.filter((contest) => matchesSearch([
+      contest.id,
+      contest.title,
+      contest.description,
+      contest.status,
+      contest.is_public ? t("contest.public") : t("contest.private"),
+      contest.registration_enabled ? t("registration.enabledShort") : "",
+      contest.participation_mode,
+      contest.time_mode,
+      contestTaskIds[contest.id]?.join(" "),
+      formatUserIds(contestParticipantIds[contest.id] ?? [], users),
+      formatTeamIds(contestTeamIds[contest.id] ?? [], teams)
+    ], query)),
+    [contests, contestTaskIds, contestParticipantIds, contestTeamIds, users, teams, query, t]
+  );
 
   const load = useCallback(async () => {
     const [nextContests, nextTasks, nextUsers, nextTeams, nextRegistrations] = await Promise.all([api<Contest[]>("/api/contests"), api<Task[]>("/api/tasks"), api<User[]>("/api/users"), api<Team[]>("/api/teams"), api<ContestRegistration[]>(`/api/admin/contest-registrations?status=${registrationFilter}`)]);
@@ -947,10 +1027,14 @@ function ContestsAdmin({ api, onChanged }: { api: ApiClient; onChanged: () => vo
       </form>
       <FlashMessage flash={flash} />
       <PendingRegistrations registrations={registrations} filter={registrationFilter} onFilterChange={setRegistrationFilter} onDecide={decideRegistration} />
+      <TableToolbar query={query} onQueryChange={setQuery} total={contests.length} filtered={filteredContests.length} placeholder={t("contest.search")} />
       <div className="table-wrap">
         <table>
           <thead><tr><th>{t("table.id")}</th><th>{t("table.title")}</th><th>{t("table.status")}</th><th>{t("table.access")}</th><th>{t("contest.participationMode")}</th><th>{t("table.mode")}</th><th>{t("table.starts")}</th><th>{t("table.ends")}</th><th>{t("table.minutes")}</th><th>{t("scoreboard.freezeAt")}</th><th>{t("scoreboard.unfrozenShort")}</th><th>{t("table.tasks")}</th><th>{t("table.participants")}</th><th>{t("table.teams")}</th><th></th></tr></thead>
-          <tbody>{contests.map((contest) => <ContestRow key={contest.id} contest={contest} tasks={tasks} users={users} teams={teams} taskIds={contestTaskIds[contest.id] ?? []} participantIds={contestParticipantIds[contest.id] ?? []} teamIds={contestTeamIds[contest.id] ?? []} onSave={saveContest} onSaveTasks={saveContestTasks} onSaveParticipants={saveContestParticipants} onSaveTeams={saveContestTeams} onDelete={deleteContest} />)}</tbody>
+          <tbody>
+            {filteredContests.map((contest) => <ContestRow key={contest.id} contest={contest} tasks={tasks} users={users} teams={teams} taskIds={contestTaskIds[contest.id] ?? []} participantIds={contestParticipantIds[contest.id] ?? []} teamIds={contestTeamIds[contest.id] ?? []} onSave={saveContest} onSaveTasks={saveContestTasks} onSaveParticipants={saveContestParticipants} onSaveTeams={saveContestTeams} onDelete={deleteContest} />)}
+            {!filteredContests.length && <tr><td colSpan={15} className="muted">{t("empty.noMatchesText")}</td></tr>}
+          </tbody>
         </table>
       </div>
     </section>
@@ -1167,6 +1251,7 @@ function TasksAdmin({ api }: { api: ApiClient }) {
   const { t } = useI18n();
   const [tasks, setTasks] = useState<Task[]>([]);
   const [flash, setFlash] = useState<Flash>(emptyFlash);
+  const [query, setQuery] = useState("");
   const [previewMode, setPreviewMode] = useState<"edit" | "preview">("edit");
   const [form, setForm] = useState({
     title: "",
@@ -1182,6 +1267,22 @@ function TasksAdmin({ api }: { api: ApiClient }) {
     test_output: "",
     test_is_sample: true
   });
+  const filteredTasks = useMemo(
+    () => tasks.filter((task) => matchesSearch([
+      task.id,
+      task.title,
+      task.statement,
+      task.input_format,
+      task.output_format,
+      task.contest_ids.join(" "),
+      task.current_version_number,
+      task.time_limit_ms,
+      task.memory_limit_mb,
+      task.points,
+      task.test_count
+    ], query)),
+    [tasks, query]
+  );
 
   const load = useCallback(async () => {
     setTasks(await api<Task[]>("/api/tasks"));
@@ -1282,10 +1383,14 @@ function TasksAdmin({ api }: { api: ApiClient }) {
         <button type="submit">{t("common.create")}</button>
       </form>
       <FlashMessage flash={flash} />
+      <TableToolbar query={query} onQueryChange={setQuery} total={tasks.length} filtered={filteredTasks.length} placeholder={t("task.search")} />
       <div className="table-wrap">
         <table>
           <thead><tr><th>{t("table.id")}</th><th>{t("table.title")}</th><th>{t("task.version")}</th><th>{t("table.limits")}</th><th>{t("table.points")}</th><th>{t("table.tests")}</th><th></th></tr></thead>
-          <tbody>{tasks.map((task) => <TaskRow key={task.id} task={task} onSave={saveTask} onDelete={deleteTask} />)}</tbody>
+          <tbody>
+            {filteredTasks.map((task) => <TaskRow key={task.id} task={task} onSave={saveTask} onDelete={deleteTask} />)}
+            {!filteredTasks.length && <tr><td colSpan={7} className="muted">{t("empty.noMatchesText")}</td></tr>}
+          </tbody>
         </table>
       </div>
     </section>
@@ -1739,6 +1844,22 @@ function SubmissionsAdmin({ api }: { api: ApiClient }) {
   const [selectedSubmissionId, setSelectedSubmissionId] = useState<number | null>(null);
   const [detail, setDetail] = useState<SubmissionDetail | null>(null);
   const [flash, setFlash] = useState<Flash>(emptyFlash);
+  const [query, setQuery] = useState("");
+  const filteredSubmissions = useMemo(
+    () => submissions.filter((submission) => matchesSearch([
+      submission.id,
+      submission.contest_id,
+      submission.task_id,
+      submission.task_version_id,
+      submission.user_id,
+      submission.team_id,
+      submission.language,
+      submission.verdict,
+      t(`verdict.${submission.verdict}`),
+      submission.score
+    ], query)),
+    [submissions, query, t]
+  );
 
   const loadContests = useCallback(() => api<Contest[]>("/api/contests").then(setContests), [api]);
   const loadSubmissions = useCallback(async () => {
@@ -1773,17 +1894,19 @@ function SubmissionsAdmin({ api }: { api: ApiClient }) {
         </select>
       </label>
       <FlashMessage flash={flash} />
+      <TableToolbar query={query} onQueryChange={setQuery} total={submissions.length} filtered={filteredSubmissions.length} placeholder={t("submission.search")} />
       <div className="split">
         <div className="table-wrap">
           <table>
             <thead><tr><th>{t("table.id")}</th><th>{t("table.contest")}</th><th>{t("table.task")}</th><th>{t("table.user")}</th><th>{t("table.lang")}</th><th>{t("table.verdict")}</th><th>{t("table.score")}</th><th>{t("table.created")}</th></tr></thead>
             <tbody>
-              {submissions.map((submission) => (
+              {filteredSubmissions.map((submission) => (
                 <tr key={submission.id} className={submission.id === selectedSubmissionId ? "selected" : ""} onClick={() => setSelectedSubmissionId(submission.id)}>
                   <td>#{submission.id}</td><td>{submission.contest_id}</td><td>{submission.task_id}</td><td>{submission.user_id}</td><td>{submission.language}</td>
                   <td><span className={verdictClass(submission.verdict)}>{t(`verdict.${submission.verdict}`)}</span></td><td>{formatScore(submission.score)}</td><td>{formatDate(submission.created_at)}</td>
                 </tr>
               ))}
+              {!filteredSubmissions.length && <tr><td colSpan={8} className="muted">{t("empty.noMatchesText")}</td></tr>}
             </tbody>
           </table>
         </div>

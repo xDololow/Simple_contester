@@ -23,8 +23,12 @@ const SUBMISSION_LANGUAGES: Array<{ value: Language; label: string }> = [
   { value: "lua", label: "Lua" }
 ];
 
+const SUBMIT_DRAFT_PREFIX = "simple-contester-submit-draft:v1";
+const SUBMIT_LANGUAGE_PREFIX = "simple-contester-submit-language:v1";
+
 export function ContestView({ api, contest, me, token }: { api: ApiClient; contest: Contest; me: User; token: string }) {
   const { t } = useI18n();
+  const [now, setNow] = useState(() => Date.now());
   const [tasks, setTasks] = useState<Task[]>([]);
   const [submissions, setSubmissions] = useState<Submission[]>([]);
   const [scoreboard, setScoreboard] = useState<ScoreboardRow[]>([]);
@@ -44,6 +48,7 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
   const [detail, setDetail] = useState<SubmissionDetail | null>(null);
   const [flash, setFlash] = useState<Flash>(emptyFlash);
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) || tasks[0] || null;
+  const myScore = scoreboard.find((row) => contest.participation_mode !== "team" && row.user_id === me.id)?.score ?? null;
 
   const refreshRegistration = useCallback(async () => {
     if (!contest.registration_enabled || me.role === "admin") {
@@ -78,6 +83,11 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
     setScoreboard(live.scoreboard);
     setScoreboardFrozen(Boolean(live.scoreboard_frozen));
   }, [api, contest.id]);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => setNow(Date.now()), 30000);
+    return () => window.clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -211,11 +221,23 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
       {tab === "overview" && (
         <section className="panel">
           <Header title={t("tab.overview")} subtitle={t("contest.summary")} />
+          <div className="contest-summary-grid">
+            <SummaryCard label={t("overview.remaining")} value={formatRemaining(contest, now, t)} detail={t("overview.deadline", { time: formatDate(contest.ends_at) })} />
+            <SummaryCard label={t("overview.schedule")} value={formatContestWindow(contest, t)} detail={`${formatDate(contest.starts_at)} - ${formatDate(contest.ends_at)}`} />
+            <SummaryCard
+              label={t("overview.freeze")}
+              value={formatFreezeStatus(contest, scoreboardFrozen, now, t)}
+              detail={contest.scoreboard_freeze_at ? t("overview.freezeAt", { time: formatDate(contest.scoreboard_freeze_at) }) : t("overview.freezeNone")}
+              warn={scoreboardFrozen}
+            />
+            <SummaryCard label={t("overview.registration")} value={formatRegistrationStatus(contest, registration, me, t)} detail={formatAccessStatus(contest, hasContestAccess, t)} />
+          </div>
           <div className="overview-grid">
             <div className="stat"><strong>{tasks.length}</strong><span>{t("tab.tasks")}</span></div>
             <div className="stat"><strong>{submissions.length}</strong><span>{t("tab.submissions")}</span></div>
             <div className="stat"><strong>{scoreboard.length}</strong><span>{t("title.scoreboard")}</span></div>
             <div className="stat"><strong>{clarifications.length}</strong><span>{t("tab.clarifications")}</span></div>
+            {myScore !== null && <div className="stat"><strong>{formatScore(myScore)}</strong><span>{t("overview.myScore")}</span></div>}
           </div>
         </section>
       )}
@@ -232,7 +254,12 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
                   </button>
                 ))}
               </div>
-              {selectedTask && <SubmitBox api={api} contestId={contest.id} task={selectedTask} onSubmitted={refreshLiveData} />}
+              {selectedTask && (
+                <div className="task-detail">
+                  <TaskStatement task={selectedTask} />
+                  <SubmitBox api={api} contestId={contest.id} task={selectedTask} onSubmitted={refreshLiveData} />
+                </div>
+              )}
             </div>
           ) : (
             <EmptyState title={t("empty.tasksTitle")} text={t("empty.tasksText")} />
@@ -322,11 +349,65 @@ function EmptyState({ title, text }: { title: string; text: string }) {
   );
 }
 
+function SummaryCard({ label, value, detail, warn = false }: { label: string; value: string; detail: string; warn?: boolean }) {
+  return (
+    <div className={warn ? "summary-card warn" : "summary-card"}>
+      <span>{label}</span>
+      <strong>{value}</strong>
+      <small>{detail}</small>
+    </div>
+  );
+}
+
+function TaskStatement({ task }: { task: Task }) {
+  const { t } = useI18n();
+  return (
+    <article className="task-statement">
+      <div className="task-statement-head">
+        <div>
+          <h3>{task.title}</h3>
+          <span className="limits">{task.time_limit_ms} ms · {task.memory_limit_mb} MB · {formatScore(task.points)} {t("common.points")}</span>
+        </div>
+        {task.partial_scoring && <span className="pill">{t("task.partialScoring")}</span>}
+      </div>
+      <div className="statement-text">{task.statement || t("task.noStatement")}</div>
+      <div className="task-format-grid">
+        <div>
+          <strong>{t("task.inputFormat")}</strong>
+          <p>{task.input_format || t("common.empty")}</p>
+        </div>
+        <div>
+          <strong>{t("task.outputFormat")}</strong>
+          <p>{task.output_format || t("common.empty")}</p>
+        </div>
+      </div>
+    </article>
+  );
+}
+
 function SubmitBox({ api, contestId, task, onSubmitted }: { api: ApiClient; contestId: number; task: Task; onSubmitted: () => void }) {
   const { t } = useI18n();
-  const [language, setLanguage] = useState<Language>("python");
-  const [sourceCode, setSourceCode] = useState("print(input())");
+  const [language, setLanguageState] = useState<Language>(() => readStoredLanguage(contestId, task.id));
+  const [sourceCode, setSourceCode] = useState(() => readDraft(contestId, task.id, readStoredLanguage(contestId, task.id)));
   const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    const nextLanguage = readStoredLanguage(contestId, task.id);
+    setLanguageState(nextLanguage);
+    setSourceCode(readDraft(contestId, task.id, nextLanguage));
+    setMessage("");
+  }, [contestId, task.id]);
+
+  function setLanguage(nextLanguage: Language) {
+    setLanguageState(nextLanguage);
+    writeStoredLanguage(contestId, task.id, nextLanguage);
+    setSourceCode(readDraft(contestId, task.id, nextLanguage));
+  }
+
+  function updateSourceCode(nextSourceCode: string) {
+    setSourceCode(nextSourceCode);
+    writeDraft(contestId, task.id, language, nextSourceCode);
+  }
 
   async function submit() {
     setMessage("");
@@ -343,20 +424,104 @@ function SubmitBox({ api, contestId, task, onSubmitted }: { api: ApiClient; cont
   }
 
   return (
-    <div className="submit">
-      <h3>{task.title}</h3>
-      <p>{task.statement}</p>
-      <div className="limits">{task.time_limit_ms} ms · {task.memory_limit_mb} MB · {formatScore(task.points)} {t("common.points")}</div>
-      <select value={language} onChange={(event) => setLanguage(event.target.value as Language)}>
-        {SUBMISSION_LANGUAGES.map((item) => (
-          <option key={item.value} value={item.value}>{item.label}</option>
-        ))}
-      </select>
-      <textarea className="code" value={sourceCode} onChange={(event) => setSourceCode(event.target.value)} />
-      <button onClick={submit}>{t("submission.submit")}</button>
-      {message && <span className="muted">{message}</span>}
-    </div>
+    <form className="submit" onSubmit={(event) => { event.preventDefault(); submit(); }}>
+      <Header title={t("submission.solutionFor", { task: task.title })} subtitle={t("submission.draftSaved")} />
+      <label>{t("table.lang")}
+        <select value={language} onChange={(event) => setLanguage(event.target.value as Language)}>
+          {SUBMISSION_LANGUAGES.map((item) => (
+            <option key={item.value} value={item.value}>{item.label}</option>
+          ))}
+        </select>
+      </label>
+      <label>{t("submission.sourceCode")}
+        <textarea className="code submit-code" value={sourceCode} onChange={(event) => updateSourceCode(event.target.value)} />
+      </label>
+      <div className="submit-actions">
+        <button type="submit" disabled={!sourceCode.trim()}>{t("submission.submit")}</button>
+        {message && <span className="muted">{message}</span>}
+      </div>
+    </form>
   );
+}
+
+function readStoredLanguage(contestId: number, taskId: number): Language {
+  if (typeof localStorage === "undefined") return "python";
+  const stored = localStorage.getItem(`${SUBMIT_LANGUAGE_PREFIX}:${contestId}:${taskId}`) as Language | null;
+  return SUBMISSION_LANGUAGES.some((item) => item.value === stored) ? stored : "python";
+}
+
+function writeStoredLanguage(contestId: number, taskId: number, language: Language) {
+  localStorage.setItem(`${SUBMIT_LANGUAGE_PREFIX}:${contestId}:${taskId}`, language);
+}
+
+function readDraft(contestId: number, taskId: number, language: Language) {
+  if (typeof localStorage === "undefined") return defaultSource(language);
+  return localStorage.getItem(draftKey(contestId, taskId, language)) ?? defaultSource(language);
+}
+
+function writeDraft(contestId: number, taskId: number, language: Language, sourceCode: string) {
+  localStorage.setItem(draftKey(contestId, taskId, language), sourceCode);
+}
+
+function draftKey(contestId: number, taskId: number, language: Language) {
+  return `${SUBMIT_DRAFT_PREFIX}:${contestId}:${taskId}:${language}`;
+}
+
+function defaultSource(language: Language) {
+  if (language === "javascript") return "const fs = require('fs');\nconst input = fs.readFileSync(0, 'utf8').trim();\nconsole.log(input);";
+  if (language === "typescript") return "const fs = require('fs');\nconst input = fs.readFileSync(0, 'utf8').trim();\nconsole.log(input);";
+  if (language === "cpp17" || language === "cpp20") return "#include <bits/stdc++.h>\nusing namespace std;\n\nint main() {\n  ios::sync_with_stdio(false);\n  cin.tie(nullptr);\n  return 0;\n}";
+  if (language === "c11") return "#include <stdio.h>\n\nint main(void) {\n  return 0;\n}";
+  if (language === "java") return "import java.io.*;\nimport java.util.*;\n\npublic class Main {\n  public static void main(String[] args) throws Exception {\n  }\n}";
+  if (language === "go") return "package main\n\nfunc main() {\n}";
+  return "print(input())";
+}
+
+function formatContestWindow(contest: Contest, t: (key: string, vars?: Record<string, string | number>) => string) {
+  if (contest.status === "running") return t("overview.runningNow");
+  if (contest.status === "scheduled") return t("overview.startsAt", { time: formatDate(contest.starts_at) });
+  if (contest.status === "finished") return t("status.finished");
+  return t(`status.${contest.status}`);
+}
+
+function formatRemaining(contest: Contest, now: number, t: (key: string, vars?: Record<string, string | number>) => string) {
+  const startsAt = new Date(contest.starts_at).getTime();
+  const endsAt = new Date(contest.ends_at).getTime();
+  if (now < startsAt) return t("overview.untilStart", { time: formatDuration(startsAt - now, t) });
+  if (now >= endsAt || contest.status === "finished") return t("overview.ended");
+  return formatDuration(endsAt - now, t);
+}
+
+function formatFreezeStatus(contest: Contest, frozen: boolean, now: number, t: (key: string, vars?: Record<string, string | number>) => string) {
+  if (contest.scoreboard_unfrozen) return t("scoreboard.unfrozenShort");
+  if (!contest.scoreboard_freeze_at) return t("overview.freezeNone");
+  if (frozen) return t("scoreboard.frozenBadge");
+  const freezeAt = new Date(contest.scoreboard_freeze_at).getTime();
+  if (Number.isNaN(freezeAt)) return t("overview.freezeNone");
+  return now < freezeAt ? t("overview.untilFreeze", { time: formatDuration(freezeAt - now, t) }) : t("scoreboard.frozenBadge");
+}
+
+function formatRegistrationStatus(contest: Contest, registration: ContestRegistration | null, me: User, t: (key: string, vars?: Record<string, string | number>) => string) {
+  if (me.role === "admin") return t("common.admin");
+  if (!contest.registration_enabled) return t("registration.disabled");
+  if (registration) return t(`registration.status.${registration.status}`);
+  return t("registration.notRequested");
+}
+
+function formatAccessStatus(contest: Contest, hasContestAccess: boolean, t: (key: string, vars?: Record<string, string | number>) => string) {
+  if (hasContestAccess) return t("overview.accessGranted");
+  if (contest.registration_requires_approval) return t("registration.requiresApproval");
+  return t("overview.accessPending");
+}
+
+function formatDuration(ms: number, t: (key: string, vars?: Record<string, string | number>) => string) {
+  const totalMinutes = Math.max(0, Math.ceil(ms / 60000));
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return t("duration.daysHours", { days, hours });
+  if (hours > 0) return t("duration.hoursMinutes", { hours, minutes });
+  return t("duration.minutes", { minutes });
 }
 
 function ClarificationsBox({
