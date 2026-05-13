@@ -53,35 +53,6 @@ docker compose logs -f backend judger
 docker compose down
 ```
 
-## Публикация в GitHub
-
-Репозиторий для публикации:
-
-```text
-https://github.com/xDololow/Simple_contester.git
-```
-
-Перед публикацией проверьте, что в git не попали `.env`, backup-дампы,
-локальные базы, кэши и сборочные артефакты. `.gitignore` уже исключает эти
-файлы.
-
-Рекомендуемый первый push:
-
-```bash
-git status --short
-bash scripts/ci.sh
-git remote add origin https://github.com/xDololow/Simple_contester.git
-git add .
-git commit -m "Prepare Simple Contester project"
-git push -u origin main
-```
-
-Если `origin` уже существует:
-
-```bash
-git remote set-url origin https://github.com/xDololow/Simple_contester.git
-```
-
 ## Основные возможности
 
 - Вход по `username` и паролю без email.

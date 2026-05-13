@@ -59,34 +59,6 @@ docker compose logs -f backend judger
 docker compose down
 ```
 
-## Publish To GitHub
-
-This repository is ready to be pushed to:
-
-```text
-https://github.com/xDololow/Simple_contester.git
-```
-
-Before publishing, make sure `.env`, backup files, local databases, caches, and
-generated frontend builds are not staged. The project `.gitignore` excludes
-those local artifacts.
-
-Recommended first publish flow:
-
-```bash
-git status --short
-bash scripts/ci.sh
-git remote add origin https://github.com/xDololow/Simple_contester.git
-git add .
-git commit -m "Prepare Simple Contester project"
-git push -u origin main
-```
-
-If `origin` already exists, replace the `remote add` command with:
-
-```bash
-git remote set-url origin https://github.com/xDololow/Simple_contester.git
-```
 
 ## Production Deployment MVP
 
