@@ -1,7 +1,7 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer
 
 from .models import (
     ClarificationStatus,
@@ -12,42 +12,81 @@ from .models import (
     ContestTimeMode,
     JudgerStatus,
     Language,
+    ScoreboardVisibility,
     SubmissionVerdict,
     UserRole,
 )
 
 
-class TokenOut(BaseModel):
+def encode_datetime_utc(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return value.isoformat().replace("+00:00", "Z")
+
+
+class ApiModel(BaseModel):
+    model_config = ConfigDict(json_encoders={datetime: encode_datetime_utc})
+
+    @model_serializer(mode="wrap", when_used="json")
+    def serialize_model(self, handler: Any) -> Any:
+        return encode_datetimes(handler(self))
+
+
+def encode_datetimes(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return encode_datetime_utc(value)
+    if isinstance(value, list):
+        return [encode_datetimes(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(encode_datetimes(item) for item in value)
+    if isinstance(value, dict):
+        return {key: encode_datetimes(item) for key, item in value.items()}
+    return value
+
+
+class TokenOut(ApiModel):
     access_token: str
     token_type: str = "bearer"
 
 
-class LoginIn(BaseModel):
+class AppConfigOut(ApiModel):
+    site_timezone: str
+
+
+class LoginIn(ApiModel):
     username: str
     password: str
 
 
-class PasswordChangeIn(BaseModel):
+class PasswordChangeIn(ApiModel):
     old_password: str = Field(min_length=1)
     new_password: str = Field(min_length=3)
 
 
-class UserCreate(BaseModel):
+class UserPreferencesUpdate(ApiModel):
+    timezone: str | None = Field(default=None, max_length=64)
+
+
+class UserCreate(ApiModel):
     username: str = Field(min_length=2, max_length=80)
     password: str = Field(min_length=3)
     display_name: str | None = None
     role: UserRole = UserRole.participant
+    timezone: str | None = Field(default=None, max_length=64)
 
 
-class UserUpdate(BaseModel):
+class UserUpdate(ApiModel):
     username: str | None = Field(default=None, min_length=2, max_length=80)
     password: str | None = Field(default=None, min_length=3)
     display_name: str | None = Field(default=None, max_length=160)
     role: UserRole | None = None
     is_active: bool | None = None
+    timezone: str | None = Field(default=None, max_length=64)
 
 
-class UserOut(BaseModel):
+class UserOut(ApiModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
@@ -55,23 +94,26 @@ class UserOut(BaseModel):
     display_name: str
     role: UserRole
     is_active: bool
+    timezone: str | None = None
     created_at: datetime | None = None
 
 
-class ImportReport(BaseModel):
+class ImportReport(ApiModel):
     created: int
     skipped: int
     errors: list[str]
+    team_id: int | None = None
+    team_members_added: int = 0
 
 
-class AdminUsersStats(BaseModel):
+class AdminUsersStats(ApiModel):
     total: int
     active: int
     admin: int
     participant: int
 
 
-class AdminContestsStats(BaseModel):
+class AdminContestsStats(ApiModel):
     total: int
     by_status: dict[ContestStatus, int]
     public: int
@@ -80,7 +122,7 @@ class AdminContestsStats(BaseModel):
     team: int
 
 
-class AdminSubmissionsStats(BaseModel):
+class AdminSubmissionsStats(ApiModel):
     total: int
     by_verdict: dict[SubmissionVerdict, int]
     by_language: dict[Language, int]
@@ -103,7 +145,7 @@ class AdminSubmissionsStats(BaseModel):
     average_score: float
 
 
-class AdminJudgerStats(BaseModel):
+class AdminJudgerStats(ApiModel):
     running_by_judger_id: dict[str, int]
     recent_finished_by_judger_id: dict[str, int]
     active: int = 0
@@ -111,14 +153,14 @@ class AdminJudgerStats(BaseModel):
     offline: int = 0
 
 
-class AdminSystemStats(BaseModel):
+class AdminSystemStats(ApiModel):
     server_time: datetime
     database_ok: bool
     app_version: str = "unknown"
     build: str = "unknown"
 
 
-class AdminStatsOut(BaseModel):
+class AdminStatsOut(ApiModel):
     users: AdminUsersStats
     teams_total: int
     contests: AdminContestsStats
@@ -129,7 +171,7 @@ class AdminStatsOut(BaseModel):
     system: AdminSystemStats
 
 
-class AdminJudgerOut(BaseModel):
+class AdminJudgerOut(ApiModel):
     id: int
     judger_id: str
     hostname: str
@@ -147,7 +189,7 @@ class AdminJudgerOut(BaseModel):
     last_error: str | None = None
 
 
-class AdminJudgerEventOut(BaseModel):
+class AdminJudgerEventOut(ApiModel):
     id: int
     judger_id: str
     event_type: str
@@ -157,36 +199,36 @@ class AdminJudgerEventOut(BaseModel):
     created_at: datetime
 
 
-class TeamCreate(BaseModel):
+class TeamCreate(ApiModel):
     name: str = Field(min_length=2, max_length=160)
     user_ids: list[int] = Field(default_factory=list)
 
 
-class TeamUpdate(BaseModel):
+class TeamUpdate(ApiModel):
     name: str | None = Field(default=None, min_length=2, max_length=160)
     user_ids: list[int] | None = None
 
 
-class TeamOut(BaseModel):
+class TeamOut(ApiModel):
     id: int
     name: str
     member_ids: list[int]
     created_at: datetime | None = None
 
 
-class ContestTeamsUpdate(BaseModel):
+class ContestTeamsUpdate(ApiModel):
     team_ids: list[int] = Field(default_factory=list)
 
 
-class ContestParticipantsUpdate(BaseModel):
+class ContestParticipantsUpdate(ApiModel):
     user_ids: list[int] = Field(default_factory=list)
 
 
-class ContestTasksUpdate(BaseModel):
+class ContestTasksUpdate(ApiModel):
     task_ids: list[int] = Field(default_factory=list)
 
 
-class ContestCreate(BaseModel):
+class ContestCreate(ApiModel):
     title: str = Field(min_length=1, max_length=200)
     description: str = ""
     status: ContestStatus = ContestStatus.draft
@@ -200,9 +242,10 @@ class ContestCreate(BaseModel):
     individual_duration_minutes: int | None = None
     scoreboard_freeze_at: datetime | None = None
     scoreboard_unfrozen: bool = False
+    scoreboard_visibility: ScoreboardVisibility = ScoreboardVisibility.public
 
 
-class ContestUpdate(BaseModel):
+class ContestUpdate(ApiModel):
     title: str | None = Field(default=None, min_length=1, max_length=200)
     description: str | None = None
     status: ContestStatus | None = None
@@ -216,6 +259,7 @@ class ContestUpdate(BaseModel):
     individual_duration_minutes: int | None = Field(default=None, gt=0)
     scoreboard_freeze_at: datetime | None = None
     scoreboard_unfrozen: bool | None = None
+    scoreboard_visibility: ScoreboardVisibility | None = None
 
 
 class ContestOut(ContestCreate):
@@ -225,7 +269,7 @@ class ContestOut(ContestCreate):
     created_at: datetime | None = None
 
 
-class ParticipantContestOut(BaseModel):
+class ParticipantContestOut(ApiModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
@@ -235,7 +279,28 @@ class ParticipantContestOut(BaseModel):
     deadline_at: datetime | None
 
 
-class ContestRegistrationOut(BaseModel):
+class AdminParticipantContestTimeOut(ApiModel):
+    id: int
+    contest_id: int
+    user_id: int
+    username: str
+    display_name: str
+    started_at: datetime | None
+    deadline_at: datetime | None
+    duration_seconds: int | None
+    spent_seconds: int | None
+    remaining_seconds: int | None
+
+
+class ParticipantContestTimeUpdate(ApiModel):
+    started_at: datetime | None = None
+    deadline_at: datetime | None = None
+    duration_seconds: int | None = Field(default=None, gt=0)
+    delta_seconds: int | None = None
+    reset: bool = False
+
+
+class ContestRegistrationOut(ApiModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
@@ -257,7 +322,7 @@ class ContestRegistrationDetailOut(ContestRegistrationOut):
     can_access: bool = False
 
 
-class TaskTestCreate(BaseModel):
+class TaskTestCreate(ApiModel):
     input_data: str
     output_data: str
     is_sample: bool = False
@@ -265,7 +330,7 @@ class TaskTestCreate(BaseModel):
     group_name: str | None = Field(default=None, max_length=120)
 
 
-class TaskTestUpdate(BaseModel):
+class TaskTestUpdate(ApiModel):
     input_data: str | None = None
     output_data: str | None = None
     is_sample: bool | None = None
@@ -273,7 +338,7 @@ class TaskTestUpdate(BaseModel):
     group_name: str | None = Field(default=None, max_length=120)
 
 
-class TaskTestOut(BaseModel):
+class TaskTestOut(ApiModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
@@ -285,12 +350,12 @@ class TaskTestOut(BaseModel):
     group_name: str | None = None
 
 
-class TaskTestPublicOut(BaseModel):
+class TaskTestPublicOut(ApiModel):
     id: int
     is_sample: bool
 
 
-class TaskCreate(BaseModel):
+class TaskCreate(ApiModel):
     contest_id: int | None = None
     contest_ids: list[int] = Field(default_factory=list)
     title: str = Field(min_length=1, max_length=200)
@@ -305,7 +370,7 @@ class TaskCreate(BaseModel):
     tests: list[TaskTestCreate] = Field(default_factory=list)
 
 
-class TaskUpdate(BaseModel):
+class TaskUpdate(ApiModel):
     title: str | None = Field(default=None, min_length=1, max_length=200)
     statement: str | None = None
     input_format: str | None = None
@@ -317,7 +382,7 @@ class TaskUpdate(BaseModel):
     partial_scoring: bool | None = None
 
 
-class TaskOut(BaseModel):
+class TaskOut(ApiModel):
     id: int
     contest_id: int | None = None
     contest_ids: list[int] = Field(default_factory=list)
@@ -338,7 +403,7 @@ class TaskDetailOut(TaskOut):
     tests: list[TaskTestPublicOut] | None = None
 
 
-class TaskVersionOut(BaseModel):
+class TaskVersionOut(ApiModel):
     id: int
     task_id: int
     version_number: int
@@ -356,31 +421,31 @@ class TaskVersionOut(BaseModel):
     created_by_user_id: int | None = None
 
 
-class TestArchiveImportReport(BaseModel):
+class TestArchiveImportReport(ApiModel):
     created: int
     skipped: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 
 
-class PackageImportReport(BaseModel):
+class PackageImportReport(ApiModel):
     created_tasks: int
     created_tests: int
     contest_id: int | None = None
     task_ids: list[int] = Field(default_factory=list)
 
 
-class ClarificationCreate(BaseModel):
+class ClarificationCreate(ApiModel):
     task_id: int | None = None
     question: str = Field(min_length=1, max_length=10000)
 
 
-class ClarificationAdminUpdate(BaseModel):
+class ClarificationAdminUpdate(ApiModel):
     answer: str | None = Field(default=None, max_length=10000)
     status: ClarificationStatus | None = None
     visibility: ClarificationVisibility | None = None
 
 
-class ClarificationOut(BaseModel):
+class ClarificationOut(ApiModel):
     id: int
     contest_id: int
     task_id: int | None = None
@@ -398,12 +463,12 @@ class ClarificationOut(BaseModel):
     answered_at: datetime | None = None
 
 
-class SubmissionCreate(BaseModel):
+class SubmissionCreate(ApiModel):
     language: Language
     source_code: str = Field(min_length=1)
 
 
-class SubmissionOut(BaseModel):
+class SubmissionOut(ApiModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
@@ -424,7 +489,7 @@ class SubmissionOut(BaseModel):
     attempt_number: int = 0
 
 
-class TestResultOut(BaseModel):
+class TestResultOut(ApiModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
@@ -442,14 +507,14 @@ class SubmissionAdminDetailOut(SubmissionOut):
     results: list[TestResultOut] = Field(default_factory=list)
 
 
-class ScoreboardCell(BaseModel):
+class ScoreboardCell(ApiModel):
     task_id: int
     attempts: int
     solved: bool
     solved_at_minutes: int | None
 
 
-class ScoreboardRow(BaseModel):
+class ScoreboardRow(ApiModel):
     user_id: int
     username: str
     display_name: str

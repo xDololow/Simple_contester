@@ -4,6 +4,17 @@ __pycache__/
 .pytest_cache/
 .codex
 .env
+.env.*
+!.env.example
+.agents/
+
+backups/
+*.sql
+*.sql.gz
+*.log
+coverage/
+.coverage
+htmlcov/
 
 frontend/dist/
 frontend/node_modules/

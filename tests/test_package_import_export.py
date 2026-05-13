@@ -182,6 +182,7 @@ def test_contest_package_export_import_roundtrip(
         f"/api/contests/{demo_contest['id']}",
         headers=admin_headers,
         json={
+            "is_public": False,
             "registration_enabled": True,
             "registration_requires_approval": False,
             "scoreboard_freeze_at": (starts_at + timedelta(minutes=20)).isoformat(),

@@ -37,6 +37,31 @@ def create_running_contest(client: APIClient, admin_headers: dict[str, str], tit
     return response.json()
 
 
+def create_running_individual_time_contest(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    title: str,
+    duration_minutes: int = 60,
+) -> dict[str, Any]:
+    now = datetime.utcnow()
+    response = client.post(
+        "/api/contests",
+        headers=admin_headers,
+        json={
+            "title": title,
+            "description": "",
+            "status": "running",
+            "is_public": False,
+            "time_mode": "individual",
+            "starts_at": (now - timedelta(minutes=5)).isoformat(),
+            "ends_at": (now + timedelta(hours=2)).isoformat(),
+            "individual_duration_minutes": duration_minutes,
+        },
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
 def create_running_team_contest(client: APIClient, admin_headers: dict[str, str], title: str, is_public: bool = False) -> dict[str, Any]:
     contest = create_running_contest(client, admin_headers, title, is_public=is_public)
     updated = client.patch(
@@ -147,6 +172,56 @@ def test_participant_with_private_contest_access_can_submit(
 
     assert created.status_code == 200, created.text
     assert created.json()["contest_id"] == contest["id"]
+
+
+def test_admin_can_view_and_adjust_individual_participant_time(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    create_user: Callable[..., dict[str, Any]],
+) -> None:
+    participant = create_user(username="time_alice", password="time-pass")
+    contest = create_running_individual_time_contest(client, admin_headers, "Individual Time", duration_minutes=60)
+    assigned = client.put(
+        f"/api/contests/{contest['id']}/participants",
+        headers=admin_headers,
+        json={"user_ids": [participant["id"]]},
+    )
+    assert assigned.status_code == 200, assigned.text
+
+    listed = client.get(f"/api/admin/contests/{contest['id']}/participant-times", headers=admin_headers)
+    assert listed.status_code == 200, listed.text
+    assert listed.json()[0]["user_id"] == participant["id"]
+    assert listed.json()[0]["started_at"] is None
+    assert listed.json()[0]["duration_seconds"] == 3600
+
+    duration_set = client.patch(
+        f"/api/admin/contests/{contest['id']}/participant-times/{participant['id']}",
+        headers=admin_headers,
+        json={"duration_seconds": 1800},
+    )
+    assert duration_set.status_code == 200, duration_set.text
+    payload = duration_set.json()
+    assert payload["started_at"] is not None
+    assert payload["deadline_at"] is not None
+    assert payload["duration_seconds"] == 1800
+    first_deadline = datetime.fromisoformat(payload["deadline_at"])
+
+    extended = client.patch(
+        f"/api/admin/contests/{contest['id']}/participant-times/{participant['id']}",
+        headers=admin_headers,
+        json={"delta_seconds": 600},
+    )
+    assert extended.status_code == 200, extended.text
+    assert datetime.fromisoformat(extended.json()["deadline_at"]) == first_deadline + timedelta(seconds=600)
+
+    reset = client.patch(
+        f"/api/admin/contests/{contest['id']}/participant-times/{participant['id']}",
+        headers=admin_headers,
+        json={"reset": True},
+    )
+    assert reset.status_code == 200, reset.text
+    assert reset.json()["started_at"] is None
+    assert reset.json()["deadline_at"] is None
 
 
 def test_participant_creates_clarification_for_available_contest(
@@ -356,7 +431,7 @@ def test_registration_auto_approve_grants_individual_access(
     participant: dict,
     participant_headers: dict[str, str],
 ) -> None:
-    contest = create_running_contest(client, admin_headers, "Auto Registration")
+    contest = create_running_individual_time_contest(client, admin_headers, "Auto Registration")
     task = create_contest_task(client, admin_headers, contest["id"])
     enabled = client.patch(
         f"/api/contests/{contest['id']}",
@@ -368,6 +443,8 @@ def test_registration_auto_approve_grants_individual_access(
     requested = client.post(f"/api/contests/{contest['id']}/registration", headers=participant_headers)
     assert requested.status_code == 200, requested.text
     assert requested.json()["status"] == "approved"
+    started = client.post(f"/api/contests/{contest['id']}/start", headers=participant_headers)
+    assert started.status_code == 200, started.text
 
     created = client.post(
         f"/api/contests/{contest['id']}/tasks/{task['id']}/submissions",
@@ -613,18 +690,25 @@ def test_admin_can_manage_contest_participant_access(
 
 def test_individual_deadline_blocks_submission_without_sleeping(
     client: APIClient,
+    admin_headers: dict[str, str],
     participant: dict,
     participant_headers: dict[str, str],
-    demo_contest: dict,
-    demo_task: dict,
 ) -> None:
-    start = client.get(f"/api/contests/{demo_contest['id']}/start", headers=participant_headers)
+    contest = create_running_individual_time_contest(client, admin_headers, "Deadline")
+    task = create_contest_task(client, admin_headers, contest["id"])
+    access = client.put(
+        f"/api/contests/{contest['id']}/participants",
+        headers=admin_headers,
+        json={"user_ids": [participant["id"]]},
+    )
+    assert access.status_code == 200, access.text
+    start = client.post(f"/api/contests/{contest['id']}/start", headers=participant_headers)
     assert start.status_code == 200, start.text
 
     with SessionLocal() as db:
         participant_window = db.scalar(
             select(ParticipantContest).where(
-                ParticipantContest.contest_id == demo_contest["id"],
+                ParticipantContest.contest_id == contest["id"],
                 ParticipantContest.user_id == participant["id"],
             )
         )
@@ -633,7 +717,7 @@ def test_individual_deadline_blocks_submission_without_sleeping(
         db.commit()
 
     response = client.post(
-        f"/api/contests/{demo_contest['id']}/tasks/{demo_task['id']}/submissions",
+        f"/api/contests/{contest['id']}/tasks/{task['id']}/submissions",
         headers=participant_headers,
         json={"language": "python", "source_code": "print(sum(map(int, input().split())))"},
     )
@@ -920,6 +1004,90 @@ def test_participant_cannot_see_foreign_submission_or_hidden_results(
     assert admin_detail.status_code == 200, admin_detail.text
     assert admin_detail.json()["source_code"] == "print(42)"
     assert admin_detail.json()["results"][0]["output"] == "hidden output"
+
+
+def test_admin_can_rejudge_submission_against_current_task_version(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant_headers: dict[str, str],
+    demo_contest: dict,
+    demo_task: dict,
+) -> None:
+    created = client.post(
+        f"/api/contests/{demo_contest['id']}/tasks/{demo_task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(5)"},
+    )
+    assert created.status_code == 200, created.text
+    submission_id = created.json()["id"]
+    original_version_id = created.json()["task_version_id"]
+
+    with SessionLocal() as db:
+        stored_submission = db.get(Submission, submission_id)
+        assert stored_submission is not None
+        first_test = db.scalar(select(TaskTest).where(TaskTest.task_id == demo_task["id"]).order_by(TaskTest.id))
+        assert first_test is not None
+        stored_submission.verdict = SubmissionVerdict.accepted
+        stored_submission.score = 100
+        stored_submission.compile_output = "old compile output"
+        stored_submission.started_at = datetime.utcnow()
+        stored_submission.finished_at = datetime.utcnow()
+        stored_submission.judger_id = "old-judger"
+        stored_submission.claim_token = "old-token"
+        stored_submission.attempt_number = 2
+        db.add(
+            TestResult(
+                submission_id=submission_id,
+                task_test_id=first_test.id,
+                verdict=SubmissionVerdict.accepted,
+                time_ms=12,
+                output="old output",
+                error="",
+            )
+        )
+        db.commit()
+
+    tests = client.get(f"/api/tasks/{demo_task['id']}/tests", headers=admin_headers)
+    assert tests.status_code == 200, tests.text
+
+    updated_test = client.patch(
+        f"/api/tests/{tests.json()[0]['id']}",
+        headers=admin_headers,
+        json={"output_data": "changed\n"},
+    )
+    assert updated_test.status_code == 200, updated_test.text
+
+    with SessionLocal() as db:
+        latest_version_id = db.scalar(
+            select(TaskVersion.id)
+            .where(TaskVersion.task_id == demo_task["id"])
+            .order_by(TaskVersion.version_number.desc())
+            .limit(1)
+        )
+    assert latest_version_id is not None
+    assert latest_version_id != original_version_id
+
+    denied = client.post(f"/api/admin/submissions/{submission_id}/rejudge", headers=participant_headers)
+    assert denied.status_code == 403
+
+    rejudged = client.post(f"/api/admin/submissions/{submission_id}/rejudge", headers=admin_headers)
+    assert rejudged.status_code == 200, rejudged.text
+    payload = rejudged.json()
+    assert payload["verdict"] == "Queued"
+    assert payload["score"] == 0
+    assert payload["compile_output"] == ""
+    assert payload["started_at"] is None
+    assert payload["finished_at"] is None
+    assert payload["attempt_number"] == 0
+    assert payload["task_version_id"] == latest_version_id
+    assert payload["results"] == []
+
+    with SessionLocal() as db:
+        stored_submission = db.get(Submission, submission_id)
+        assert stored_submission is not None
+        assert stored_submission.judger_id is None
+        assert stored_submission.claim_token is None
+        assert db.scalar(select(TestResult).where(TestResult.submission_id == submission_id)) is None
 
 
 def test_admin_can_assign_teams_to_contest(

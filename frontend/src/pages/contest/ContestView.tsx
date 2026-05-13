@@ -3,10 +3,18 @@ import type { FormEvent } from "react";
 import { API_BASE } from "../../api/client";
 import { FlashMessage, Header, SubmissionDetailView } from "../../components/shared";
 import { useI18n } from "../../i18n";
-import type { ApiClient, Clarification, Contest, ContestLiveEvent, ContestRegistration, Flash, Language, ScoreboardRow, Submission, SubmissionDetail, Task, User } from "../../types";
-import { emptyFlash, errorText, formatDate, formatScore, verdictClass } from "../../utils/format";
+import type { ApiClient, Clarification, Contest, ContestLiveEvent, ContestRegistration, Flash, Language, ParticipantContest, ScoreboardRow, Submission, SubmissionDetail, Task, User } from "../../types";
+import { emptyFlash, errorText, formatDate, formatScore, parseApiDate, verdictClass } from "../../utils/format";
 
 type ContestTab = "overview" | "tasks" | "submissions" | "scoreboard" | "clarifications";
+
+type TaskProgress = {
+  taskId: number;
+  bestScore: number;
+  attempts: number;
+  solved: boolean;
+  latestVerdict: string | null;
+};
 
 const SUBMISSION_LANGUAGES: Array<{ value: Language; label: string }> = [
   { value: "python", label: "Python" },
@@ -26,7 +34,7 @@ const SUBMISSION_LANGUAGES: Array<{ value: Language; label: string }> = [
 const SUBMIT_DRAFT_PREFIX = "simple-contester-submit-draft:v1";
 const SUBMIT_LANGUAGE_PREFIX = "simple-contester-submit-language:v1";
 
-export function ContestView({ api, contest, me, token }: { api: ApiClient; contest: Contest; me: User; token: string }) {
+export function ContestView({ api, contest, me, token, siteTimezone }: { api: ApiClient; contest: Contest; me: User; token: string; siteTimezone: string }) {
   const { t } = useI18n();
   const [now, setNow] = useState(() => Date.now());
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -36,19 +44,46 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
     me.role !== "admin" &&
       Boolean(contest.scoreboard_freeze_at) &&
       !contest.scoreboard_unfrozen &&
-      Date.now() >= new Date(contest.scoreboard_freeze_at || "").getTime()
+      Date.now() >= parseApiDate(contest.scoreboard_freeze_at || "").getTime()
   );
+  const [scoreboardVisibility, setScoreboardVisibility] = useState(contest.scoreboard_visibility ?? "public");
   const [clarifications, setClarifications] = useState<Clarification[]>([]);
+  const [participantWindow, setParticipantWindow] = useState<ParticipantContest | null | undefined>(undefined);
   const [registration, setRegistration] = useState<ContestRegistration | null>(null);
   const [hasContestAccess, setHasContestAccess] = useState(true);
   const [registrationLoading, setRegistrationLoading] = useState(false);
-  const [tab, setTab] = useState<ContestTab>("tasks");
+  const [tab, setTab] = useState<ContestTab>("overview");
   const [selectedTaskId, setSelectedTaskId] = useState<number | null>(null);
   const [selectedSubmissionId, setSelectedSubmissionId] = useState<number | null>(null);
   const [detail, setDetail] = useState<SubmissionDetail | null>(null);
   const [flash, setFlash] = useState<Flash>(emptyFlash);
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) || tasks[0] || null;
+  const taskProgress = buildTaskProgress(tasks, me.role === "admin" ? [] : submissions);
+  const solvedCount = tasks.filter((task) => taskProgress[task.id]?.solved).length;
+  const earnedTaskScore = tasks.reduce((sum, task) => sum + (taskProgress[task.id]?.bestScore ?? 0), 0);
+  const totalTaskScore = tasks.reduce((sum, task) => sum + task.points, 0);
   const myScore = scoreboard.find((row) => contest.participation_mode !== "team" && row.user_id === me.id)?.score ?? null;
+  const scoreboardHidden = me.role !== "admin" && scoreboardVisibility === "hidden";
+  const scoreboardSubtitle = scoreboardHidden
+    ? t("scoreboard.hiddenText")
+    : scoreboardVisibility === "anonymous" && me.role !== "admin"
+      ? t("scoreboard.anonymousText")
+      : scoreboardFrozen
+        ? t("scoreboard.frozenText")
+        : t("common.live");
+  const startsAtMs = parseApiDate(contest.starts_at).getTime();
+  const contestNotStarted = me.role !== "admin" && Number.isFinite(startsAtMs) && now < startsAtMs;
+  const individualAttemptLocked = me.role !== "admin" && contest.time_mode === "individual" && !contestNotStarted && (!participantWindow?.started_at || !participantWindow.deadline_at);
+  const contestLocked = contestNotStarted || individualAttemptLocked;
+  const contestTabs: Array<[ContestTab, string]> = contestLocked
+    ? [["overview", t("tab.overview")]]
+    : [
+        ["overview", t("tab.overview")],
+        ["tasks", t("tab.tasks")],
+        ["submissions", t("tab.submissions")],
+        ["scoreboard", t("title.scoreboard")],
+        ["clarifications", t("tab.clarifications")]
+      ];
 
   const refreshRegistration = useCallback(async () => {
     if (!contest.registration_enabled || me.role === "admin") {
@@ -72,28 +107,72 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
     setSubmissions(live.submissions);
     setScoreboard(live.scoreboard);
     setScoreboardFrozen(Boolean(live.scoreboard_frozen));
+    setScoreboardVisibility(live.scoreboard_visibility ?? contest.scoreboard_visibility ?? "public");
     setClarifications(nextClarifications);
     setSelectedTaskId((current) => current ?? nextTasks[0]?.id ?? null);
     setHasContestAccess(true);
-  }, [api, contest.id]);
+  }, [api, contest.id, contest.scoreboard_visibility]);
+
+  const refreshParticipantWindow = useCallback(async () => {
+    if (me.role === "admin" || contest.time_mode !== "individual") {
+      setParticipantWindow(null);
+      return null;
+    }
+    const nextWindow = await api<ParticipantContest | null>(`/api/contests/${contest.id}/participant-window`);
+    setParticipantWindow(nextWindow);
+    return nextWindow;
+  }, [api, contest.id, contest.time_mode, me.role]);
 
   const refreshLiveData = useCallback(async () => {
     const live = await api<ContestLiveEvent>(`/api/contests/${contest.id}/live-snapshot`);
     setSubmissions(live.submissions);
     setScoreboard(live.scoreboard);
     setScoreboardFrozen(Boolean(live.scoreboard_frozen));
-  }, [api, contest.id]);
+    setScoreboardVisibility(live.scoreboard_visibility ?? contest.scoreboard_visibility ?? "public");
+  }, [api, contest.id, contest.scoreboard_visibility]);
 
   useEffect(() => {
-    const interval = window.setInterval(() => setNow(Date.now()), 30000);
+    setParticipantWindow(undefined);
+  }, [contest.id]);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => setNow(Date.now()), contestLocked ? 1000 : 30000);
     return () => window.clearInterval(interval);
-  }, []);
+  }, [contestLocked]);
+
+  useEffect(() => {
+    if (contestLocked && tab !== "overview") {
+      setTab("overview");
+    }
+  }, [contestLocked, tab]);
 
   useEffect(() => {
     let cancelled = false;
-    if (hasContestAccess) {
-      refresh()
-        .then(() => refreshRegistration())
+    const clearContestData = () => {
+      setTasks([]);
+      setSubmissions([]);
+      setScoreboard([]);
+      setScoreboardVisibility(contest.scoreboard_visibility ?? "public");
+      setClarifications([]);
+      setSelectedTaskId(null);
+      setSelectedSubmissionId(null);
+    };
+    if (contestNotStarted) {
+      clearContestData();
+      refreshRegistration().catch((registrationError) => {
+        if (!cancelled) setFlash({ kind: "error", text: errorText(registrationError) });
+      });
+    } else if (hasContestAccess) {
+      refreshParticipantWindow()
+        .then((window) => {
+          if (cancelled) return;
+          const locked = me.role !== "admin" && contest.time_mode === "individual" && (!window?.started_at || !window.deadline_at);
+          if (locked) {
+            clearContestData();
+            return refreshRegistration();
+          }
+          return refresh().then(() => refreshRegistration());
+        })
         .catch((error) => {
           if (cancelled) return;
           const message = errorText(error);
@@ -115,7 +194,7 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
       fallbackInterval = window.setInterval(() => refreshLiveData().catch(console.error), 5000);
     };
 
-    if (!hasContestAccess) {
+    if (!hasContestAccess || contestLocked) {
       return () => {
         cancelled = true;
         if (fallbackInterval !== null) window.clearInterval(fallbackInterval);
@@ -137,6 +216,7 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
       setSubmissions(live.submissions);
       setScoreboard(live.scoreboard);
       setScoreboardFrozen(Boolean(live.scoreboard_frozen));
+      setScoreboardVisibility(live.scoreboard_visibility ?? contest.scoreboard_visibility ?? "public");
     });
     eventSource.onerror = () => {
       eventSource?.close();
@@ -148,7 +228,7 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
       eventSource?.close();
       if (fallbackInterval !== null) window.clearInterval(fallbackInterval);
     };
-  }, [contest.id, contest.registration_enabled, hasContestAccess, refresh, refreshLiveData, refreshRegistration, token]);
+  }, [contest.id, contest.registration_enabled, contest.scoreboard_visibility, contest.time_mode, contestLocked, contestNotStarted, hasContestAccess, me.role, refresh, refreshLiveData, refreshParticipantWindow, refreshRegistration, token]);
 
   async function requestRegistration() {
     setRegistrationLoading(true);
@@ -158,12 +238,25 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
       setRegistration(nextRegistration);
       if (nextRegistration.status === "approved") {
         setHasContestAccess(true);
-        await refresh();
+        if (!contestLocked) {
+          await refresh();
+        }
       }
     } catch (error) {
       setFlash({ kind: "error", text: errorText(error) });
     } finally {
       setRegistrationLoading(false);
+    }
+  }
+
+  async function startAttempt() {
+    setFlash(emptyFlash);
+    try {
+      const nextWindow = await api<ParticipantContest>(`/api/contests/${contest.id}/start`, { method: "POST" });
+      setParticipantWindow(nextWindow);
+      await refresh();
+    } catch (error) {
+      setFlash({ kind: "error", text: errorText(error) });
     }
   }
 
@@ -189,7 +282,7 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
           <span>{t(`common.${contest.participation_mode}`)}</span>
           <span>{contest.time_mode === "individual" ? `${contest.individual_duration_minutes} ${t("table.minutes").toLowerCase()}` : t("common.fixed")}</span>
           {scoreboardFrozen && <span className="pill warn">{t("scoreboard.frozenBadge")}</span>}
-          <span>{formatDate(contest.starts_at)} - {formatDate(contest.ends_at)}</span>
+          <span>{formatDate(contest.starts_at, siteTimezone)} - {formatDate(contest.ends_at, siteTimezone)}</span>
         </div>
       </section>
       <FlashMessage flash={flash} />
@@ -205,13 +298,7 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
       {!hasContestAccess ? null : (
       <>
       <nav className="tabs contest-tabs" aria-label={t("nav.contestSections")}>
-        {[
-          ["overview", t("tab.overview")],
-          ["tasks", t("tab.tasks")],
-          ["submissions", t("tab.submissions")],
-          ["scoreboard", t("title.scoreboard")],
-          ["clarifications", t("tab.clarifications")]
-        ].map(([id, label]) => (
+        {contestTabs.map(([id, label]) => (
           <button key={id} className={tab === id ? "active" : ""} onClick={() => setTab(id as ContestTab)} type="button">
             {label}
           </button>
@@ -222,23 +309,34 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
         <section className="panel">
           <Header title={t("tab.overview")} subtitle={t("contest.summary")} />
           <div className="contest-summary-grid">
-            <SummaryCard label={t("overview.remaining")} value={formatRemaining(contest, now, t)} detail={t("overview.deadline", { time: formatDate(contest.ends_at) })} />
-            <SummaryCard label={t("overview.schedule")} value={formatContestWindow(contest, t)} detail={`${formatDate(contest.starts_at)} - ${formatDate(contest.ends_at)}`} />
+            <SummaryCard label={t("overview.remaining")} value={formatRemaining(contest, now, t)} detail={t("overview.deadline", { time: formatDate(contest.ends_at, siteTimezone) })} />
+            <SummaryCard label={t("overview.schedule")} value={formatContestWindow(contest, t, siteTimezone)} detail={`${formatDate(contest.starts_at, siteTimezone)} - ${formatDate(contest.ends_at, siteTimezone)}`} />
             <SummaryCard
               label={t("overview.freeze")}
               value={formatFreezeStatus(contest, scoreboardFrozen, now, t)}
-              detail={contest.scoreboard_freeze_at ? t("overview.freezeAt", { time: formatDate(contest.scoreboard_freeze_at) }) : t("overview.freezeNone")}
+              detail={contest.scoreboard_freeze_at ? t("overview.freezeAt", { time: formatDate(contest.scoreboard_freeze_at, siteTimezone) }) : t("overview.freezeNone")}
               warn={scoreboardFrozen}
             />
             <SummaryCard label={t("overview.registration")} value={formatRegistrationStatus(contest, registration, me, t)} detail={formatAccessStatus(contest, hasContestAccess, t)} />
           </div>
-          <div className="overview-grid">
-            <div className="stat"><strong>{tasks.length}</strong><span>{t("tab.tasks")}</span></div>
-            <div className="stat"><strong>{submissions.length}</strong><span>{t("tab.submissions")}</span></div>
-            <div className="stat"><strong>{scoreboard.length}</strong><span>{t("title.scoreboard")}</span></div>
-            <div className="stat"><strong>{clarifications.length}</strong><span>{t("tab.clarifications")}</span></div>
-            {myScore !== null && <div className="stat"><strong>{formatScore(myScore)}</strong><span>{t("overview.myScore")}</span></div>}
-          </div>
+          {contestNotStarted ? (
+            <StartCountdown contest={contest} now={now} siteTimezone={siteTimezone} />
+          ) : individualAttemptLocked ? (
+            <StartAttemptPanel contest={contest} onStart={startAttempt} />
+          ) : (
+            <>
+              <div className="overview-grid">
+                <div className="stat"><strong>{tasks.length}</strong><span>{t("tab.tasks")}</span></div>
+                <div className="stat"><strong>{submissions.length}</strong><span>{t("tab.submissions")}</span></div>
+                <div className="stat"><strong>{scoreboard.length}</strong><span>{t("title.scoreboard")}</span></div>
+                <div className="stat"><strong>{clarifications.length}</strong><span>{t("tab.clarifications")}</span></div>
+                {myScore !== null && <div className="stat"><strong>{formatScore(myScore)}</strong><span>{t("overview.myScore")}</span></div>}
+                {me.role !== "admin" && <div className="stat"><strong>{solvedCount}/{tasks.length}</strong><span>{t("task.solvedCount")}</span></div>}
+                {me.role !== "admin" && <div className="stat"><strong>{formatScore(earnedTaskScore)}/{formatScore(totalTaskScore)}</strong><span>{t("task.earnedPoints")}</span></div>}
+              </div>
+              {me.role !== "admin" && tasks.length > 0 && <TaskProgressSummary tasks={tasks} progress={taskProgress} />}
+            </>
+          )}
         </section>
       )}
 
@@ -250,7 +348,7 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
               <div className="list task-list">
                 {tasks.map((task) => (
                   <button key={task.id} className={task.id === selectedTask?.id ? "active item" : "item"} onClick={() => setSelectedTaskId(task.id)} type="button">
-                    <span>{task.title}</span><span className="pill">{formatScore(task.points)}</span>
+                    <span>{task.title}</span><TaskProgressBadge task={task} progress={taskProgress[task.id]} />
                   </button>
                 ))}
               </div>
@@ -284,13 +382,13 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
                         <td>{submission.language}</td>
                         <td><span className={verdictClass(submission.verdict)}>{t(`verdict.${submission.verdict}`)}</span></td>
                         <td>{formatScore(submission.score)}</td>
-                        <td>{formatDate(submission.created_at)}</td>
+                        <td>{formatDate(submission.created_at, siteTimezone)}</td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
-              {me.role === "admin" && <SubmissionDetailView detail={detail} compact />}
+              {me.role === "admin" && <SubmissionDetailView detail={detail} compact siteTimezone={siteTimezone} />}
             </>
           ) : (
             <EmptyState title={t("empty.submissionsTitle")} text={t("empty.submissionsText")} />
@@ -300,8 +398,10 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
 
       {tab === "scoreboard" && (
         <section className="panel">
-          <Header title={t("title.scoreboard")} subtitle={scoreboardFrozen ? t("scoreboard.frozenText") : t("common.live")} />
-          {scoreboard.length ? (
+          <Header title={t("title.scoreboard")} subtitle={scoreboardSubtitle} />
+          {scoreboardHidden ? (
+            <EmptyState title={t("scoreboard.hiddenTitle")} text={t("scoreboard.hiddenText")} />
+          ) : scoreboard.length ? (
             <div className="table-wrap">
               <table>
                 <thead>
@@ -331,6 +431,7 @@ export function ContestView({ api, contest, me, token }: { api: ApiClient; conte
           contestId={contest.id}
           tasks={tasks}
           clarifications={clarifications}
+          siteTimezone={siteTimezone}
           onRefresh={async () => setClarifications(await api<Clarification[]>(`/api/contests/${contest.id}/clarifications`))}
         />
       )}
@@ -355,6 +456,62 @@ function SummaryCard({ label, value, detail, warn = false }: { label: string; va
       <span>{label}</span>
       <strong>{value}</strong>
       <small>{detail}</small>
+    </div>
+  );
+}
+
+function TaskProgressSummary({ tasks, progress }: { tasks: Task[]; progress: Record<number, TaskProgress> }) {
+  const { t } = useI18n();
+  return (
+    <div className="task-progress-grid" aria-label={t("task.progressTitle")}>
+      {tasks.map((task) => {
+        const item = progress[task.id];
+        return (
+          <div key={task.id} className={item?.solved ? "task-progress-card solved" : "task-progress-card"}>
+            <span>{task.title}</span>
+            <strong>{formatScore(item?.bestScore ?? 0)} / {formatScore(task.points)}</strong>
+            <small>{item?.solved ? t("task.solved") : item?.attempts ? t("task.attempts", { count: item.attempts }) : t("task.notSubmitted")}</small>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function TaskProgressBadge({ task, progress }: { task: Task; progress: TaskProgress | undefined }) {
+  const { t } = useI18n();
+  if (!progress || progress.attempts === 0) {
+    return <span className="task-progress-badge"><span className="pill">{formatScore(task.points)}</span><small>0 / {formatScore(task.points)}</small></span>;
+  }
+  return (
+    <span className="task-progress-badge">
+      <span className={progress.solved ? "pill ok" : "pill warn"}>{progress.solved ? t("task.solved") : t("task.inProgress")}</span>
+      <small>{formatScore(progress.bestScore)} / {formatScore(task.points)}</small>
+    </span>
+  );
+}
+
+function StartCountdown({ contest, now, siteTimezone }: { contest: Contest; now: number; siteTimezone: string }) {
+  const { t } = useI18n();
+  const startsAt = parseApiDate(contest.starts_at).getTime();
+  return (
+    <div className="start-countdown">
+      <span className="pill">{t("contest.startCountdown")}</span>
+      <strong>{formatCountdown(startsAt - now, t)}</strong>
+      <p>{t("contest.startsSoonSubtitle")}</p>
+      <small>{t("overview.startsAt", { time: formatDate(contest.starts_at, siteTimezone) })}</small>
+    </div>
+  );
+}
+
+function StartAttemptPanel({ contest, onStart }: { contest: Contest; onStart: () => void }) {
+  const { t } = useI18n();
+  return (
+    <div className="start-countdown">
+      <span className="pill">{t("contest.individualStartRequired")}</span>
+      <strong>{contest.individual_duration_minutes ?? "-"} {t("table.minutes").toLowerCase()}</strong>
+      <p>{t("contest.individualStartDescription")}</p>
+      <button type="button" onClick={onStart}>{t("contest.startAttempt")}</button>
     </div>
   );
 }
@@ -477,16 +634,16 @@ function defaultSource(language: Language) {
   return "print(input())";
 }
 
-function formatContestWindow(contest: Contest, t: (key: string, vars?: Record<string, string | number>) => string) {
+function formatContestWindow(contest: Contest, t: (key: string, vars?: Record<string, string | number>) => string, siteTimezone: string) {
   if (contest.status === "running") return t("overview.runningNow");
-  if (contest.status === "scheduled") return t("overview.startsAt", { time: formatDate(contest.starts_at) });
+  if (contest.status === "scheduled") return t("overview.startsAt", { time: formatDate(contest.starts_at, siteTimezone) });
   if (contest.status === "finished") return t("status.finished");
   return t(`status.${contest.status}`);
 }
 
 function formatRemaining(contest: Contest, now: number, t: (key: string, vars?: Record<string, string | number>) => string) {
-  const startsAt = new Date(contest.starts_at).getTime();
-  const endsAt = new Date(contest.ends_at).getTime();
+  const startsAt = parseApiDate(contest.starts_at).getTime();
+  const endsAt = parseApiDate(contest.ends_at).getTime();
   if (now < startsAt) return t("overview.untilStart", { time: formatDuration(startsAt - now, t) });
   if (now >= endsAt || contest.status === "finished") return t("overview.ended");
   return formatDuration(endsAt - now, t);
@@ -496,7 +653,7 @@ function formatFreezeStatus(contest: Contest, frozen: boolean, now: number, t: (
   if (contest.scoreboard_unfrozen) return t("scoreboard.unfrozenShort");
   if (!contest.scoreboard_freeze_at) return t("overview.freezeNone");
   if (frozen) return t("scoreboard.frozenBadge");
-  const freezeAt = new Date(contest.scoreboard_freeze_at).getTime();
+  const freezeAt = parseApiDate(contest.scoreboard_freeze_at).getTime();
   if (Number.isNaN(freezeAt)) return t("overview.freezeNone");
   return now < freezeAt ? t("overview.untilFreeze", { time: formatDuration(freezeAt - now, t) }) : t("scoreboard.frozenBadge");
 }
@@ -524,17 +681,50 @@ function formatDuration(ms: number, t: (key: string, vars?: Record<string, strin
   return t("duration.minutes", { minutes });
 }
 
+function formatCountdown(ms: number, t: (key: string, vars?: Record<string, string | number>) => string) {
+  const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+  const days = Math.floor(totalSeconds / 86400);
+  const hours = Math.floor((totalSeconds % 86400) / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  const time = [hours, minutes, seconds].map((part) => String(part).padStart(2, "0")).join(":");
+  return days > 0 ? t("duration.daysClock", { days, time }) : time;
+}
+
+function buildTaskProgress(tasks: Task[], submissions: Submission[]): Record<number, TaskProgress> {
+  const taskIds = new Set(tasks.map((task) => task.id));
+  const progress: Record<number, TaskProgress> = {};
+  for (const submission of submissions) {
+    if (!taskIds.has(submission.task_id)) continue;
+    const current = progress[submission.task_id] ?? {
+      taskId: submission.task_id,
+      bestScore: 0,
+      attempts: 0,
+      solved: false,
+      latestVerdict: null
+    };
+    current.attempts += 1;
+    current.bestScore = Math.max(current.bestScore, submission.score);
+    current.solved = current.solved || submission.verdict === "Accepted";
+    current.latestVerdict = submission.verdict;
+    progress[submission.task_id] = current;
+  }
+  return progress;
+}
+
 function ClarificationsBox({
   api,
   contestId,
   tasks,
   clarifications,
+  siteTimezone,
   onRefresh
 }: {
   api: ApiClient;
   contestId: number;
   tasks: Task[];
   clarifications: Clarification[];
+  siteTimezone: string;
   onRefresh: () => Promise<void>;
 }) {
   const { t } = useI18n();
@@ -580,7 +770,7 @@ function ClarificationsBox({
       </form>
       {clarifications.length ? (
         <div className="clarification-list">
-          {clarifications.map((item) => <ClarificationCard key={item.id} item={item} />)}
+          {clarifications.map((item) => <ClarificationCard key={item.id} item={item} siteTimezone={siteTimezone} />)}
         </div>
       ) : (
         <EmptyState title={t("empty.clarificationsTitle")} text={t("empty.clarificationsText")} />
@@ -589,7 +779,7 @@ function ClarificationsBox({
   );
 }
 
-function ClarificationCard({ item }: { item: Clarification }) {
+function ClarificationCard({ item, siteTimezone }: { item: Clarification; siteTimezone: string }) {
   const { t } = useI18n();
   return (
     <article className="clarification-card">
@@ -598,7 +788,7 @@ function ClarificationCard({ item }: { item: Clarification }) {
         <span className="meta-row">
           <span className="pill">{t(`clarification.status.${item.status}`)}</span>
           <span className="pill">{t(`clarification.visibility.${item.visibility}`)}</span>
-          <span>{formatDate(item.created_at)}</span>
+          <span>{formatDate(item.created_at, siteTimezone)}</span>
         </span>
       </div>
       <p>{item.question}</p>

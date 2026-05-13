@@ -9,6 +9,12 @@ from app.config import settings
 from app.main import LOGIN_ATTEMPTS, LOGIN_LOCKED_UNTIL
 
 
+def test_public_config_exposes_site_timezone(client: APIClient) -> None:
+    response = client.get("/api/config")
+    assert response.status_code == 200, response.text
+    assert response.json()["site_timezone"] == "Asia/Krasnoyarsk"
+
+
 def test_login_and_participant_cannot_access_admin_endpoints(
     client: APIClient,
     admin_headers: dict[str, str],
@@ -188,7 +194,13 @@ def test_import_users_from_csv_json_and_yaml(
     )
 
     assert response.status_code == 200, response.text
-    assert response.json() == {"created": 1, "skipped": 0, "errors": []}
+    assert response.json() == {
+        "created": 1,
+        "skipped": 0,
+        "errors": [],
+        "team_id": None,
+        "team_members_added": 0,
+    }
 
 
 def test_import_skips_existing_username_duplicates(client: APIClient, admin_headers: dict[str, str]) -> None:

@@ -158,10 +158,10 @@ def demo_contest(client: APIClient, admin_headers: dict[str, str]) -> dict[str, 
             "description": "Integration fixture contest",
             "status": "running",
             "is_public": True,
-            "time_mode": "individual",
+            "time_mode": "fixed",
             "starts_at": (now - timedelta(minutes=5)).isoformat(),
             "ends_at": (now + timedelta(hours=1)).isoformat(),
-            "individual_duration_minutes": 30,
+            "individual_duration_minutes": None,
         },
     )
     assert response.status_code == 200, response.text

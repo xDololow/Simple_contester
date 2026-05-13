@@ -34,6 +34,12 @@ class ContestParticipationMode(str, Enum):
     team = "team"
 
 
+class ScoreboardVisibility(str, Enum):
+    public = "public"
+    anonymous = "anonymous"
+    hidden = "hidden"
+
+
 class ContestRegistrationStatus(str, Enum):
     pending = "pending"
     approved = "approved"
@@ -99,6 +105,7 @@ class User(Base):
     display_name: Mapped[str] = mapped_column(String(160))
     role: Mapped[UserRole] = mapped_column(SAEnum(UserRole), default=UserRole.participant)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     teams: Mapped[list["TeamMember"]] = relationship(back_populates="user", cascade="all, delete-orphan")
@@ -147,6 +154,7 @@ class Contest(Base):
     individual_duration_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     scoreboard_freeze_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     scoreboard_unfrozen: Mapped[bool] = mapped_column(Boolean, default=False)
+    scoreboard_visibility: Mapped[str] = mapped_column(String(20), default=ScoreboardVisibility.public.value)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     tasks: Mapped[list["ContestTask"]] = relationship(back_populates="contest", cascade="all, delete-orphan")

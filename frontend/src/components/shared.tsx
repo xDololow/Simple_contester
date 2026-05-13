@@ -30,19 +30,29 @@ export function FlashMessage({ flash }: { flash: Flash }) {
   return <p className={flash.kind === "error" ? "error" : "success"}>{flash.text}</p>;
 }
 
-export function SubmissionDetailView({ detail, compact = false }: { detail: SubmissionDetail | null; compact?: boolean }) {
+export function SubmissionDetailView({
+  detail,
+  compact = false,
+  siteTimezone,
+  labels
+}: {
+  detail: SubmissionDetail | null;
+  compact?: boolean;
+  siteTimezone?: string;
+  labels?: { contest?: string; task?: string; user?: string };
+}) {
   const { t } = useI18n();
   if (!detail) return <div className={compact ? "detail compact-detail" : "detail"}><p className="muted">{t("submission.select")}</p></div>;
   return (
     <div className={compact ? "detail compact-detail" : "detail"}>
       <Header title={t("title.submission", { id: detail.id })} subtitle={`${detail.language} · ${formatScore(detail.score)} ${t("common.points")}`} />
       <div className="kv">
-        <span>{t("table.contest")}</span><strong>{detail.contest_id}</strong>
-        <span>{t("table.task")}</span><strong>{detail.task_id}</strong>
-        <span>{t("table.user")}</span><strong>{detail.user_id}</strong>
+        <span>{t("table.contest")}</span><strong>{labels?.contest ?? detail.contest_id}</strong>
+        <span>{t("table.task")}</span><strong>{labels?.task ?? detail.task_id}</strong>
+        <span>{t("table.user")}</span><strong>{labels?.user ?? detail.user_id}</strong>
         <span>{t("table.judger")}</span><strong>{detail.judger_id || "-"}</strong>
-        <span>{t("table.started")}</span><strong>{formatDate(detail.started_at)}</strong>
-        <span>{t("table.finished")}</span><strong>{formatDate(detail.finished_at)}</strong>
+        <span>{t("table.started")}</span><strong>{formatDate(detail.started_at, siteTimezone)}</strong>
+        <span>{t("table.finished")}</span><strong>{formatDate(detail.finished_at, siteTimezone)}</strong>
       </div>
       {detail.compile_output && <pre className="output">{detail.compile_output}</pre>}
       <pre className="source">{detail.source_code}</pre>

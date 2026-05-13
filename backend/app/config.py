@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     admin_username: str = "admin"
     admin_password: str = "admin"
     cors_origins: str = "http://localhost:5173"
+    site_timezone: str = "Asia/Krasnoyarsk"
 
     @property
     def cors_origin_list(self) -> list[str]:

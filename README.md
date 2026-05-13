@@ -2,6 +2,8 @@
 
 Closed/local olympiad contest platform MVP.
 
+Russian documentation: [README.ru.md](README.ru.md).
+
 ## Stack
 
 - Backend: FastAPI + SQLAlchemy
@@ -9,9 +11,21 @@ Closed/local olympiad contest platform MVP.
 - Database: MariaDB
 - Judger: Python worker, scalable via Docker Compose
 
+## Requirements
+
+- Git
+- Docker Engine with the Compose plugin
+- 4 GB+ free RAM for the full stack and judger toolchains
+- Optional for local scripts outside Docker: Python 3.12+, Bun, Node.js/npm
+
 ## Quick Start
 
+Clone the repository, copy the example environment file, and start the full
+local stack:
+
 ```bash
+git clone https://github.com/xDololow/Simple_contester.git
+cd Simple_contester
 cp .env.example .env
 docker compose up --build
 ```
@@ -27,6 +41,51 @@ Default admin credentials:
 ```text
 username: admin
 password: admin
+```
+
+Open the frontend, log in as `admin`, and change the admin password before
+creating real users or contests.
+
+Useful first commands:
+
+```bash
+# Run in the background after the first successful build.
+docker compose up -d
+
+# Watch backend and judger logs.
+docker compose logs -f backend judger
+
+# Stop containers but keep MariaDB data.
+docker compose down
+```
+
+## Publish To GitHub
+
+This repository is ready to be pushed to:
+
+```text
+https://github.com/xDololow/Simple_contester.git
+```
+
+Before publishing, make sure `.env`, backup files, local databases, caches, and
+generated frontend builds are not staged. The project `.gitignore` excludes
+those local artifacts.
+
+Recommended first publish flow:
+
+```bash
+git status --short
+bash scripts/ci.sh
+git remote add origin https://github.com/xDololow/Simple_contester.git
+git add .
+git commit -m "Prepare Simple Contester project"
+git push -u origin main
+```
+
+If `origin` already exists, replace the `remote add` command with:
+
+```bash
+git remote set-url origin https://github.com/xDololow/Simple_contester.git
 ```
 
 ## Production Deployment MVP
@@ -78,6 +137,59 @@ Reverse proxy and TLS:
   the `dev` profile so it is skipped unless explicitly requested.
 - Keep MariaDB off the public network. The prod override removes the host
   MariaDB port mapping.
+
+Example Caddy config for a local frontend service plus the backend API:
+
+```caddyfile
+contest.example.com {
+  encode zstd gzip
+
+  reverse_proxy /api/* 127.0.0.1:8001
+  reverse_proxy /docs* 127.0.0.1:8001
+  reverse_proxy /openapi.json 127.0.0.1:8001
+
+  reverse_proxy 127.0.0.1:5173
+}
+```
+
+Example nginx config. `proxy_buffering off` keeps live SSE updates responsive:
+
+```nginx
+server {
+  listen 80;
+  server_name contest.example.com;
+  client_max_body_size 100m;
+
+  location /api/ {
+    proxy_pass http://127.0.0.1:8001;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+  }
+
+  location /docs {
+    proxy_pass http://127.0.0.1:8001;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+
+  location = /openapi.json {
+    proxy_pass http://127.0.0.1:8001;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+
+  location / {
+    proxy_pass http://127.0.0.1:5173;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+}
+```
 
 Docker profiles and compose files:
 
@@ -276,6 +388,7 @@ Compose reads `.env` automatically. Start from `.env.example`; the defaults keep
 | `FRONTEND_PORT` | `5173` | Host port mapped to Vite container port `5173`. |
 | `VITE_API_BASE` | `http://localhost:8001` | API URL compiled into the Vite frontend. Update this when `BACKEND_PORT` changes. |
 | `CORS_ORIGINS` | `http://localhost:5173` | Comma-separated backend CORS origins. Update this when `FRONTEND_PORT` changes. |
+| `SITE_TIMEZONE` | `Asia/Krasnoyarsk` | IANA timezone used by the UI for date display and `datetime-local` form conversion. |
 | `DATABASE_URL` | `mysql+pymysql://contestant:contestant@mariadb:3306/simple_contester` | SQLAlchemy URL used by backend and judger inside Docker. |
 | `JWT_SECRET` | `change-me-in-production` | Token signing secret. Change outside local demo. |
 | `ACCESS_TOKEN_MINUTES` | `1440` | JWT access token lifetime in minutes. Existing login response shape is unchanged. |
@@ -636,6 +749,51 @@ bash scripts/demo.sh
 ```
 
 The script prints the created IDs and `curl` commands for both scoreboards. A judger should move the submissions from `Queued` to final verdicts.
+
+## Continuous Load Test
+
+`scripts/load_test.py` creates a private running contest, several participants,
+one A+B task, and then continuously submits solutions while polling live data,
+scoreboard, and submission history. By default it cycles through every supported
+language: Python, Java, JavaScript, TypeScript, C11, C++17, C++20, C#, Object
+Pascal, Fortran, Go, and Lua.
+
+Start the stack with one or more judgers first:
+
+```bash
+docker compose up --build -d
+docker compose up -d --scale judger=3
+```
+
+Run indefinitely until `Ctrl+C`:
+
+```bash
+python3 scripts/load_test.py
+```
+
+Short smoke run over all languages:
+
+```bash
+python3 scripts/load_test.py --iterations 1 --interval 0
+```
+
+Useful knobs:
+
+```bash
+API_BASE=http://localhost:8001 \
+ADMIN_USERNAME=admin \
+ADMIN_PASSWORD=admin \
+LOAD_PARTICIPANTS=5 \
+LOAD_LANGUAGES=python,cpp17,go \
+LOAD_WRONG_EVERY=10 \
+LOAD_REJUDGE_EVERY=25 \
+python3 scripts/load_test.py
+```
+
+`LOAD_WRONG_EVERY` intentionally submits a wrong solution every N submissions.
+`LOAD_REJUDGE_EVERY` asks the admin API to requeue a random previous submission
+every N submissions, which is useful when testing queue leases and repeated
+judging.
 
 Equivalent curl workflow:
 

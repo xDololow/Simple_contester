@@ -2,6 +2,7 @@ export type Role = "admin" | "participant";
 export type ContestStatus = "draft" | "scheduled" | "running" | "finished" | "archived";
 export type TimeMode = "fixed" | "individual";
 export type ParticipationMode = "individual" | "team";
+export type ScoreboardVisibility = "public" | "anonymous" | "hidden";
 export type ContestRegistrationStatus = "pending" | "approved" | "rejected";
 export type ClarificationStatus = "open" | "answered" | "closed";
 export type ClarificationVisibility = "private" | "broadcast";
@@ -21,12 +22,17 @@ export type Language =
 
 export type ApiClient = <T>(path: string, init?: RequestInit) => Promise<T>;
 
+export type AppConfig = {
+  site_timezone: string;
+};
+
 export type User = {
   id: number;
   username: string;
   display_name: string;
   role: Role;
   is_active: boolean;
+  timezone?: string | null;
   created_at?: string | null;
 };
 
@@ -52,6 +58,7 @@ export type Contest = {
   individual_duration_minutes: number | null;
   scoreboard_freeze_at: string | null;
   scoreboard_unfrozen: boolean;
+  scoreboard_visibility: ScoreboardVisibility;
   created_at?: string | null;
 };
 
@@ -70,6 +77,27 @@ export type ContestRegistration = {
   team_name?: string | null;
   decided_by_username?: string | null;
   can_access?: boolean;
+};
+
+export type ParticipantContestTime = {
+  id: number;
+  contest_id: number;
+  user_id: number;
+  username: string;
+  display_name: string;
+  started_at: string | null;
+  deadline_at: string | null;
+  duration_seconds: number | null;
+  spent_seconds: number | null;
+  remaining_seconds: number | null;
+};
+
+export type ParticipantContest = {
+  id: number;
+  contest_id: number;
+  user_id: number;
+  started_at: string | null;
+  deadline_at: string | null;
 };
 
 export type Task = {
@@ -165,6 +193,7 @@ export type ContestLiveEvent = {
   submissions: Submission[];
   scoreboard: ScoreboardRow[];
   scoreboard_frozen?: boolean;
+  scoreboard_visibility?: ScoreboardVisibility;
 };
 
 export type Clarification = {
@@ -189,6 +218,8 @@ export type ImportReport = {
   created: number;
   skipped: number;
   errors: string[];
+  team_id?: number | null;
+  team_members_added?: number;
 };
 
 export type TestArchiveImportReport = {

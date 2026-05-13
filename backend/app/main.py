@@ -6,13 +6,15 @@ import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import PurePosixPath
+from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
-from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from sqlalchemy import and_, func, or_, select, text
+from sqlalchemy import and_, delete, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -35,6 +37,7 @@ from .models import (
     JudgerEvent,
     Language,
     ParticipantContest,
+    ScoreboardVisibility,
     Submission,
     SubmissionVerdict,
     Task,
@@ -42,6 +45,7 @@ from .models import (
     TaskVersion,
     Team,
     TeamMember,
+    TestResult,
     User,
     UserRole,
 )
@@ -54,6 +58,8 @@ from .schemas import (
     AdminSubmissionsStats,
     AdminSystemStats,
     AdminUsersStats,
+    AdminParticipantContestTimeOut,
+    AppConfigOut,
     ClarificationAdminUpdate,
     ClarificationCreate,
     ClarificationOut,
@@ -68,6 +74,7 @@ from .schemas import (
     ImportReport,
     LoginIn,
     ParticipantContestOut,
+    ParticipantContestTimeUpdate,
     PackageImportReport,
     PasswordChangeIn,
     ScoreboardCell,
@@ -92,6 +99,7 @@ from .schemas import (
     TokenOut,
     UserCreate,
     UserOut,
+    UserPreferencesUpdate,
     UserUpdate,
 )
 
@@ -120,6 +128,32 @@ def now_utc() -> datetime:
     return datetime.utcnow()
 
 
+def configured_site_timezone() -> str:
+    try:
+        ZoneInfo(settings.site_timezone)
+        return settings.site_timezone
+    except ZoneInfoNotFoundError:
+        return "UTC"
+
+
+def normalize_timezone(value: str | None) -> str | None:
+    if value is None:
+        return None
+    timezone_name = value.strip()
+    if not timezone_name:
+        return None
+    try:
+        ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as exc:
+        raise HTTPException(status_code=400, detail="Unknown timezone") from exc
+    return timezone_name
+
+
+@app.get("/api/config", response_model=AppConfigOut)
+def get_app_config() -> AppConfigOut:
+    return AppConfigOut(site_timezone=configured_site_timezone())
+
+
 def normalize_dt(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value
@@ -130,6 +164,42 @@ def is_scoreboard_frozen_for_user(contest: Contest, user: User, current: datetim
     if user.role == UserRole.admin or contest.scoreboard_unfrozen or contest.scoreboard_freeze_at is None:
         return False
     return normalize_dt(current or now_utc()) >= normalize_dt(contest.scoreboard_freeze_at)
+
+
+def contest_scoreboard_visibility(contest: Contest) -> ScoreboardVisibility:
+    try:
+        return ScoreboardVisibility(contest.scoreboard_visibility or ScoreboardVisibility.public.value)
+    except ValueError:
+        return ScoreboardVisibility.public
+
+
+def encode_scoreboard_visibility(value: Any) -> str:
+    return value.value if hasattr(value, "value") else str(value)
+
+
+def apply_scoreboard_visibility(contest: Contest, user: User, rows: list[ScoreboardRow]) -> list[ScoreboardRow]:
+    visibility = contest_scoreboard_visibility(contest)
+    if user.role == UserRole.admin or visibility == ScoreboardVisibility.public:
+        return rows
+    if visibility == ScoreboardVisibility.hidden:
+        return []
+
+    label_prefix = "Team" if contest.participation_mode == ContestParticipationMode.team else "Participant"
+    anonymized: list[ScoreboardRow] = []
+    for index, row in enumerate(rows, start=1):
+        label = f"{label_prefix} #{index}"
+        anonymized.append(
+            row.model_copy(
+                update={
+                    "user_id": -index,
+                    "username": label,
+                    "display_name": label,
+                    "team_id": -index if contest.participation_mode == ContestParticipationMode.team else None,
+                    "team_name": label if contest.participation_mode == ContestParticipationMode.team else None,
+                }
+            )
+        )
+    return anonymized
 
 
 def validate_contest_time_window(
@@ -154,6 +224,60 @@ def validate_contest_time_window(
         available_minutes = int((ends_at - starts_at).total_seconds() // 60)
         if individual_duration_minutes > available_minutes:
             raise HTTPException(status_code=400, detail="individual_duration_minutes must fit contest window")
+
+
+def effective_contest_status(
+    status_value: ContestStatus,
+    starts_at: datetime,
+    ends_at: datetime,
+    current: datetime | None = None,
+) -> ContestStatus:
+    if status_value in {ContestStatus.draft, ContestStatus.archived}:
+        return status_value
+    now = normalize_dt(current or now_utc())
+    starts = normalize_dt(starts_at)
+    ends = normalize_dt(ends_at)
+    if now < starts:
+        return ContestStatus.scheduled
+    if now <= ends:
+        return ContestStatus.running
+    return ContestStatus.finished
+
+
+def sync_contest_status(contest: Contest, current: datetime | None = None) -> None:
+    contest.status = effective_contest_status(contest.status, contest.starts_at, contest.ends_at, current)
+
+
+def contest_to_out(contest: Contest) -> ContestOut:
+    data = ContestOut.model_validate(contest)
+    data.status = effective_contest_status(data.status, data.starts_at, data.ends_at)
+    return data
+
+
+def normalize_contest_access(payload: dict[str, Any], contest: Contest | None = None) -> None:
+    is_public = bool(payload.get("is_public", contest.is_public if contest is not None else False))
+    registration_enabled = bool(
+        payload.get("registration_enabled", contest.registration_enabled if contest is not None else False)
+    )
+    registration_requires_approval = bool(
+        payload.get(
+            "registration_requires_approval",
+            contest.registration_requires_approval if contest is not None else False,
+        )
+    )
+    if is_public:
+        payload["is_public"] = True
+        payload["registration_enabled"] = False
+        payload["registration_requires_approval"] = False
+        return
+    if registration_enabled:
+        payload["is_public"] = False
+        payload["registration_enabled"] = True
+        payload["registration_requires_approval"] = registration_requires_approval
+        return
+    payload["is_public"] = False
+    payload["registration_enabled"] = False
+    payload["registration_requires_approval"] = False
 
 
 def ensure_admin(db: Session) -> None:
@@ -211,6 +335,15 @@ def ensure_task_test_scoring_columns() -> None:
         group_column = conn.execute(text("SHOW COLUMNS FROM task_tests LIKE 'group_name'")).mappings().first()
         if group_column is None:
             conn.execute(text("ALTER TABLE task_tests ADD COLUMN group_name VARCHAR(120) NULL"))
+
+
+def ensure_user_timezone_column() -> None:
+    if engine.dialect.name not in {"mysql", "mariadb"}:
+        return
+    with engine.begin() as conn:
+        column = conn.execute(text("SHOW COLUMNS FROM users LIKE 'timezone'")).mappings().first()
+        if column is None:
+            conn.execute(text("ALTER TABLE users ADD COLUMN timezone VARCHAR(64) NULL"))
 
 
 def ensure_task_versioning_schema() -> None:
@@ -275,6 +408,9 @@ def ensure_contest_access_columns() -> None:
         column = conn.execute(text("SHOW COLUMNS FROM contests LIKE 'scoreboard_unfrozen'")).mappings().first()
         if column is None:
             conn.execute(text("ALTER TABLE contests ADD COLUMN scoreboard_unfrozen BOOL NOT NULL DEFAULT 0"))
+        column = conn.execute(text("SHOW COLUMNS FROM contests LIKE 'scoreboard_visibility'")).mappings().first()
+        if column is None:
+            conn.execute(text("ALTER TABLE contests ADD COLUMN scoreboard_visibility VARCHAR(20) NOT NULL DEFAULT 'public'"))
         column = conn.execute(text("SHOW COLUMNS FROM submissions LIKE 'team_id'")).mappings().first()
         if column is None:
             conn.execute(text("ALTER TABLE submissions ADD COLUMN team_id INT NULL"))
@@ -380,6 +516,7 @@ def startup() -> None:
     ensure_float_score_columns()
     ensure_partial_scoring_column()
     ensure_task_test_scoring_columns()
+    ensure_user_timezone_column()
     ensure_task_versioning_schema()
     ensure_contest_access_columns()
     ensure_contest_registrations_table()
@@ -661,6 +798,13 @@ def assert_contest_access(db: Session, contest: Contest, user: User) -> None:
     raise HTTPException(status_code=403, detail="Contest is not available")
 
 
+def assert_contest_started(contest: Contest, user: User) -> None:
+    if user.role == UserRole.admin:
+        return
+    if normalize_dt(now_utc()) < normalize_dt(contest.starts_at):
+        raise HTTPException(status_code=403, detail="Contest has not started")
+
+
 def assert_contest_visible_for_registration(db: Session, contest: Contest, user: User) -> None:
     if contest.registration_enabled:
         return
@@ -789,6 +933,8 @@ def get_or_start_participant_contest(db: Session, contest: Contest, user: User) 
     if existing and existing.started_at is not None and existing.deadline_at is not None:
         return existing
     started_at = now_utc()
+    if started_at < normalize_dt(contest.starts_at) or started_at > normalize_dt(contest.ends_at):
+        raise HTTPException(status_code=400, detail="Contest is outside the available window")
     if contest.time_mode == ContestTimeMode.individual:
         if contest.individual_duration_minutes is None:
             raise HTTPException(status_code=400, detail="Individual duration is not configured")
@@ -805,14 +951,71 @@ def get_or_start_participant_contest(db: Session, contest: Contest, user: User) 
     return participant
 
 
+def get_participant_contest(db: Session, contest: Contest, user: User) -> ParticipantContest | None:
+    return db.scalar(
+        select(ParticipantContest).where(
+            ParticipantContest.contest_id == contest.id,
+            ParticipantContest.user_id == user.id,
+        )
+    )
+
+
+def assert_individual_attempt_started(db: Session, contest: Contest, user: User) -> ParticipantContest | None:
+    if user.role == UserRole.admin or contest.time_mode != ContestTimeMode.individual:
+        return None
+    participant = get_participant_contest(db, contest, user)
+    if participant is None or participant.started_at is None or participant.deadline_at is None:
+        raise HTTPException(status_code=403, detail="Contest attempt has not started")
+    return participant
+
+
+def participant_time_out(contest: Contest, participant: ParticipantContest, user: User) -> AdminParticipantContestTimeOut:
+    started_at = normalize_dt(participant.started_at) if participant.started_at else None
+    deadline_at = normalize_dt(participant.deadline_at) if participant.deadline_at else None
+    duration_seconds: int | None = None
+    spent_seconds: int | None = None
+    remaining_seconds: int | None = None
+    current = now_utc()
+    if started_at is not None and deadline_at is not None:
+        duration_seconds = max(0, int((deadline_at - started_at).total_seconds()))
+        spent_until = min(current, deadline_at)
+        spent_seconds = max(0, int((spent_until - started_at).total_seconds()))
+        remaining_seconds = max(0, int((deadline_at - current).total_seconds()))
+    elif contest.time_mode == ContestTimeMode.individual and contest.individual_duration_minutes is not None:
+        duration_seconds = contest.individual_duration_minutes * 60
+        if started_at is None:
+            spent_seconds = 0
+            remaining_seconds = duration_seconds
+    return AdminParticipantContestTimeOut(
+        id=participant.id,
+        contest_id=participant.contest_id,
+        user_id=participant.user_id,
+        username=user.username,
+        display_name=user.display_name,
+        started_at=participant.started_at,
+        deadline_at=participant.deadline_at,
+        duration_seconds=duration_seconds,
+        spent_seconds=spent_seconds,
+        remaining_seconds=remaining_seconds,
+    )
+
+
+def validate_participant_time_window(participant: ParticipantContest) -> None:
+    if participant.started_at is not None and participant.deadline_at is not None:
+        if normalize_dt(participant.deadline_at) <= normalize_dt(participant.started_at):
+            raise HTTPException(status_code=400, detail="deadline_at must be after started_at")
+
+
 def assert_contest_allows_submission(db: Session, contest: Contest, user: User) -> None:
     assert_contest_access(db, contest, user)
     current = now_utc()
-    if current < contest.starts_at or current > contest.ends_at:
+    if current < normalize_dt(contest.starts_at) or current > normalize_dt(contest.ends_at):
         raise HTTPException(status_code=400, detail="Contest is outside the available window")
     if contest.time_mode == ContestTimeMode.individual and contest.individual_duration_minutes is None:
         raise HTTPException(status_code=400, detail="Individual duration is not configured")
-    participant = get_or_start_participant_contest(db, contest, user)
+    participant = assert_individual_attempt_started(db, contest, user)
+    if participant is None:
+        return
     if participant.deadline_at is not None and current > participant.deadline_at:
         raise HTTPException(status_code=400, detail="Individual contest deadline has passed")
 
@@ -885,6 +1088,18 @@ def change_password(data: PasswordChangeIn, user: User = Depends(get_current_use
     return user
 
 
+@app.patch("/api/me/preferences", response_model=UserOut)
+def update_preferences(
+    data: UserPreferencesUpdate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> User:
+    user.timezone = normalize_timezone(data.timezone)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
 @app.get("/api/users", response_model=list[UserOut])
 def list_users(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> list[User]:
     return list(db.scalars(select(User).order_by(User.username)))
@@ -897,6 +1112,7 @@ def create_user(data: UserCreate, _: User = Depends(require_admin), db: Session 
         password_hash=hash_password(data.password),
         display_name=data.display_name or data.username,
         role=data.role,
+        timezone=normalize_timezone(data.timezone),
     )
     db.add(user)
     try:
@@ -918,6 +1134,8 @@ def update_user(user_id: int, data: UserUpdate, _: User = Depends(require_admin)
     user = get_user_or_404(db, user_id)
     updates = data.model_dump(exclude_unset=True)
     password = updates.pop("password", None)
+    if "timezone" in updates:
+        updates["timezone"] = normalize_timezone(updates["timezone"])
     for key, value in updates.items():
         setattr(user, key, value)
     if password is not None:
@@ -962,7 +1180,13 @@ def parse_import_file(filename: str, content: bytes) -> list[dict]:
 
 
 @app.post("/api/users/import", response_model=ImportReport)
-async def import_users(file: UploadFile = File(...), _: User = Depends(require_admin), db: Session = Depends(get_db)) -> ImportReport:
+async def import_users(
+    file: UploadFile = File(...),
+    team_id: int | None = Form(default=None),
+    team_name: str | None = Form(default=None),
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> ImportReport:
     try:
         rows = parse_import_file(file.filename or "", await file.read())
     except Exception as exc:
@@ -971,6 +1195,7 @@ async def import_users(file: UploadFile = File(...), _: User = Depends(require_a
     created = 0
     skipped = 0
     errors: list[str] = []
+    created_users: list[User] = []
     for index, row in enumerate(rows, start=1):
         username = str(row.get("username") or "").strip()
         password = str(row.get("password") or "")
@@ -990,10 +1215,41 @@ async def import_users(file: UploadFile = File(...), _: User = Depends(require_a
             skipped += 1
             errors.append(f"Row {index}: unknown role '{role_value}'")
             continue
-        db.add(User(username=username, password_hash=hash_password(password), display_name=display_name, role=role))
+        user = User(username=username, password_hash=hash_password(password), display_name=display_name, role=role)
+        db.add(user)
+        created_users.append(user)
         created += 1
+    target_team: Team | None = None
+    cleaned_team_name = (team_name or "").strip()
+    if team_id is not None and cleaned_team_name:
+        raise HTTPException(status_code=400, detail="Use either team_id or team_name, not both")
+    if team_id is not None:
+        target_team = db.get(Team, team_id)
+        if target_team is None:
+            raise HTTPException(status_code=404, detail="Team not found")
+    elif cleaned_team_name and created_users:
+        target_team = db.scalar(select(Team).where(Team.name == cleaned_team_name))
+        if target_team is None:
+            target_team = Team(name=cleaned_team_name)
+            db.add(target_team)
+            db.flush()
+    team_members_added = 0
+    if target_team is not None and created_users:
+        db.flush()
+        existing_member_ids = {member.user_id for member in target_team.members}
+        for user in created_users:
+            if user.id not in existing_member_ids:
+                target_team.members.append(TeamMember(user_id=user.id))
+                existing_member_ids.add(user.id)
+                team_members_added += 1
     db.commit()
-    return ImportReport(created=created, skipped=skipped, errors=errors)
+    return ImportReport(
+        created=created,
+        skipped=skipped,
+        errors=errors,
+        team_id=target_team.id if target_team is not None else None,
+        team_members_added=team_members_added,
+    )
 
 
 def count_rows(db: Session, model: type[object]) -> int:
@@ -1132,7 +1388,10 @@ def admin_stats(_: User = Depends(require_admin), db: Session = Depends(get_db))
     stale_running_before = current - timedelta(seconds=STALE_RUNNING_SECONDS)
 
     users_by_role = grouped_counts(db, User.role)
-    contests_by_status = grouped_counts(db, Contest.status)
+    contests = db.scalars(select(Contest)).all()
+    contests_by_status = {status: 0 for status in ContestStatus}
+    for contest in contests:
+        contests_by_status[effective_contest_status(contest.status, contest.starts_at, contest.ends_at, current)] += 1
     submissions_by_verdict = grouped_counts(db, Submission.verdict)
     submissions_by_language = grouped_counts(db, Submission.language)
     submission_total = sum(submissions_by_verdict.values())
@@ -1214,8 +1473,8 @@ def admin_stats(_: User = Depends(require_admin), db: Session = Depends(get_db))
         ),
         teams_total=count_rows(db, Team),
         contests=AdminContestsStats(
-            total=count_rows(db, Contest),
-            by_status={status: contests_by_status.get(status, 0) for status in ContestStatus},
+            total=len(contests),
+            by_status=contests_by_status,
             public=db.scalar(select(func.count()).select_from(Contest).where(Contest.is_public.is_(True))) or 0,
             private=db.scalar(select(func.count()).select_from(Contest).where(Contest.is_public.is_(False))) or 0,
             individual=db.scalar(select(func.count()).select_from(Contest).where(Contest.participation_mode == ContestParticipationMode.individual)) or 0,
@@ -1589,6 +1848,7 @@ def create_contest_package_zip(contest: Contest) -> bytes:
                 "individual_duration_minutes": contest.individual_duration_minutes,
                 "scoreboard_freeze_at": contest.scoreboard_freeze_at.isoformat() if contest.scoreboard_freeze_at else None,
                 "scoreboard_unfrozen": contest.scoreboard_unfrozen,
+                "scoreboard_visibility": contest_scoreboard_visibility(contest).value,
             },
             "tasks": [
                 {"dir": f"tasks/{index:03d}", "position": index - 1, "title": link.task.title}
@@ -1728,6 +1988,7 @@ def import_contest_package_zip(db: Session, content: bytes) -> PackageImportRepo
         individual_duration_minutes = contest_data.get("individual_duration_minutes")
         if individual_duration_minutes is not None:
             individual_duration_minutes = int(individual_duration_minutes)
+        scoreboard_visibility = ScoreboardVisibility(str(contest_data.get("scoreboard_visibility") or ScoreboardVisibility.public.value))
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="Invalid contest mode or duration metadata") from exc
     validate_contest_time_window(starts_at, ends_at, time_mode, individual_duration_minutes, scoreboard_freeze_at)
@@ -1745,6 +2006,7 @@ def import_contest_package_zip(db: Session, content: bytes) -> PackageImportRepo
         individual_duration_minutes=individual_duration_minutes,
         scoreboard_freeze_at=scoreboard_freeze_at,
         scoreboard_unfrozen=bool(contest_data.get("scoreboard_unfrozen", False)),
+        scoreboard_visibility=scoreboard_visibility.value,
     )
     db.add(contest)
     db.flush()
@@ -1870,7 +2132,7 @@ def delete_team(team_id: int, _: User = Depends(require_admin), db: Session = De
 
 
 @app.get("/api/contests", response_model=list[ContestOut])
-def list_contests(db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list[Contest]:
+def list_contests(db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list[ContestOut]:
     stmt = select(Contest).order_by(Contest.starts_at.desc())
     if user.role != UserRole.admin:
         accessible_contests = select(ParticipantContest.contest_id).where(ParticipantContest.user_id == user.id)
@@ -1901,16 +2163,18 @@ def list_contests(db: Session = Depends(get_db), user: User = Depends(get_curren
                 and_(Contest.participation_mode == ContestParticipationMode.team, Contest.id.in_(registered_team_contests)),
             )
         )
-    return list(db.scalars(stmt))
+    return [contest_to_out(contest) for contest in db.scalars(stmt)]
 
 
 @app.post("/api/contests", response_model=ContestOut)
-def create_contest(data: ContestCreate, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> Contest:
+def create_contest(data: ContestCreate, _: User = Depends(require_admin), db: Session = Depends(get_db)) -> ContestOut:
     payload = data.model_dump()
     payload["starts_at"] = normalize_dt(payload["starts_at"])
     payload["ends_at"] = normalize_dt(payload["ends_at"])
     if payload["scoreboard_freeze_at"] is not None:
         payload["scoreboard_freeze_at"] = normalize_dt(payload["scoreboard_freeze_at"])
+    payload["scoreboard_visibility"] = encode_scoreboard_visibility(payload["scoreboard_visibility"])
+    normalize_contest_access(payload)
     validate_contest_time_window(
         payload["starts_at"],
         payload["ends_at"],
@@ -1919,10 +2183,11 @@ def create_contest(data: ContestCreate, _: User = Depends(require_admin), db: Se
         payload["scoreboard_freeze_at"],
     )
     contest = Contest(**payload)
+    sync_contest_status(contest)
     db.add(contest)
     db.commit()
     db.refresh(contest)
-    return contest
+    return contest_to_out(contest)
 
 
 @app.post("/api/contests/import-package", response_model=PackageImportReport)
@@ -1938,10 +2203,10 @@ async def import_contest_package(
 
 
 @app.get("/api/contests/{contest_id}", response_model=ContestOut)
-def get_contest(contest_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> Contest:
+def get_contest(contest_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> ContestOut:
     contest = get_contest_or_404(db, contest_id)
     assert_contest_visible_for_registration(db, contest, user)
-    return contest
+    return contest_to_out(contest)
 
 
 @app.patch("/api/contests/{contest_id}", response_model=ContestOut)
@@ -1950,12 +2215,15 @@ def update_contest(
     data: ContestUpdate,
     _: User = Depends(require_admin),
     db: Session = Depends(get_db),
-) -> Contest:
+) -> ContestOut:
     contest = get_contest_or_404(db, contest_id)
     updates = data.model_dump(exclude_unset=True)
     for key in ("starts_at", "ends_at", "scoreboard_freeze_at"):
         if key in updates and updates[key] is not None:
             updates[key] = normalize_dt(updates[key])
+    if "scoreboard_visibility" in updates:
+        updates["scoreboard_visibility"] = encode_scoreboard_visibility(updates["scoreboard_visibility"])
+    normalize_contest_access(updates, contest)
     candidate = {
         "starts_at": updates.get("starts_at", contest.starts_at),
         "ends_at": updates.get("ends_at", contest.ends_at),
@@ -1969,9 +2237,10 @@ def update_contest(
     validate_contest_time_window(**candidate)
     for key, value in updates.items():
         setattr(contest, key, value)
+    sync_contest_status(contest)
     db.commit()
     db.refresh(contest)
-    return contest
+    return contest_to_out(contest)
 
 
 @app.delete("/api/contests/{contest_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -2005,6 +2274,106 @@ def start_contest(contest_id: int, db: Session = Depends(get_db), user: User = D
     contest = get_contest_or_404(db, contest_id)
     assert_contest_access(db, contest, user)
     return get_or_start_participant_contest(db, contest, user)
+
+
+@app.post("/api/contests/{contest_id}/start", response_model=ParticipantContestOut)
+def start_contest_attempt(contest_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> ParticipantContest:
+    contest = get_contest_or_404(db, contest_id)
+    assert_contest_access(db, contest, user)
+    return get_or_start_participant_contest(db, contest, user)
+
+
+@app.get("/api/contests/{contest_id}/participant-window", response_model=ParticipantContestOut | None)
+def get_contest_participant_window(
+    contest_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ParticipantContest | None:
+    contest = get_contest_or_404(db, contest_id)
+    assert_contest_access(db, contest, user)
+    if user.role == UserRole.admin or contest.time_mode != ContestTimeMode.individual:
+        return None
+    return get_participant_contest(db, contest, user)
+
+
+@app.get("/api/admin/contests/{contest_id}/participant-times", response_model=list[AdminParticipantContestTimeOut])
+def list_admin_participant_times(
+    contest_id: int,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> list[AdminParticipantContestTimeOut]:
+    contest = get_contest_or_404(db, contest_id)
+    if contest.time_mode != ContestTimeMode.individual:
+        raise HTTPException(status_code=400, detail="Contest does not use individual time")
+    rows = db.execute(
+        select(ParticipantContest, User)
+        .join(User, User.id == ParticipantContest.user_id)
+        .where(ParticipantContest.contest_id == contest_id)
+        .order_by(User.username)
+    ).all()
+    return [participant_time_out(contest, participant, participant_user) for participant, participant_user in rows]
+
+
+@app.patch(
+    "/api/admin/contests/{contest_id}/participant-times/{user_id}",
+    response_model=AdminParticipantContestTimeOut,
+)
+def update_admin_participant_time(
+    contest_id: int,
+    user_id: int,
+    data: ParticipantContestTimeUpdate,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> AdminParticipantContestTimeOut:
+    contest = get_contest_or_404(db, contest_id)
+    if contest.time_mode != ContestTimeMode.individual:
+        raise HTTPException(status_code=400, detail="Contest does not use individual time")
+    participant_user = db.get(User, user_id)
+    if participant_user is None or participant_user.role != UserRole.participant:
+        raise HTTPException(status_code=404, detail="Participant not found")
+    participant = db.scalar(
+        select(ParticipantContest).where(
+            ParticipantContest.contest_id == contest_id,
+            ParticipantContest.user_id == user_id,
+        )
+    )
+    if participant is None:
+        participant = ParticipantContest(contest_id=contest_id, user_id=user_id)
+        db.add(participant)
+        db.flush()
+    updates = data.model_dump(exclude_unset=True)
+    if data.reset:
+        participant.started_at = None
+        participant.deadline_at = None
+    else:
+        if "started_at" in updates:
+            raw_started_at = updates["started_at"]
+            participant.started_at = normalize_dt(raw_started_at) if raw_started_at is not None else None
+            if raw_started_at is None:
+                participant.deadline_at = None
+        if "deadline_at" in updates:
+            raw_deadline_at = updates["deadline_at"]
+            participant.deadline_at = normalize_dt(raw_deadline_at) if raw_deadline_at is not None else None
+        if data.duration_seconds is not None:
+            if participant.started_at is None:
+                participant.started_at = now_utc()
+            participant.deadline_at = normalize_dt(participant.started_at) + timedelta(seconds=data.duration_seconds)
+        if data.delta_seconds is not None:
+            if participant.deadline_at is None:
+                raise HTTPException(status_code=400, detail="Participant has no deadline to adjust")
+            participant.deadline_at = normalize_dt(participant.deadline_at) + timedelta(seconds=data.delta_seconds)
+    validate_participant_time_window(participant)
+    if participant.started_at is not None:
+        started_at = normalize_dt(participant.started_at)
+        if started_at < normalize_dt(contest.starts_at):
+            raise HTTPException(status_code=400, detail="started_at must be within contest window")
+        if started_at > normalize_dt(contest.ends_at):
+            raise HTTPException(status_code=400, detail="started_at must be within contest window")
+    if participant.deadline_at is not None and normalize_dt(participant.deadline_at) > normalize_dt(contest.ends_at):
+        raise HTTPException(status_code=400, detail="deadline_at must be within contest window")
+    db.commit()
+    db.refresh(participant)
+    return participant_time_out(contest, participant, participant_user)
 
 
 @app.get("/api/contests/{contest_id}/registration", response_model=ContestRegistrationDetailOut | None)
@@ -2165,6 +2534,8 @@ def list_contest_clarifications(
 ) -> list[ClarificationOut]:
     contest = get_contest_or_404(db, contest_id)
     assert_contest_access(db, contest, user)
+    assert_contest_started(contest, user)
+    assert_individual_attempt_started(db, contest, user)
     clarifications = list_clarifications_for_contest(db, contest, user)
     return [to_clarification_out(db, clarification) for clarification in clarifications]
 
@@ -2178,6 +2549,8 @@ def create_contest_clarification(
 ) -> ClarificationOut:
     contest = get_contest_or_404(db, contest_id)
     assert_contest_access(db, contest, user)
+    assert_contest_started(contest, user)
+    assert_individual_attempt_started(db, contest, user)
     if data.task_id is not None and not task_belongs_to_contest(db, contest_id, data.task_id):
         raise HTTPException(status_code=404, detail="Contest task not found")
     question = data.question.strip()
@@ -2249,6 +2622,8 @@ def update_admin_clarification(
 def list_tasks(contest_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list[TaskOut]:
     contest = get_contest_or_404(db, contest_id)
     assert_contest_access(db, contest, user)
+    assert_contest_started(contest, user)
+    assert_individual_attempt_started(db, contest, user)
     return list_contest_tasks(db, contest_id)
 
 
@@ -2334,6 +2709,8 @@ def get_task(task_id: int, db: Session = Depends(get_db), user: User = Depends(g
         for contest in contests:
             try:
                 assert_contest_access(db, contest, user)
+                assert_contest_started(contest, user)
+                assert_individual_attempt_started(db, contest, user)
                 has_access = True
                 break
             except HTTPException:
@@ -2522,6 +2899,8 @@ def list_submissions(
     if contest_id is not None:
         contest = get_contest_or_404(db, contest_id)
         assert_contest_access(db, contest, user)
+        assert_contest_started(contest, user)
+        assert_individual_attempt_started(db, contest, user)
         filters.append(Submission.contest_id == contest_id)
     if user.role != UserRole.admin:
         team_ids: list[int] = []
@@ -2575,6 +2954,8 @@ def get_submission(submission_id: int, db: Session = Depends(get_db), user: User
         raise HTTPException(status_code=404, detail="Submission not found")
     contest = get_contest_or_404(db, submission.contest_id)
     assert_contest_access(db, contest, user)
+    assert_contest_started(contest, user)
+    assert_individual_attempt_started(db, contest, user)
     if user.role != UserRole.admin:
         team_ids = get_accessible_team_ids_for_user(db, contest.id, user.id) if contest.participation_mode == ContestParticipationMode.team else []
         if submission.user_id != user.id and (submission.team_id is None or submission.team_id not in team_ids):
@@ -2594,6 +2975,38 @@ def get_admin_submission_detail(
     if submission is None:
         raise HTTPException(status_code=404, detail="Submission not found")
     return submission
+
+
+@app.post("/api/admin/submissions/{submission_id}/rejudge", response_model=SubmissionAdminDetailOut)
+def rejudge_submission(
+    submission_id: int,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> Submission:
+    submission = db.scalar(
+        select(Submission).where(Submission.id == submission_id).options(selectinload(Submission.results))
+    )
+    if submission is None:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    task = get_task_or_404(db, submission.task_id)
+    task_version = create_task_version_if_changed(db, task, admin.id)
+    db.execute(delete(TestResult).where(TestResult.submission_id == submission_id))
+    db.expire(submission, ["results"])
+    submission.task_version_id = task_version.id
+    submission.verdict = SubmissionVerdict.queued
+    submission.score = 0.0
+    submission.compile_output = ""
+    submission.started_at = None
+    submission.finished_at = None
+    submission.judger_id = None
+    submission.claimed_at = None
+    submission.claim_expires_at = None
+    submission.claim_token = None
+    submission.attempt_number = 0
+    db.commit()
+    return db.scalar(
+        select(Submission).where(Submission.id == submission_id).options(selectinload(Submission.results))
+    ) or submission
 
 
 @app.get("/api/admin/submissions/{submission_id}/test-results", response_model=list[TestResultOut])
@@ -2616,12 +3029,20 @@ def sse_event(event: str, data: object) -> str:
 
 def contest_events_payload(db: Session, contest_id: int, user: User) -> dict[str, object]:
     contest = get_contest_or_404(db, contest_id)
+    assert_contest_access(db, contest, user)
+    assert_contest_started(contest, user)
+    assert_individual_attempt_started(db, contest, user)
     submissions = [
         SubmissionOut.model_validate(submission).model_dump(mode="json")
         for submission in list_submissions(contest_id=contest_id, db=db, user=user)
     ]
     rows = [row.model_dump(mode="json") for row in scoreboard(contest_id=contest_id, db=db, user=user)]
-    return {"submissions": submissions, "scoreboard": rows, "scoreboard_frozen": is_scoreboard_frozen_for_user(contest, user)}
+    return {
+        "submissions": submissions,
+        "scoreboard": rows,
+        "scoreboard_frozen": is_scoreboard_frozen_for_user(contest, user),
+        "scoreboard_visibility": contest_scoreboard_visibility(contest).value,
+    }
 
 
 def contest_events_fingerprint(db: Session, contest_id: int) -> str:
@@ -2658,6 +3079,7 @@ def contest_events_fingerprint(db: Session, contest_id: int) -> str:
                 "contest",
                 contest.scoreboard_freeze_at.isoformat() if contest.scoreboard_freeze_at else None,
                 contest.scoreboard_unfrozen,
+                contest_scoreboard_visibility(contest).value,
             ]
         ],
         separators=(",", ":"),
@@ -2668,6 +3090,8 @@ def contest_events_fingerprint(db: Session, contest_id: int) -> str:
 def scoreboard(contest_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list[ScoreboardRow]:
     contest = get_contest_or_404(db, contest_id)
     assert_contest_access(db, contest, user)
+    assert_contest_started(contest, user)
+    assert_individual_attempt_started(db, contest, user)
     tasks = db.scalars(
         select(Task)
         .join(ContestTask, ContestTask.task_id == Task.id)
@@ -2731,7 +3155,8 @@ def scoreboard(contest_id: int, db: Session = Depends(get_db), user: User = Depe
                     cells=cells,
                 )
             )
-        return sorted(rows, key=lambda row: (-row.score, row.penalty, row.team_name or row.username))
+        rows = sorted(rows, key=lambda row: (-row.score, row.penalty, row.team_name or row.username))
+        return apply_scoreboard_visibility(contest, user, rows)
 
     participant_windows = {
         row.user_id: row
@@ -2796,7 +3221,8 @@ def scoreboard(contest_id: int, db: Session = Depends(get_db), user: User = Depe
                 cells=cells,
             )
         )
-    return sorted(rows, key=lambda row: (-row.score, row.penalty, row.username))
+    rows = sorted(rows, key=lambda row: (-row.score, row.penalty, row.username))
+    return apply_scoreboard_visibility(contest, user, rows)
 
 
 @app.get("/api/contests/{contest_id}/live-snapshot")
@@ -2810,6 +3236,8 @@ async def contest_events(contest_id: int, request: Request, token: str | None = 
         user = get_sse_user(token, db)
         contest = get_contest_or_404(db, contest_id)
         assert_contest_access(db, contest, user)
+        assert_contest_started(contest, user)
+        assert_individual_attempt_started(db, contest, user)
 
     async def stream():
         last_fingerprint: str | None = None
@@ -2818,6 +3246,8 @@ async def contest_events(contest_id: int, request: Request, token: str | None = 
                 user = get_sse_user(token, db)
                 contest = get_contest_or_404(db, contest_id)
                 assert_contest_access(db, contest, user)
+                assert_contest_started(contest, user)
+                assert_individual_attempt_started(db, contest, user)
                 fingerprint = contest_events_fingerprint(db, contest_id)
                 if fingerprint != last_fingerprint:
                     payload = contest_events_payload(db, contest_id, user)

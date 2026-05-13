@@ -4,7 +4,7 @@ import type { ApiClient, Contest, User } from "../types";
 import { AdminDashboard } from "./admin/AdminDashboard";
 import { ContestView } from "./contest/ContestView";
 
-export function Workspace({ api, me, token }: { api: ApiClient; me: User; token: string }) {
+export function Workspace({ api, me, token, siteTimezone }: { api: ApiClient; me: User; token: string; siteTimezone: string }) {
   const { t } = useI18n();
   const [contests, setContests] = useState<Contest[]>([]);
   const [selectedContestId, setSelectedContestId] = useState<number | null>(null);
@@ -59,9 +59,9 @@ export function Workspace({ api, me, token }: { api: ApiClient; me: User; token:
       </aside>
       <section className="content">
         {view === "admin" && me.role === "admin" ? (
-          <AdminDashboard api={api} token={token} reloadContests={loadContests} />
+          <AdminDashboard api={api} token={token} reloadContests={loadContests} siteTimezone={siteTimezone} />
         ) : selectedContest ? (
-          <ContestView api={api} contest={selectedContest} me={me} token={token} />
+          <ContestView api={api} contest={selectedContest} me={me} token={token} siteTimezone={siteTimezone} />
         ) : (
           <div className="panel">{t("nav.noContests")}</div>
         )}
