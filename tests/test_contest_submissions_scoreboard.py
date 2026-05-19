@@ -1335,6 +1335,126 @@ def test_submission_lifecycle_and_scoreboard_after_accepted_submission(
     ]
 
 
+def test_icpc_scoreboard_counts_solved_tasks_and_sorts_by_penalty(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    create_user: Callable[..., dict[str, Any]],
+    auth_headers: Callable[[str, str], dict[str, str]],
+) -> None:
+    alice = create_user(username="icpc_alice", password="score-pass")
+    bob = create_user(username="icpc_bob", password="score-pass")
+    alice_headers = auth_headers(alice["username"], "score-pass")
+    bob_headers = auth_headers(bob["username"], "score-pass")
+    contest = create_running_contest(client, admin_headers, "ICPC Score")
+    updated = client.patch(f"/api/contests/{contest['id']}", headers=admin_headers, json={"scoring_mode": "icpc"})
+    assert updated.status_code == 200, updated.text
+    task = create_contest_task(client, admin_headers, contest["id"], "A")
+    assigned = client.put(
+        f"/api/contests/{contest['id']}/participants",
+        headers=admin_headers,
+        json={"user_ids": [alice["id"], bob["id"]]},
+    )
+    assert assigned.status_code == 200, assigned.text
+
+    alice_wrong = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task['id']}/submissions",
+        headers=alice_headers,
+        json={"language": "python", "source_code": "print('wrong')"},
+    )
+    alice_accepted = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task['id']}/submissions",
+        headers=alice_headers,
+        json={"language": "python", "source_code": "print(input())"},
+    )
+    bob_accepted = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task['id']}/submissions",
+        headers=bob_headers,
+        json={"language": "python", "source_code": "print(input())"},
+    )
+    assert alice_wrong.status_code == 200, alice_wrong.text
+    assert alice_accepted.status_code == 200, alice_accepted.text
+    assert bob_accepted.status_code == 200, bob_accepted.text
+
+    start = datetime.fromisoformat(contest["starts_at"].replace("Z", "+00:00")).replace(tzinfo=None)
+    with SessionLocal() as db:
+        wrong = db.get(Submission, alice_wrong.json()["id"])
+        alice_ac = db.get(Submission, alice_accepted.json()["id"])
+        bob_ac = db.get(Submission, bob_accepted.json()["id"])
+        assert wrong is not None and alice_ac is not None and bob_ac is not None
+        wrong.verdict = SubmissionVerdict.wrong_answer
+        wrong.score = 0
+        wrong.created_at = start + timedelta(minutes=5)
+        alice_ac.verdict = SubmissionVerdict.accepted
+        alice_ac.score = task["points"]
+        alice_ac.created_at = start + timedelta(minutes=30)
+        alice_ac.finished_at = alice_ac.created_at
+        bob_ac.verdict = SubmissionVerdict.accepted
+        bob_ac.score = task["points"]
+        bob_ac.created_at = start + timedelta(minutes=40)
+        bob_ac.finished_at = bob_ac.created_at
+        db.commit()
+
+    scoreboard = client.get(f"/api/contests/{contest['id']}/scoreboard", headers=alice_headers)
+    assert scoreboard.status_code == 200, scoreboard.text
+    rows = [row for row in scoreboard.json() if row["user_id"] in {alice["id"], bob["id"]}]
+    assert [row["user_id"] for row in rows] == [bob["id"], alice["id"]]
+    assert rows[0]["score"] == 1
+    assert rows[0]["penalty"] == 40
+    assert rows[1]["score"] == 1
+    assert rows[1]["penalty"] == 50
+
+
+def test_ioi_and_atcoder_score_partial_submissions_differently(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    participant: dict,
+    participant_headers: dict[str, str],
+) -> None:
+    contest = create_running_contest(client, admin_headers, "Scoring Modes")
+    task = create_contest_task(client, admin_headers, contest["id"], "A")
+    assigned = client.put(
+        f"/api/contests/{contest['id']}/participants",
+        headers=admin_headers,
+        json={"user_ids": [participant["id"]]},
+    )
+    assert assigned.status_code == 200, assigned.text
+    partial = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print('partial')"},
+    )
+    accepted = client.post(
+        f"/api/contests/{contest['id']}/tasks/{task['id']}/submissions",
+        headers=participant_headers,
+        json={"language": "python", "source_code": "print(input())"},
+    )
+    assert partial.status_code == 200, partial.text
+    assert accepted.status_code == 200, accepted.text
+
+    with SessionLocal() as db:
+        partial_submission = db.get(Submission, partial.json()["id"])
+        accepted_submission = db.get(Submission, accepted.json()["id"])
+        assert partial_submission is not None and accepted_submission is not None
+        partial_submission.verdict = SubmissionVerdict.wrong_answer
+        partial_submission.score = 70
+        accepted_submission.verdict = SubmissionVerdict.accepted
+        accepted_submission.score = 40
+        accepted_submission.finished_at = accepted_submission.created_at
+        db.commit()
+
+    ioi_scoreboard = client.get(f"/api/contests/{contest['id']}/scoreboard", headers=participant_headers)
+    assert ioi_scoreboard.status_code == 200, ioi_scoreboard.text
+    ioi_row = next(item for item in ioi_scoreboard.json() if item["user_id"] == participant["id"])
+    assert ioi_row["score"] == 70
+
+    updated = client.patch(f"/api/contests/{contest['id']}", headers=admin_headers, json={"scoring_mode": "atcoder"})
+    assert updated.status_code == 200, updated.text
+    atcoder_scoreboard = client.get(f"/api/contests/{contest['id']}/scoreboard", headers=participant_headers)
+    assert atcoder_scoreboard.status_code == 200, atcoder_scoreboard.text
+    atcoder_row = next(item for item in atcoder_scoreboard.json() if item["user_id"] == participant["id"])
+    assert atcoder_row["score"] == 40
+
+
 def test_scoreboard_freeze_hides_post_freeze_results_until_unfrozen(
     client: APIClient,
     admin_headers: dict[str, str],

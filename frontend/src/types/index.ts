@@ -2,6 +2,7 @@ export type Role = "admin" | "participant";
 export type ContestStatus = "draft" | "scheduled" | "running" | "finished" | "archived";
 export type TimeMode = "fixed" | "individual";
 export type ParticipationMode = "individual" | "team";
+export type ScoringMode = "ioi" | "ecoo" | "icpc" | "atcoder";
 export type ScoreboardVisibility = "public" | "anonymous" | "hidden";
 export type ContestRegistrationStatus = "pending" | "approved" | "rejected";
 export type ClarificationStatus = "open" | "answered" | "closed";
@@ -53,6 +54,7 @@ export type Contest = {
   registration_requires_approval: boolean;
   time_mode: TimeMode;
   participation_mode: ParticipationMode;
+  scoring_mode: ScoringMode;
   starts_at: string;
   ends_at: string;
   individual_duration_minutes: number | null;

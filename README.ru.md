@@ -262,3 +262,17 @@ bash scripts/ci.sh
 python -m pytest
 cd frontend && bun run build
 ```
+
+Чтобы отдельно сравнить системы оценивания IOI/ECOO/ICPC/AtCoder на одинаковых посылках:
+
+```bash
+docker build -f backend/Dockerfile -t simple-contester-backend-ci:local .
+docker run --rm \
+  -e PYTHONDONTWRITEBYTECODE=1 \
+  -e PYTHONPATH=/workspace/backend:/workspace/judger \
+  -v "$PWD:/workspace" \
+  -w /workspace \
+  --entrypoint python \
+  simple-contester-backend-ci:local \
+  -m pytest tests/test_scoring_modes_comparison.py -q
+```

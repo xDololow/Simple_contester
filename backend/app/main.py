@@ -37,6 +37,7 @@ from .models import (
     JudgerEvent,
     Language,
     ParticipantContest,
+    ScoringMode,
     ScoreboardVisibility,
     Submission,
     SubmissionVerdict,
@@ -175,6 +176,65 @@ def contest_scoreboard_visibility(contest: Contest) -> ScoreboardVisibility:
 
 def encode_scoreboard_visibility(value: Any) -> str:
     return value.value if hasattr(value, "value") else str(value)
+
+
+def contest_scoring_mode(contest: Contest) -> ScoringMode:
+    try:
+        return ScoringMode(contest.scoring_mode or ScoringMode.ioi.value)
+    except ValueError:
+        return ScoringMode.ioi
+
+
+def encode_scoring_mode(value: Any) -> str:
+    return value.value if hasattr(value, "value") else str(value)
+
+
+def scoreboard_sort_key(mode: ScoringMode, row: ScoreboardRow) -> tuple[float, int, str]:
+    name = row.team_name or row.username
+    if mode == ScoringMode.icpc:
+        return (-row.score, row.penalty, name)
+    return (-row.score, row.penalty, name)
+
+
+def score_task_submissions(
+    contest: Contest,
+    task: Task,
+    submissions: list[Submission],
+    base_time: datetime,
+    mode: ScoringMode,
+) -> tuple[float, int, ScoreboardCell]:
+    accepted = next((submission for submission in submissions if submission.verdict == SubmissionVerdict.accepted), None)
+    attempts_before_accept = [submission for submission in submissions if accepted is None or submission.created_at <= accepted.created_at]
+    solved_at_minutes = None
+    score = 0.0
+    penalty = 0
+
+    if mode in {ScoringMode.ioi, ScoringMode.ecoo}:
+        # ECOO can later branch here for per-test-set or grouped task policies.
+        score = max((submission.score for submission in submissions), default=0.0)
+    elif mode == ScoringMode.icpc:
+        if accepted:
+            score = 1.0
+    elif mode == ScoringMode.atcoder:
+        score = max((submission.score for submission in submissions if submission.verdict == SubmissionVerdict.accepted), default=0.0)
+
+    if accepted:
+        solved_at_minutes = max(0, int((accepted.created_at - base_time).total_seconds() // 60))
+        if mode in {ScoringMode.icpc, ScoringMode.atcoder}:
+            penalty = solved_at_minutes + 20 * max(0, len(attempts_before_accept) - 1)
+        elif mode == ScoringMode.ecoo:
+            penalty = solved_at_minutes
+
+    return (
+        score,
+        penalty,
+        ScoreboardCell(
+            task_id=task.id,
+            attempts=len(attempts_before_accept),
+            solved=accepted is not None,
+            solved_at_minutes=solved_at_minutes,
+        ),
+    )
 
 
 def apply_scoreboard_visibility(contest: Contest, user: User, rows: list[ScoreboardRow]) -> list[ScoreboardRow]:
@@ -402,6 +462,9 @@ def ensure_contest_access_columns() -> None:
         column = conn.execute(text("SHOW COLUMNS FROM contests LIKE 'participation_mode'")).mappings().first()
         if column is None:
             conn.execute(text("ALTER TABLE contests ADD COLUMN participation_mode VARCHAR(20) NOT NULL DEFAULT 'individual'"))
+        column = conn.execute(text("SHOW COLUMNS FROM contests LIKE 'scoring_mode'")).mappings().first()
+        if column is None:
+            conn.execute(text("ALTER TABLE contests ADD COLUMN scoring_mode VARCHAR(20) NOT NULL DEFAULT 'ioi'"))
         column = conn.execute(text("SHOW COLUMNS FROM contests LIKE 'scoreboard_freeze_at'")).mappings().first()
         if column is None:
             conn.execute(text("ALTER TABLE contests ADD COLUMN scoreboard_freeze_at DATETIME NULL"))
@@ -1843,6 +1906,7 @@ def create_contest_package_zip(contest: Contest) -> bytes:
                 "registration_requires_approval": contest.registration_requires_approval,
                 "time_mode": contest.time_mode.value if hasattr(contest.time_mode, "value") else contest.time_mode,
                 "participation_mode": contest.participation_mode.value if hasattr(contest.participation_mode, "value") else contest.participation_mode,
+                "scoring_mode": contest_scoring_mode(contest).value,
                 "starts_at": contest.starts_at.isoformat(),
                 "ends_at": contest.ends_at.isoformat(),
                 "individual_duration_minutes": contest.individual_duration_minutes,
@@ -1985,6 +2049,7 @@ def import_contest_package_zip(db: Session, content: bytes) -> PackageImportRepo
     try:
         time_mode = ContestTimeMode(str(contest_data.get("time_mode") or ContestTimeMode.fixed.value))
         participation_mode = ContestParticipationMode(str(contest_data.get("participation_mode") or ContestParticipationMode.individual.value))
+        scoring_mode = ScoringMode(str(contest_data.get("scoring_mode") or ScoringMode.ioi.value))
         individual_duration_minutes = contest_data.get("individual_duration_minutes")
         if individual_duration_minutes is not None:
             individual_duration_minutes = int(individual_duration_minutes)
@@ -2001,6 +2066,7 @@ def import_contest_package_zip(db: Session, content: bytes) -> PackageImportRepo
         registration_requires_approval=bool(contest_data.get("registration_requires_approval", True)),
         time_mode=time_mode,
         participation_mode=participation_mode,
+        scoring_mode=scoring_mode.value,
         starts_at=starts_at,
         ends_at=ends_at,
         individual_duration_minutes=individual_duration_minutes,
@@ -2173,6 +2239,7 @@ def create_contest(data: ContestCreate, _: User = Depends(require_admin), db: Se
     payload["ends_at"] = normalize_dt(payload["ends_at"])
     if payload["scoreboard_freeze_at"] is not None:
         payload["scoreboard_freeze_at"] = normalize_dt(payload["scoreboard_freeze_at"])
+    payload["scoring_mode"] = encode_scoring_mode(payload["scoring_mode"])
     payload["scoreboard_visibility"] = encode_scoreboard_visibility(payload["scoreboard_visibility"])
     normalize_contest_access(payload)
     validate_contest_time_window(
@@ -2223,6 +2290,8 @@ def update_contest(
             updates[key] = normalize_dt(updates[key])
     if "scoreboard_visibility" in updates:
         updates["scoreboard_visibility"] = encode_scoreboard_visibility(updates["scoreboard_visibility"])
+    if "scoring_mode" in updates:
+        updates["scoring_mode"] = encode_scoring_mode(updates["scoring_mode"])
     normalize_contest_access(updates, contest)
     candidate = {
         "starts_at": updates.get("starts_at", contest.starts_at),
@@ -3080,6 +3149,7 @@ def contest_events_fingerprint(db: Session, contest_id: int) -> str:
                 contest.scoreboard_freeze_at.isoformat() if contest.scoreboard_freeze_at else None,
                 contest.scoreboard_unfrozen,
                 contest_scoreboard_visibility(contest).value,
+                contest_scoring_mode(contest).value,
             ]
         ],
         separators=(",", ":"),
@@ -3098,6 +3168,7 @@ def scoreboard(contest_id: int, db: Session = Depends(get_db), user: User = Depe
         .where(ContestTask.contest_id == contest_id)
         .order_by(ContestTask.position, Task.id)
     ).all()
+    scoring_mode = contest_scoring_mode(contest)
     if contest.participation_mode == ContestParticipationMode.team:
         assigned_teams = db.scalars(
             select(Team)
@@ -3127,22 +3198,10 @@ def scoreboard(contest_id: int, db: Session = Depends(get_db), user: User = Depe
             penalty = 0
             for task in tasks:
                 task_submissions = [s for s in submissions if s.team_id == team.id and s.task_id == task.id]
-                accepted = next((s for s in task_submissions if s.verdict == SubmissionVerdict.accepted), None)
-                attempts_before_accept = [s for s in task_submissions if accepted is None or s.created_at <= accepted.created_at]
-                best_score = max((submission.score for submission in task_submissions), default=0.0)
-                solved_at_minutes = None
-                score += best_score
-                if accepted:
-                    solved_at_minutes = max(0, int((accepted.created_at - contest.starts_at).total_seconds() // 60))
-                    penalty += solved_at_minutes + 20 * max(0, len(attempts_before_accept) - 1)
-                cells.append(
-                    ScoreboardCell(
-                        task_id=task.id,
-                        attempts=len(attempts_before_accept),
-                        solved=accepted is not None,
-                        solved_at_minutes=solved_at_minutes,
-                    )
-                )
+                task_score, task_penalty, cell = score_task_submissions(contest, task, task_submissions, contest.starts_at, scoring_mode)
+                score += task_score
+                penalty += task_penalty
+                cells.append(cell)
             rows.append(
                 ScoreboardRow(
                     user_id=team.id,
@@ -3155,7 +3214,7 @@ def scoreboard(contest_id: int, db: Session = Depends(get_db), user: User = Depe
                     cells=cells,
                 )
             )
-        rows = sorted(rows, key=lambda row: (-row.score, row.penalty, row.team_name or row.username))
+        rows = sorted(rows, key=lambda row: scoreboard_sort_key(scoring_mode, row))
         return apply_scoreboard_visibility(contest, user, rows)
 
     participant_windows = {
@@ -3194,23 +3253,11 @@ def scoreboard(contest_id: int, db: Session = Depends(get_db), user: User = Depe
         penalty = 0
         for task in tasks:
             task_submissions = [s for s in submissions if s.user_id == participant.id and s.task_id == task.id]
-            accepted = next((s for s in task_submissions if s.verdict == SubmissionVerdict.accepted), None)
-            attempts_before_accept = [s for s in task_submissions if accepted is None or s.created_at <= accepted.created_at]
-            best_score = max((submission.score for submission in task_submissions), default=0.0)
-            solved_at_minutes = None
-            score += best_score
-            if accepted:
-                base = participant_window.started_at if participant_window and participant_window.started_at else accepted.created_at
-                solved_at_minutes = max(0, int((accepted.created_at - base).total_seconds() // 60))
-                penalty += solved_at_minutes + 20 * max(0, len(attempts_before_accept) - 1)
-            cells.append(
-                ScoreboardCell(
-                    task_id=task.id,
-                    attempts=len(attempts_before_accept),
-                    solved=accepted is not None,
-                    solved_at_minutes=solved_at_minutes,
-                )
-            )
+            base = participant_window.started_at if participant_window and participant_window.started_at else contest.starts_at
+            task_score, task_penalty, cell = score_task_submissions(contest, task, task_submissions, base, scoring_mode)
+            score += task_score
+            penalty += task_penalty
+            cells.append(cell)
         rows.append(
             ScoreboardRow(
                 user_id=participant.id,
@@ -3221,7 +3268,7 @@ def scoreboard(contest_id: int, db: Session = Depends(get_db), user: User = Depe
                 cells=cells,
             )
         )
-    rows = sorted(rows, key=lambda row: (-row.score, row.penalty, row.username))
+    rows = sorted(rows, key=lambda row: scoreboard_sort_key(scoring_mode, row))
     return apply_scoreboard_visibility(contest, user, rows)
 
 

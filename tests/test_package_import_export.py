@@ -185,6 +185,7 @@ def test_contest_package_export_import_roundtrip(
             "is_public": False,
             "registration_enabled": True,
             "registration_requires_approval": False,
+            "scoring_mode": "atcoder",
             "scoreboard_freeze_at": (starts_at + timedelta(minutes=20)).isoformat(),
             "scoreboard_unfrozen": True,
         },
@@ -204,6 +205,7 @@ def test_contest_package_export_import_roundtrip(
     assert "results" not in metadata
     assert metadata["contest"]["time_mode"] == demo_contest["time_mode"]
     assert metadata["contest"]["participation_mode"] == demo_contest["participation_mode"]
+    assert metadata["contest"]["scoring_mode"] == "atcoder"
     assert metadata["contest"]["registration_enabled"] is True
     assert metadata["contest"]["registration_requires_approval"] is False
     assert metadata["contest"]["scoreboard_freeze_at"] is not None
@@ -226,6 +228,7 @@ def test_contest_package_export_import_roundtrip(
     assert imported_contest["is_public"] is False
     assert imported_contest["registration_enabled"] is True
     assert imported_contest["registration_requires_approval"] is False
+    assert imported_contest["scoring_mode"] == "atcoder"
     assert imported_contest["scoreboard_freeze_at"] is not None
     assert imported_contest["scoreboard_unfrozen"] is True
     imported_tasks = client.get(f"/api/contests/{report['contest_id']}/tasks", headers=admin_headers).json()

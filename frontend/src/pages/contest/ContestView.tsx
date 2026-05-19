@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import type { FormEvent } from "react";
+import type { FormEvent, ReactNode } from "react";
 import { API_BASE } from "../../api/client";
 import { FlashMessage, Header, SubmissionDetailView } from "../../components/shared";
 import { useI18n } from "../../i18n";
@@ -275,7 +275,6 @@ export function ContestView({ api, contest, me, token, siteTimezone }: { api: Ap
       <section className="panel contest-header">
         <div>
           <h2>{contest.title}</h2>
-          <p>{contest.description || t("title.noDescription")}</p>
         </div>
         <div className="meta">
           <span className="pill">{t(`status.${contest.status}`)}</span>
@@ -308,6 +307,16 @@ export function ContestView({ api, contest, me, token, siteTimezone }: { api: Ap
       {tab === "overview" && (
         <section className="panel">
           <Header title={t("tab.overview")} subtitle={t("contest.summary")} />
+          <article className="overview-description-block">
+            <div className="overview-description-head">
+              <h4>{t("table.description")}</h4>
+            </div>
+            {contest.description ? (
+              <MarkdownContent className="overview-markdown" value={contest.description} />
+            ) : (
+              <p className="muted">{t("title.noDescription")}</p>
+            )}
+          </article>
           <div className="contest-summary-grid">
             <SummaryCard label={t("overview.remaining")} value={formatRemaining(contest, now, t)} detail={t("overview.deadline", { time: formatDate(contest.ends_at, siteTimezone) })} />
             <SummaryCard label={t("overview.schedule")} value={formatContestWindow(contest, t, siteTimezone)} detail={`${formatDate(contest.starts_at, siteTimezone)} - ${formatDate(contest.ends_at, siteTimezone)}`} />
@@ -458,6 +467,82 @@ function SummaryCard({ label, value, detail, warn = false }: { label: string; va
       <small>{detail}</small>
     </div>
   );
+}
+
+function renderInlineMarkdown(text: string): ReactNode[] {
+  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g).filter(Boolean);
+  return parts.map((part, index) => {
+    if (part.startsWith("`") && part.endsWith("`")) return <code key={index}>{part.slice(1, -1)}</code>;
+    if (part.startsWith("**") && part.endsWith("**")) return <strong key={index}>{part.slice(2, -2)}</strong>;
+    if (part.startsWith("*") && part.endsWith("*")) return <em key={index}>{part.slice(1, -1)}</em>;
+    return <span key={index}>{part}</span>;
+  });
+}
+
+function MarkdownContent({ value, className = "markdown-preview" }: { value: string; className?: string }) {
+  const blocks: ReactNode[] = [];
+  const lines = value.split(/\r?\n/);
+  let paragraph: string[] = [];
+  let list: string[] = [];
+  let code: string[] | null = null;
+
+  function flushParagraph() {
+    if (paragraph.length) {
+      blocks.push(<p key={blocks.length}>{renderInlineMarkdown(paragraph.join(" "))}</p>);
+      paragraph = [];
+    }
+  }
+
+  function flushList() {
+    if (list.length) {
+      blocks.push(<ul key={blocks.length}>{list.map((item, index) => <li key={index}>{renderInlineMarkdown(item)}</li>)}</ul>);
+      list = [];
+    }
+  }
+
+  for (const line of lines) {
+    if (line.startsWith("```")) {
+      flushParagraph();
+      flushList();
+      if (code === null) {
+        code = [];
+      } else {
+        blocks.push(<pre key={blocks.length}><code>{code.join("\n")}</code></pre>);
+        code = null;
+      }
+      continue;
+    }
+    if (code !== null) {
+      code.push(line);
+      continue;
+    }
+    if (!line.trim()) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+    const heading = /^(#{1,3})\s+(.+)$/.exec(line);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      const level = heading[1].length;
+      const children = renderInlineMarkdown(heading[2]);
+      blocks.push(level === 1 ? <h1 key={blocks.length}>{children}</h1> : level === 2 ? <h2 key={blocks.length}>{children}</h2> : <h3 key={blocks.length}>{children}</h3>);
+      continue;
+    }
+    const bullet = /^\s*[-*]\s+(.+)$/.exec(line);
+    if (bullet) {
+      flushParagraph();
+      list.push(bullet[1]);
+      continue;
+    }
+    flushList();
+    paragraph.push(line.trim());
+  }
+  flushParagraph();
+  flushList();
+  if (code !== null) blocks.push(<pre key={blocks.length}><code>{code.join("\n")}</code></pre>);
+  return <div className={className}>{blocks}</div>;
 }
 
 function TaskProgressSummary({ tasks, progress }: { tasks: Task[]; progress: Record<number, TaskProgress> }) {

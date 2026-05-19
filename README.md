@@ -253,6 +253,20 @@ bash scripts/ci.sh frontend
 bash scripts/ci.sh judger
 ```
 
+To compare contest scoring systems directly, run the focused scoring fixture:
+
+```bash
+docker build -f backend/Dockerfile -t simple-contester-backend-ci:local .
+docker run --rm \
+  -e PYTHONDONTWRITEBYTECODE=1 \
+  -e PYTHONPATH=/workspace/backend:/workspace/judger \
+  -v "$PWD:/workspace" \
+  -w /workspace \
+  --entrypoint python \
+  simple-contester-backend-ci:local \
+  -m pytest tests/test_scoring_modes_comparison.py -q
+```
+
 The CI wrapper checks shell syntax, runs `git diff --check` when the directory is
 inside a Git worktree, validates `docker compose config`, compiles Python modules,
 runs focused in-process backend pytest files, builds the frontend with Bun inside

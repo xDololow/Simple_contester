@@ -48,6 +48,7 @@ def test_alembic_upgrade_creates_current_schema(tmp_path, monkeypatch) -> None:
     assert "registration_requires_approval" in contest_columns
     assert "scoreboard_freeze_at" in contest_columns
     assert "scoreboard_unfrozen" in contest_columns
+    assert "scoring_mode" in contest_columns
     assert {
         "contest_id",
         "user_id",

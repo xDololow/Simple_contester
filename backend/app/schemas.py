@@ -12,6 +12,7 @@ from .models import (
     ContestTimeMode,
     JudgerStatus,
     Language,
+    ScoringMode,
     ScoreboardVisibility,
     SubmissionVerdict,
     UserRole,
@@ -237,6 +238,7 @@ class ContestCreate(ApiModel):
     registration_requires_approval: bool = True
     time_mode: ContestTimeMode = ContestTimeMode.fixed
     participation_mode: ContestParticipationMode = ContestParticipationMode.individual
+    scoring_mode: ScoringMode = ScoringMode.ioi
     starts_at: datetime
     ends_at: datetime
     individual_duration_minutes: int | None = None
@@ -254,6 +256,7 @@ class ContestUpdate(ApiModel):
     registration_requires_approval: bool | None = None
     time_mode: ContestTimeMode | None = None
     participation_mode: ContestParticipationMode | None = None
+    scoring_mode: ScoringMode | None = None
     starts_at: datetime | None = None
     ends_at: datetime | None = None
     individual_duration_minutes: int | None = Field(default=None, gt=0)

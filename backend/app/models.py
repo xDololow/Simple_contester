@@ -34,6 +34,13 @@ class ContestParticipationMode(str, Enum):
     team = "team"
 
 
+class ScoringMode(str, Enum):
+    ioi = "ioi"
+    ecoo = "ecoo"
+    icpc = "icpc"
+    atcoder = "atcoder"
+
+
 class ScoreboardVisibility(str, Enum):
     public = "public"
     anonymous = "anonymous"
@@ -149,6 +156,7 @@ class Contest(Base):
         SAEnum(ContestParticipationMode),
         default=ContestParticipationMode.individual,
     )
+    scoring_mode: Mapped[str] = mapped_column(String(20), default=ScoringMode.ioi.value)
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     individual_duration_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)

@@ -69,6 +69,7 @@ check_backend() {
     tests/test_admin_stats.py \
     tests/test_auth_import.py \
     tests/test_contest_submissions_scoreboard.py \
+    tests/test_scoring_modes_comparison.py \
     tests/test_migrations.py \
     tests/test_package_import_export.py \
     tests/test_task_library_archive_import.py

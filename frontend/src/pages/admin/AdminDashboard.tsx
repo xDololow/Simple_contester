@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { API_BASE } from "../../api/client";
 import { FlashMessage, Header, SubmissionDetailView } from "../../components/shared";
 import { useI18n } from "../../i18n";
-import type { AdminStats, ApiClient, Clarification, ClarificationStatus, ClarificationVisibility, Contest, ContestRegistration, ContestStatus, Flash, ImportReport, JudgerEvent, JudgerWorker, PackageImportReport, ParticipantContestTime, ParticipationMode, Role, ScoreboardVisibility, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
+import type { AdminStats, ApiClient, Clarification, ClarificationStatus, ClarificationVisibility, Contest, ContestRegistration, ContestStatus, Flash, ImportReport, JudgerEvent, JudgerWorker, PackageImportReport, ParticipantContestTime, ParticipationMode, Role, ScoringMode, ScoreboardVisibility, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
 import { emptyFlash, errorText, formatDate, formatScore, fromLocalInputValue, toLocalInputValue, verdictClass } from "../../utils/format";
 
 type AdminTab = "status" | "users" | "import" | "teams" | "contests" | "tasks" | "packages" | "tests" | "submissions" | "clarifications";
@@ -104,6 +104,7 @@ type ContestFormState = ContestAccessFields & {
   status: ContestStatus;
   time_mode: TimeMode;
   participation_mode: ParticipationMode;
+  scoring_mode: ScoringMode;
   starts_at: string;
   ends_at: string;
   individual_duration_minutes: string;
@@ -172,6 +173,7 @@ function createEmptyContestForm(siteTimezone: string): ContestFormState {
     registration_requires_approval: false,
     time_mode: "fixed",
     participation_mode: "individual",
+    scoring_mode: "ioi",
     starts_at: toLocalInputValue(now.toISOString(), siteTimezone),
     ends_at: toLocalInputValue(later.toISOString(), siteTimezone),
     individual_duration_minutes: "03:00",
@@ -200,6 +202,7 @@ function contestToForm(
     registration_requires_approval: contest.registration_requires_approval,
     time_mode: contest.time_mode,
     participation_mode: contest.participation_mode,
+    scoring_mode: contest.scoring_mode ?? "ioi",
     starts_at: toLocalInputValue(contest.starts_at, siteTimezone),
     ends_at: toLocalInputValue(contest.ends_at, siteTimezone),
     individual_duration_minutes: durationMinutesToClock(contest.individual_duration_minutes),
@@ -1193,6 +1196,7 @@ function ContestsAdmin({ api, onChanged, siteTimezone }: { api: ApiClient; onCha
   const [registrationFilter, setRegistrationFilter] = useState<"pending" | "all">("pending");
   const [flash, setFlash] = useState<Flash>(emptyFlash);
   const [query, setQuery] = useState("");
+  const [view, setView] = useState<"list" | "form">("list");
   const [editingContestId, setEditingContestId] = useState<number | null>(null);
   const [form, setForm] = useState<ContestFormState>(() => createEmptyContestForm(siteTimezone));
   const editingContest = editingContestId ? contests.find((contest) => contest.id === editingContestId) ?? null : null;
@@ -1205,6 +1209,7 @@ function ContestsAdmin({ api, onChanged, siteTimezone }: { api: ApiClient; onCha
       contest.is_public ? t("contest.public") : t("contest.private"),
       contest.registration_enabled ? t("registration.enabledShort") : "",
       contest.participation_mode,
+      t(`scoring.${contest.scoring_mode ?? "ioi"}`),
       contest.time_mode,
       t(`scoreboard.visibility.${contest.scoreboard_visibility ?? "public"}`),
       contestTaskIds[contest.id]?.join(" "),
@@ -1248,6 +1253,13 @@ function ContestsAdmin({ api, onChanged, siteTimezone }: { api: ApiClient; onCha
   function resetContestForm() {
     setEditingContestId(null);
     setForm(createEmptyContestForm(siteTimezone));
+    setView("list");
+  }
+
+  function startContestCreate() {
+    setEditingContestId(null);
+    setForm(createEmptyContestForm(siteTimezone));
+    setView("form");
   }
 
   function editContest(contest: Contest) {
@@ -1259,6 +1271,7 @@ function ContestsAdmin({ api, onChanged, siteTimezone }: { api: ApiClient; onCha
       contestTeamIds[contest.id] ?? [],
       siteTimezone
     ));
+    setView("form");
   }
 
   async function submitContestForm(event: React.FormEvent) {
@@ -1328,33 +1341,51 @@ function ContestsAdmin({ api, onChanged, siteTimezone }: { api: ApiClient; onCha
     }
   }
 
+  if (view === "form") {
+    return (
+      <section className="panel">
+        <div className="section-title">
+          <span className="muted">{t("tab.contests")}</span>
+          <button type="button" onClick={resetContestForm}>{t("common.backToList")}</button>
+        </div>
+        <ContestForm
+          form={form}
+          mode={editingContest ? "edit" : "create"}
+          tasks={tasks}
+          users={users}
+          teams={teams}
+          onChange={setForm}
+          onCancel={resetContestForm}
+          onSubmit={submitContestForm}
+        />
+        <FlashMessage flash={flash} />
+        {editingContest?.time_mode === "individual" && (
+          <IndividualTimeAdmin
+            api={api}
+            contest={editingContest}
+            users={users}
+            siteTimezone={siteTimezone}
+          />
+        )}
+      </section>
+    );
+  }
+
   return (
     <section className="panel">
-      <Header title={t("tab.contests")} subtitle={t("title.contestsCount", { count: contests.length })} />
-      <ContestForm
-        form={form}
-        mode={editingContest ? "edit" : "create"}
-        tasks={tasks}
-        users={users}
-        teams={teams}
-        onChange={setForm}
-        onCancel={editingContest ? resetContestForm : undefined}
-        onSubmit={submitContestForm}
-      />
+      <div className="section-title">
+        <div>
+          <h3>{t("contest.listTitle")}</h3>
+          <span className="muted">{t("title.contestsCount", { count: contests.length })}</span>
+        </div>
+        <button type="button" onClick={startContestCreate}>{t("common.create")}</button>
+      </div>
       <FlashMessage flash={flash} />
-      {editingContest?.time_mode === "individual" && (
-        <IndividualTimeAdmin
-          api={api}
-          contest={editingContest}
-          users={users}
-          siteTimezone={siteTimezone}
-        />
-      )}
       <PendingRegistrations registrations={registrations} filter={registrationFilter} onFilterChange={setRegistrationFilter} onDecide={decideRegistration} siteTimezone={siteTimezone} />
       <TableToolbar query={query} onQueryChange={setQuery} total={contests.length} filtered={filteredContests.length} placeholder={t("contest.search")} />
       <div className="table-wrap">
         <table>
-          <thead><tr><th>{t("table.id")}</th><th>{t("table.title")}</th><th>{t("table.status")}</th><th>{t("table.access")}</th><th>{t("contest.participationMode")}</th><th>{t("table.mode")}</th><th>{t("table.starts")}</th><th>{t("table.ends")}</th><th>{t("contest.individualDurationShort")}</th><th>{t("scoreboard.freezeAt")}</th><th>{t("scoreboard.visibility")}</th><th>{t("scoreboard.unfrozenShort")}</th><th>{t("table.tasks")}</th><th>{t("table.participants")}</th><th>{t("table.teams")}</th><th></th></tr></thead>
+          <thead><tr><th>{t("table.id")}</th><th>{t("table.title")}</th><th>{t("table.status")}</th><th>{t("table.access")}</th><th>{t("contest.participationMode")}</th><th>{t("scoring.mode")}</th><th>{t("table.mode")}</th><th>{t("table.starts")}</th><th>{t("table.ends")}</th><th>{t("contest.individualDurationShort")}</th><th>{t("scoreboard.freezeAt")}</th><th>{t("scoreboard.visibility")}</th><th>{t("scoreboard.unfrozenShort")}</th><th>{t("table.tasks")}</th><th>{t("table.participants")}</th><th>{t("table.teams")}</th><th></th></tr></thead>
           <tbody>
             {filteredContests.map((contest) => (
               <ContestTableRow
@@ -1371,7 +1402,7 @@ function ContestsAdmin({ api, onChanged, siteTimezone }: { api: ApiClient; onCha
                 onDelete={deleteContest}
               />
             ))}
-            {!filteredContests.length && <tr><td colSpan={15} className="muted">{t("empty.noMatchesText")}</td></tr>}
+            {!filteredContests.length && <tr><td colSpan={17} className="muted">{t("empty.noMatchesText")}</td></tr>}
           </tbody>
         </table>
       </div>
@@ -1597,6 +1628,8 @@ function ContestForm({
 }) {
   const { t } = useI18n();
   const accessMode = accessModeOf(form);
+  const [scoringHelpOpen, setScoringHelpOpen] = useState(false);
+  const [descriptionPreviewMode, setDescriptionPreviewMode] = useState<"edit" | "preview">("edit");
 
   function toggleTask(taskId: number) {
     onChange((current) => ({
@@ -1620,7 +1653,29 @@ function ContestForm({
           <label>{t("table.title")}<input value={form.title} onChange={(event) => onChange({ ...form, title: event.target.value })} required /></label>
           <label>{t("table.status")}<select value={form.status} onChange={(event) => onChange({ ...form, status: event.target.value as ContestStatus })}>{contestStatuses.map((item) => <option key={item} value={item}>{t(`status.${item}`)}</option>)}</select></label>
           <label>{t("contest.participationMode")}<select value={form.participation_mode} onChange={(event) => onChange({ ...form, participation_mode: event.target.value as ParticipationMode })}><option value="individual">{t("common.individual")}</option><option value="team">{t("common.team")}</option></select></label>
-          <label className="span-2">{t("table.description")}<textarea className="short" value={form.description} onChange={(event) => onChange({ ...form, description: event.target.value })} /></label>
+          <label>
+            <span className="label-row">{t("scoring.mode")}<button type="button" className="icon-button" aria-label={t("scoring.helpOpen")} onClick={() => setScoringHelpOpen(true)}>?</button></span>
+            <select value={form.scoring_mode} onChange={(event) => onChange({ ...form, scoring_mode: event.target.value as ScoringMode })}>
+              <option value="ioi">{t("scoring.ioi")}</option>
+              <option value="ecoo">{t("scoring.ecoo")}</option>
+              <option value="icpc">{t("scoring.icpc")}</option>
+              <option value="atcoder">{t("scoring.atcoder")}</option>
+            </select>
+          </label>
+          <div className="span-full markdown-field">
+            <div className="label-row">
+              <span>{t("table.description")}</span>
+              <div className="segmented">
+                <button type="button" className={descriptionPreviewMode === "edit" ? "active" : ""} onClick={() => setDescriptionPreviewMode("edit")}>{t("task.editMarkdown")}</button>
+                <button type="button" className={descriptionPreviewMode === "preview" ? "active" : ""} onClick={() => setDescriptionPreviewMode("preview")}>{t("task.previewMarkdown")}</button>
+              </div>
+            </div>
+            {descriptionPreviewMode === "edit" ? (
+              <textarea className="contest-description-editor" value={form.description} onChange={(event) => onChange({ ...form, description: event.target.value })} />
+            ) : (
+              <MarkdownPreview value={form.description} />
+            )}
+          </div>
         </div>
       </fieldset>
       <fieldset>
@@ -1672,7 +1727,32 @@ function ContestForm({
           <p className="access-disabled-note">{t("contest.accessListsDisabled")}</p>
         )}
       </fieldset>
+      {scoringHelpOpen && <ScoringHelpModal onClose={() => setScoringHelpOpen(false)} />}
     </form>
+  );
+}
+
+function ScoringHelpModal({ onClose }: { onClose: () => void }) {
+  const { t } = useI18n();
+  const modes: ScoringMode[] = ["ioi", "ecoo", "icpc", "atcoder"];
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="modal-panel scoring-modal" role="dialog" aria-modal="true" aria-labelledby="scoring-help-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="section-title">
+          <h3 id="scoring-help-title">{t("scoring.helpTitle")}</h3>
+          <button type="button" onClick={onClose}>{t("common.close")}</button>
+        </div>
+        <div className="scoring-help-grid">
+          {modes.map((mode) => (
+            <section key={mode}>
+              <h4>{t(`scoring.${mode}`)}</h4>
+              <p>{t(`scoring.${mode}.description`)}</p>
+              <p className="muted">{t(`scoring.${mode}.example`)}</p>
+            </section>
+          ))}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1704,7 +1784,7 @@ function ContestTableRow({
   const teamNames = formatTeamIds(teamIds, teams);
   return (
     <tr className={isSelected ? "selected" : ""}>
-      <td>{contest.id}</td><td>{contest.title}</td><td>{t(`status.${contest.status}`)}</td><td>{contest.is_public ? t("contest.public") : contest.registration_enabled ? t("registration.enabledShort") : t("contest.private")}</td><td>{t(`common.${contest.participation_mode}`)}</td><td>{t(`common.${contest.time_mode}`)}</td>
+      <td>{contest.id}</td><td>{contest.title}</td><td>{t(`status.${contest.status}`)}</td><td>{contest.is_public ? t("contest.public") : contest.registration_enabled ? t("registration.enabledShort") : t("contest.private")}</td><td>{t(`common.${contest.participation_mode}`)}</td><td>{t(`scoring.${contest.scoring_mode ?? "ioi"}`)}</td><td>{t(`common.${contest.time_mode}`)}</td>
       <td>{formatDate(contest.starts_at, siteTimezone)}</td><td>{formatDate(contest.ends_at, siteTimezone)}</td><td>{durationMinutesToClock(contest.individual_duration_minutes) || "-"}</td><td>{formatDate(contest.scoreboard_freeze_at, siteTimezone)}</td><td>{t(`scoreboard.visibility.${contest.scoreboard_visibility ?? "public"}`)}</td><td>{contest.scoreboard_unfrozen ? t("common.yes") : t("common.no")}</td>
       <td>{taskIds.length}</td><td>{participantNames || t("common.none")}</td><td>{teamNames || t("common.none")}</td>
       <td className="row-actions"><button onClick={() => onEdit(contest)}>{t("common.edit")}</button><button className="danger" onClick={() => onDelete(contest)}>{t("common.delete")}</button></td>
@@ -1712,15 +1792,23 @@ function ContestTableRow({
   );
 }
 
-function TasksAdmin({ api }: { api: ApiClient }) {
-  const { t } = useI18n();
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [flash, setFlash] = useState<Flash>(emptyFlash);
-  const [query, setQuery] = useState("");
-  const [previewMode, setPreviewMode] = useState<"edit" | "preview">("edit");
-  const [testArchive, setTestArchive] = useState<File | null>(null);
-  const [testArchiveReport, setTestArchiveReport] = useState<TestArchiveImportReport | null>(null);
-  const [form, setForm] = useState({
+type TaskFormState = {
+  title: string;
+  statement: string;
+  input_format: string;
+  output_format: string;
+  samples: string;
+  time_limit_ms: string;
+  memory_limit_mb: string;
+  points: string;
+  partial_scoring: boolean;
+  test_input: string;
+  test_output: string;
+  test_is_sample: boolean;
+};
+
+function createEmptyTaskForm(): TaskFormState {
+  return {
     title: "",
     statement: "",
     input_format: "",
@@ -1733,7 +1821,37 @@ function TasksAdmin({ api }: { api: ApiClient }) {
     test_input: "",
     test_output: "",
     test_is_sample: true
-  });
+  };
+}
+
+function taskToForm(task: Task): TaskFormState {
+  return {
+    title: task.title,
+    statement: task.statement,
+    input_format: task.input_format,
+    output_format: task.output_format,
+    samples: JSON.stringify(task.samples, null, 2),
+    time_limit_ms: String(task.time_limit_ms),
+    memory_limit_mb: String(task.memory_limit_mb),
+    points: String(task.points),
+    partial_scoring: task.partial_scoring,
+    test_input: "",
+    test_output: "",
+    test_is_sample: true
+  };
+}
+
+function TasksAdmin({ api }: { api: ApiClient }) {
+  const { t } = useI18n();
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [flash, setFlash] = useState<Flash>(emptyFlash);
+  const [query, setQuery] = useState("");
+  const [view, setView] = useState<"list" | "form">("list");
+  const [editingTask, setEditingTask] = useState<Task | null>(null);
+  const [previewMode, setPreviewMode] = useState<"edit" | "preview">("edit");
+  const [testArchive, setTestArchive] = useState<File | null>(null);
+  const [testArchiveReport, setTestArchiveReport] = useState<TestArchiveImportReport | null>(null);
+  const [form, setForm] = useState<TaskFormState>(() => createEmptyTaskForm());
   const filteredTasks = useMemo(
     () => tasks.filter((task) => matchesSearch([
       task.id,
@@ -1757,44 +1875,62 @@ function TasksAdmin({ api }: { api: ApiClient }) {
 
   useEffect(() => { load().catch((error) => setFlash({ kind: "error", text: errorText(error) })); }, [load]);
 
-  async function createTask(event: React.FormEvent) {
+  function resetTaskForm() {
+    setEditingTask(null);
+    setForm(createEmptyTaskForm());
+    setTestArchive(null);
+    setPreviewMode("edit");
+    setView("list");
+  }
+
+  function startTaskCreate() {
+    setEditingTask(null);
+    setForm(createEmptyTaskForm());
+    setTestArchive(null);
+    setTestArchiveReport(null);
+    setPreviewMode("edit");
+    setView("form");
+  }
+
+  function editTask(task: Task) {
+    setEditingTask(task);
+    setForm(taskToForm(task));
+    setTestArchive(null);
+    setPreviewMode("edit");
+    setView("form");
+  }
+
+  async function submitTaskForm(event: React.FormEvent) {
     event.preventDefault();
     setFlash(emptyFlash);
     setTestArchiveReport(null);
     try {
-      const tests = form.test_input || form.test_output ? [{ input_data: form.test_input, output_data: form.test_output, is_sample: form.test_is_sample }] : [];
-      const task = await api<Task>("/api/tasks", {
-        method: "POST",
-        body: JSON.stringify({
-          title: form.title,
-          statement: form.statement,
-          input_format: form.input_format,
-          output_format: form.output_format,
-          samples: JSON.parse(form.samples || "[]"),
-          time_limit_ms: Number(form.time_limit_ms),
-          memory_limit_mb: Number(form.memory_limit_mb),
-          points: Number(form.points),
-          partial_scoring: form.partial_scoring,
-          tests
-        })
-      });
-      if (testArchive) {
+      const payload = {
+        title: form.title,
+        statement: form.statement,
+        input_format: form.input_format,
+        output_format: form.output_format,
+        samples: JSON.parse(form.samples || "[]"),
+        time_limit_ms: Number(form.time_limit_ms),
+        memory_limit_mb: Number(form.memory_limit_mb),
+        points: Number(form.points),
+        partial_scoring: form.partial_scoring
+      };
+      const task = editingTask
+        ? await api<Task>(`/api/tasks/${editingTask.id}`, { method: "PATCH", body: JSON.stringify(payload) })
+        : await api<Task>("/api/tasks", {
+          method: "POST",
+          body: JSON.stringify({
+            ...payload,
+            tests: form.test_input || form.test_output ? [{ input_data: form.test_input, output_data: form.test_output, is_sample: form.test_is_sample }] : []
+          })
+        });
+      if (!editingTask && testArchive) {
         const body = new FormData();
         body.append("file", testArchive);
         setTestArchiveReport(await api<TestArchiveImportReport>(`/api/tasks/${task.id}/tests/import-archive`, { method: "POST", body }));
       }
-      setForm({ ...form, title: "", statement: "", input_format: "", output_format: "", samples: "[]", partial_scoring: false, test_input: "", test_output: "" });
-      setTestArchive(null);
-      await load();
-    } catch (error) {
-      setFlash({ kind: "error", text: errorText(error) });
-    }
-  }
-
-  async function saveTask(task: Task, patch: Partial<Task>) {
-    setFlash(emptyFlash);
-    try {
-      await api<Task>(`/api/tasks/${task.id}`, { method: "PATCH", body: JSON.stringify(patch) });
+      resetTaskForm();
       await load();
     } catch (error) {
       setFlash({ kind: "error", text: errorText(error) });
@@ -1812,55 +1948,38 @@ function TasksAdmin({ api }: { api: ApiClient }) {
     }
   }
 
+  if (view === "form") {
+    return (
+      <section className="panel">
+        <div className="section-title">
+          <span className="muted">{t("tab.tasks")}</span>
+          <button type="button" onClick={resetTaskForm}>{t("common.backToList")}</button>
+        </div>
+        <TaskForm
+          form={form}
+          mode={editingTask ? "edit" : "create"}
+          previewMode={previewMode}
+          testArchive={testArchive}
+          onChange={setForm}
+          onPreviewModeChange={setPreviewMode}
+          onTestArchiveChange={setTestArchive}
+          onCancel={resetTaskForm}
+          onSubmit={submitTaskForm}
+        />
+        <FlashMessage flash={flash} />
+      </section>
+    );
+  }
+
   return (
     <section className="panel">
-      <Header title={t("tab.tasks")} subtitle={t("title.tasksLibrary", { count: tasks.length })} />
-      <form className="task-form" onSubmit={createTask}>
-        <fieldset>
-          <legend>{t("task.sectionBasic")}</legend>
-          <div className="form-grid">
-            <label>{t("table.title")}<input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} required /></label>
-            <label>{t("table.points")}<input type="number" step="0.01" value={form.points} onChange={(event) => setForm({ ...form, points: event.target.value })} /></label>
-            <label>{t("task.timeLimitMs")}<input type="number" value={form.time_limit_ms} onChange={(event) => setForm({ ...form, time_limit_ms: event.target.value })} /></label>
-            <label>{t("task.memoryMb")}<input type="number" value={form.memory_limit_mb} onChange={(event) => setForm({ ...form, memory_limit_mb: event.target.value })} /></label>
-            <label className="inline"><input className="check" type="checkbox" checked={form.partial_scoring} onChange={(event) => setForm({ ...form, partial_scoring: event.target.checked })} /> {t("task.partialScoring")}</label>
-          </div>
-        </fieldset>
-        <fieldset>
-          <legend>{t("task.sectionStatement")}</legend>
-          <div className="segmented">
-            <button type="button" className={previewMode === "edit" ? "active" : ""} onClick={() => setPreviewMode("edit")}>{t("task.editMarkdown")}</button>
-            <button type="button" className={previewMode === "preview" ? "active" : ""} onClick={() => setPreviewMode("preview")}>{t("task.previewMarkdown")}</button>
-          </div>
-          {previewMode === "edit" ? (
-            <label>{t("task.statement")}<textarea value={form.statement} onChange={(event) => setForm({ ...form, statement: event.target.value })} required /></label>
-          ) : (
-            <MarkdownPreview value={form.statement} />
-          )}
-        </fieldset>
-        <fieldset>
-          <legend>{t("task.sectionFormats")}</legend>
-          <div className="form-grid">
-            <label>{t("task.inputFormat")}<textarea className="short" value={form.input_format} onChange={(event) => setForm({ ...form, input_format: event.target.value })} /></label>
-            <label>{t("task.outputFormat")}<textarea className="short" value={form.output_format} onChange={(event) => setForm({ ...form, output_format: event.target.value })} /></label>
-            <label className="span-2">{t("task.samplesJson")}<textarea className="short code" value={form.samples} onChange={(event) => setForm({ ...form, samples: event.target.value })} /></label>
-          </div>
-        </fieldset>
-        <fieldset>
-          <legend>{t("task.sectionFirstTest")}</legend>
-          <div className="form-grid">
-            <label>{t("task.firstInput")}<textarea className="short code" value={form.test_input} onChange={(event) => setForm({ ...form, test_input: event.target.value })} /></label>
-            <label>{t("task.firstOutput")}<textarea className="short code" value={form.test_output} onChange={(event) => setForm({ ...form, test_output: event.target.value })} /></label>
-            <label className="inline"><input className="check" type="checkbox" checked={form.test_is_sample} onChange={(event) => setForm({ ...form, test_is_sample: event.target.checked })} /> {t("task.sampleTest")}</label>
-          </div>
-        </fieldset>
-        <fieldset>
-          <legend>{t("task.sectionTestArchive")}</legend>
-          <label className="file-field">{t("test.archiveUpload")}<input type="file" accept=".zip" onChange={(event) => setTestArchive(event.target.files?.[0] ?? null)} /></label>
-          <p className="muted">{testArchive ? testArchive.name : t("task.archiveImportAfterCreate")}</p>
-        </fieldset>
-        <button type="submit">{t("common.create")}</button>
-      </form>
+      <div className="section-title">
+        <div>
+          <h3>{t("task.listTitle")}</h3>
+          <span className="muted">{t("title.tasksLibrary", { count: tasks.length })}</span>
+        </div>
+        <button type="button" onClick={startTaskCreate}>{t("common.create")}</button>
+      </div>
       <FlashMessage flash={flash} />
       {testArchiveReport && <TestArchiveReportView report={testArchiveReport} />}
       <TableToolbar query={query} onQueryChange={setQuery} total={tasks.length} filtered={filteredTasks.length} placeholder={t("task.search")} />
@@ -1868,7 +1987,7 @@ function TasksAdmin({ api }: { api: ApiClient }) {
         <table>
           <thead><tr><th>{t("table.id")}</th><th>{t("table.title")}</th><th>{t("task.version")}</th><th>{t("table.limits")}</th><th>{t("table.points")}</th><th>{t("table.tests")}</th><th></th></tr></thead>
           <tbody>
-            {filteredTasks.map((task) => <TaskRow key={task.id} task={task} onSave={saveTask} onDelete={deleteTask} />)}
+            {filteredTasks.map((task) => <TaskRow key={task.id} task={task} onEdit={editTask} onDelete={deleteTask} />)}
             {!filteredTasks.length && <tr><td colSpan={7} className="muted">{t("empty.noMatchesText")}</td></tr>}
           </tbody>
         </table>
@@ -1877,83 +1996,104 @@ function TasksAdmin({ api }: { api: ApiClient }) {
   );
 }
 
-function TaskRow({ task, onSave, onDelete }: { task: Task; onSave: (task: Task, patch: Partial<Task>) => void; onDelete: (task: Task) => void }) {
+function TaskForm({
+  form,
+  mode,
+  previewMode,
+  testArchive,
+  onChange,
+  onPreviewModeChange,
+  onTestArchiveChange,
+  onCancel,
+  onSubmit
+}: {
+  form: TaskFormState;
+  mode: "create" | "edit";
+  previewMode: "edit" | "preview";
+  testArchive: File | null;
+  onChange: React.Dispatch<React.SetStateAction<TaskFormState>>;
+  onPreviewModeChange: (mode: "edit" | "preview") => void;
+  onTestArchiveChange: (file: File | null) => void;
+  onCancel: () => void;
+  onSubmit: (event: React.FormEvent) => void;
+}) {
   const { t } = useI18n();
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState({
-    title: task.title,
-    statement: task.statement,
-    input_format: task.input_format,
-    output_format: task.output_format,
-    samples: JSON.stringify(task.samples, null, 2),
-    time_limit_ms: String(task.time_limit_ms),
-    memory_limit_mb: String(task.memory_limit_mb),
-    points: String(task.points),
-    partial_scoring: task.partial_scoring
-  });
-  useEffect(() => setDraft({
-    title: task.title,
-    statement: task.statement,
-    input_format: task.input_format,
-    output_format: task.output_format,
-    samples: JSON.stringify(task.samples, null, 2),
-    time_limit_ms: String(task.time_limit_ms),
-    memory_limit_mb: String(task.memory_limit_mb),
-    points: String(task.points),
-    partial_scoring: task.partial_scoring
-  }), [task]);
 
   return (
-    <>
-      <tr className={editing ? "editing" : ""}>
-        <td>{task.id}</td>
-        <td>{editing ? <input value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} /> : task.title}</td>
-        <td>{task.current_version_number ? `v${task.current_version_number}` : "-"}</td>
-        <td>{editing ? <><input type="number" value={draft.time_limit_ms} onChange={(event) => setDraft({ ...draft, time_limit_ms: event.target.value })} /><input type="number" value={draft.memory_limit_mb} onChange={(event) => setDraft({ ...draft, memory_limit_mb: event.target.value })} /></> : `${task.time_limit_ms} ms / ${task.memory_limit_mb} MB`}</td>
-        <td>{editing ? <input type="number" step="0.01" value={draft.points} onChange={(event) => setDraft({ ...draft, points: event.target.value })} /> : formatScore(task.points)}</td>
-        <td>{task.test_count}{task.partial_scoring ? ` · ${t("task.partialScoring")}` : ""}</td>
-        <td className="row-actions">
-          {editing ? (
-            <>
-              <button onClick={() => {
-                onSave(task, {
-                  title: draft.title,
-                  statement: draft.statement,
-                  input_format: draft.input_format,
-                  output_format: draft.output_format,
-                  samples: JSON.parse(draft.samples || "[]") as Task["samples"],
-                  time_limit_ms: Number(draft.time_limit_ms),
-                  memory_limit_mb: Number(draft.memory_limit_mb),
-                  points: Number(draft.points),
-                  partial_scoring: draft.partial_scoring
-                });
-                setEditing(false);
-              }}>{t("common.save")}</button>
-              <button onClick={() => setEditing(false)}>{t("common.cancel")}</button>
-            </>
-          ) : (
-            <>
-              <button onClick={() => setEditing(true)}>{t("common.edit")}</button>
-              <button className="danger" onClick={() => onDelete(task)}>{t("common.delete")}</button>
-            </>
-          )}
-        </td>
-      </tr>
-      {editing && (
-        <tr className="editing">
-          <td></td>
-          <td colSpan={6}>
-            <div className="nested-edit">
-              <label>{t("task.statement")}<textarea value={draft.statement} onChange={(event) => setDraft({ ...draft, statement: event.target.value })} /></label>
-              <label>{t("task.inputFormat")}<textarea className="short" value={draft.input_format} onChange={(event) => setDraft({ ...draft, input_format: event.target.value })} /></label>
-              <label>{t("task.outputFormat")}<textarea className="short" value={draft.output_format} onChange={(event) => setDraft({ ...draft, output_format: event.target.value })} /></label>
-              <label>{t("task.samplesJson")}<textarea className="short code" value={draft.samples} onChange={(event) => setDraft({ ...draft, samples: event.target.value })} /></label>
-              <label className="inline"><input className="check" type="checkbox" checked={draft.partial_scoring} onChange={(event) => setDraft({ ...draft, partial_scoring: event.target.checked })} /> {t("task.partialScoring")}</label>
+    <form className="task-form" onSubmit={onSubmit}>
+      <div className="section-title">
+        <h3>{mode === "edit" ? t("task.editTitle") : t("task.createTitle")}</h3>
+        <div className="row-actions">
+          <button type="button" onClick={onCancel}>{t("common.cancel")}</button>
+          <button type="submit">{mode === "edit" ? t("common.save") : t("common.create")}</button>
+        </div>
+      </div>
+      <fieldset>
+        <legend>{t("task.sectionBasic")}</legend>
+        <div className="form-grid">
+          <label>{t("table.title")}<input value={form.title} onChange={(event) => onChange({ ...form, title: event.target.value })} required /></label>
+          <label>{t("table.points")}<input type="number" step="0.01" value={form.points} onChange={(event) => onChange({ ...form, points: event.target.value })} /></label>
+          <label>{t("task.timeLimitMs")}<input type="number" value={form.time_limit_ms} onChange={(event) => onChange({ ...form, time_limit_ms: event.target.value })} /></label>
+          <label>{t("task.memoryMb")}<input type="number" value={form.memory_limit_mb} onChange={(event) => onChange({ ...form, memory_limit_mb: event.target.value })} /></label>
+          <label className="inline"><input className="check" type="checkbox" checked={form.partial_scoring} onChange={(event) => onChange({ ...form, partial_scoring: event.target.checked })} /> {t("task.partialScoring")}</label>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>{t("task.sectionStatement")}</legend>
+        <div className="segmented">
+          <button type="button" className={previewMode === "edit" ? "active" : ""} onClick={() => onPreviewModeChange("edit")}>{t("task.editMarkdown")}</button>
+          <button type="button" className={previewMode === "preview" ? "active" : ""} onClick={() => onPreviewModeChange("preview")}>{t("task.previewMarkdown")}</button>
+        </div>
+        {previewMode === "edit" ? (
+          <label>{t("task.statement")}<textarea value={form.statement} onChange={(event) => onChange({ ...form, statement: event.target.value })} required /></label>
+        ) : (
+          <MarkdownPreview value={form.statement} />
+        )}
+      </fieldset>
+      <fieldset>
+        <legend>{t("task.sectionFormats")}</legend>
+        <div className="form-grid">
+          <label>{t("task.inputFormat")}<textarea className="short" value={form.input_format} onChange={(event) => onChange({ ...form, input_format: event.target.value })} /></label>
+          <label>{t("task.outputFormat")}<textarea className="short" value={form.output_format} onChange={(event) => onChange({ ...form, output_format: event.target.value })} /></label>
+          <label className="span-2">{t("task.samplesJson")}<textarea className="short code" value={form.samples} onChange={(event) => onChange({ ...form, samples: event.target.value })} /></label>
+        </div>
+      </fieldset>
+      {mode === "create" && (
+        <>
+          <fieldset>
+            <legend>{t("task.sectionFirstTest")}</legend>
+            <div className="form-grid">
+              <label>{t("task.firstInput")}<textarea className="short code" value={form.test_input} onChange={(event) => onChange({ ...form, test_input: event.target.value })} /></label>
+              <label>{t("task.firstOutput")}<textarea className="short code" value={form.test_output} onChange={(event) => onChange({ ...form, test_output: event.target.value })} /></label>
+              <label className="inline"><input className="check" type="checkbox" checked={form.test_is_sample} onChange={(event) => onChange({ ...form, test_is_sample: event.target.checked })} /> {t("task.sampleTest")}</label>
             </div>
-          </td>
-        </tr>
+          </fieldset>
+          <fieldset>
+            <legend>{t("task.sectionTestArchive")}</legend>
+            <label className="file-field">{t("test.archiveUpload")}<input type="file" accept=".zip" onChange={(event) => onTestArchiveChange(event.target.files?.[0] ?? null)} /></label>
+            <p className="muted">{testArchive ? testArchive.name : t("task.archiveImportAfterCreate")}</p>
+          </fieldset>
+        </>
       )}
-    </>
+    </form>
+  );
+}
+
+function TaskRow({ task, onEdit, onDelete }: { task: Task; onEdit: (task: Task) => void; onDelete: (task: Task) => void }) {
+  const { t } = useI18n();
+  return (
+    <tr>
+      <td>{task.id}</td>
+      <td>{task.title}</td>
+      <td>{task.current_version_number ? `v${task.current_version_number}` : "-"}</td>
+      <td>{task.time_limit_ms} ms / {task.memory_limit_mb} MB</td>
+      <td>{formatScore(task.points)}</td>
+      <td>{task.test_count}{task.partial_scoring ? ` · ${t("task.partialScoring")}` : ""}</td>
+      <td className="row-actions">
+        <button type="button" onClick={() => onEdit(task)}>{t("common.edit")}</button>
+        <button type="button" className="danger" onClick={() => onDelete(task)}>{t("common.delete")}</button>
+      </td>
+    </tr>
   );
 }
 
