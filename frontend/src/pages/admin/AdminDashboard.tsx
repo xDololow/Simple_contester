@@ -6,15 +6,22 @@ import type { AdminStats, ApiClient, Clarification, ClarificationStatus, Clarifi
 import { emptyFlash, errorText, formatDate, formatScore, fromLocalInputValue, toLocalInputValue, verdictClass } from "../../utils/format";
 
 type AdminTab = "status" | "users" | "import" | "teams" | "contests" | "tasks" | "packages" | "tests" | "submissions" | "clarifications";
+const ADMIN_NAV_STORAGE_KEY = "simple-contester-admin-nav-hidden";
 
 export function AdminDashboard({ api, token, reloadContests, siteTimezone }: { api: ApiClient; token: string; reloadContests: () => void; siteTimezone: string }) {
   const { t } = useI18n();
   const [tab, setTab] = useState<AdminTab>("status");
+  const [navHidden, setNavHidden] = useState(() => localStorage.getItem(ADMIN_NAV_STORAGE_KEY) === "1");
+
+  useEffect(() => {
+    localStorage.setItem(ADMIN_NAV_STORAGE_KEY, navHidden ? "1" : "0");
+  }, [navHidden]);
 
   return (
-    <div className="admin-shell">
-      <AdminNav activeTab={tab} onChange={setTab} />
+    <div className={navHidden ? "admin-shell admin-nav-hidden" : "admin-shell"}>
+      {!navHidden && <AdminNav activeTab={tab} onChange={setTab} onHide={() => setNavHidden(true)} />}
       <div className="admin-content">
+        {navHidden && <button type="button" className="admin-nav-toggle" onClick={() => setNavHidden(false)}>{t("layout.showAdminMenu")}</button>}
         {tab === "status" && <StatusAdmin api={api} siteTimezone={siteTimezone} />}
         {tab === "users" && <UsersAdmin api={api} siteTimezone={siteTimezone} />}
         {tab === "import" && <ImportUsersAdmin api={api} token={token} />}
@@ -30,7 +37,7 @@ export function AdminDashboard({ api, token, reloadContests, siteTimezone }: { a
   );
 }
 
-function AdminNav({ activeTab, onChange }: { activeTab: AdminTab; onChange: (tab: AdminTab) => void }) {
+function AdminNav({ activeTab, onChange, onHide }: { activeTab: AdminTab; onChange: (tab: AdminTab) => void; onHide: () => void }) {
   const { t } = useI18n();
   const groups: Array<{ label: string; tabs: AdminTab[] }> = [
     { label: t("admin.nav.monitoring"), tabs: ["status", "submissions"] },
@@ -40,6 +47,7 @@ function AdminNav({ activeTab, onChange }: { activeTab: AdminTab; onChange: (tab
   ];
   return (
     <nav className="admin-nav" aria-label={t("nav.adminWorkspace")}>
+      <button type="button" className="small" onClick={onHide}>{t("layout.hideAdminMenu")}</button>
       {groups.map((group) => (
         <div className="admin-nav-group" key={group.label}>
           <span>{group.label}</span>
@@ -727,13 +735,20 @@ function ImportUsersAdmin({ api, token }: { api: ApiClient; token: string }) {
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<UserImportPreview | null>(null);
   const [teams, setTeams] = useState<Team[]>([]);
+  const [contests, setContests] = useState<Contest[]>([]);
   const [addToTeam, setAddToTeam] = useState(false);
   const [teamTarget, setTeamTarget] = useState<"existing" | "new">("existing");
   const [selectedTeamId, setSelectedTeamId] = useState("");
   const [newTeamName, setNewTeamName] = useState("");
+  const [addToContest, setAddToContest] = useState(false);
+  const [selectedContestId, setSelectedContestId] = useState("");
 
-  const loadTeams = useCallback(() => api<Team[]>("/api/teams").then(setTeams), [api]);
-  useEffect(() => { loadTeams().catch((error) => setFlash({ kind: "error", text: errorText(error) })); }, [loadTeams]);
+  const loadTargets = useCallback(async () => {
+    const [nextTeams, nextContests] = await Promise.all([api<Team[]>("/api/teams"), api<Contest[]>("/api/contests")]);
+    setTeams(nextTeams);
+    setContests(nextContests);
+  }, [api]);
+  useEffect(() => { loadTargets().catch((error) => setFlash({ kind: "error", text: errorText(error) })); }, [loadTargets]);
 
   async function selectFile(event: React.ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
@@ -761,6 +776,7 @@ function ImportUsersAdmin({ api, token }: { api: ApiClient; token: string }) {
       if (teamTarget === "existing" && selectedTeamId) body.append("team_id", selectedTeamId);
       if (teamTarget === "new" && newTeamName.trim()) body.append("team_name", newTeamName.trim());
     }
+    if (addToContest && selectedContestId) body.append("contest_id", selectedContestId);
     try {
       const response = await fetch(`${API_BASE}/api/users/import`, { method: "POST", headers: { Authorization: `Bearer ${token}` }, body });
       const data = await response.json();
@@ -768,13 +784,15 @@ function ImportUsersAdmin({ api, token }: { api: ApiClient; token: string }) {
       setReport(data);
       setFile(null);
       setPreview(null);
-      await loadTeams();
+      await loadTargets();
     } catch (error) {
       setFlash({ kind: "error", text: errorText(error) });
     }
   }
 
-  const canSubmitImport = Boolean(preview?.validCount) && (!addToTeam || (teamTarget === "existing" ? Boolean(selectedTeamId) : Boolean(newTeamName.trim())));
+  const canSubmitImport = Boolean(preview?.validCount)
+    && (!addToTeam || (teamTarget === "existing" ? Boolean(selectedTeamId) : Boolean(newTeamName.trim())))
+    && (!addToContest || Boolean(selectedContestId));
 
   return (
     <section className="panel">
@@ -816,6 +834,17 @@ function ImportUsersAdmin({ api, token }: { api: ApiClient; token: string }) {
                 )}
               </div>
             )}
+            <label className="inline"><input className="check" type="checkbox" checked={addToContest} onChange={(event) => setAddToContest(event.target.checked)} /> {t("import.addToContest")}</label>
+            {addToContest && (
+              <div className="form-grid">
+                <label>{t("table.contest")}
+                  <select value={selectedContestId} onChange={(event) => setSelectedContestId(event.target.value)}>
+                    <option value="">{t("common.none")}</option>
+                    {contests.map((contest) => <option key={contest.id} value={contest.id}>{contest.id}: {contest.title}</option>)}
+                  </select>
+                </label>
+              </div>
+            )}
           </div>
           <div className="table-wrap">
             <table>
@@ -845,6 +874,7 @@ function ImportUsersAdmin({ api, token }: { api: ApiClient; token: string }) {
           <div className="stat"><strong>{report.skipped}</strong><span>{t("common.skipped")}</span></div>
           <div className="stat"><strong>{report.errors.length}</strong><span>{t("common.errors")}</span></div>
           {report.team_id && <div className="stat"><strong>{report.team_members_added ?? 0}</strong><span>{t("import.teamMembersAdded", { team: report.team_id })}</span></div>}
+          {report.contest_id && <div className="stat"><strong>{report.contest_participants_added ?? 0}</strong><span>{t("import.contestParticipantsAdded", { contest: report.contest_id })}</span></div>}
           <table>
             <thead><tr><th>{t("table.status")}</th><th>{t("import.rowReport")}</th></tr></thead>
             <tbody>

@@ -200,7 +200,60 @@ def test_import_users_from_csv_json_and_yaml(
         "errors": [],
         "team_id": None,
         "team_members_added": 0,
+        "contest_id": None,
+        "contest_participants_added": 0,
     }
+
+
+def test_import_can_add_created_participants_to_contest(client: APIClient, admin_headers: dict[str, str]) -> None:
+    contest_response = client.post(
+        "/api/contests",
+        headers=admin_headers,
+        json={
+            "title": "Import target",
+            "description": "",
+            "status": "draft",
+            "is_public": False,
+            "registration_enabled": False,
+            "registration_requires_approval": True,
+            "time_mode": "fixed",
+            "participation_mode": "individual",
+            "scoring_mode": "ioi",
+            "starts_at": "2026-05-19T10:00:00",
+            "ends_at": "2026-05-19T13:00:00",
+            "individual_duration_minutes": None,
+            "scoreboard_freeze_at": None,
+            "scoreboard_unfrozen": False,
+            "scoreboard_visibility": "public",
+        },
+    )
+    assert contest_response.status_code == 200, contest_response.text
+    contest_id = contest_response.json()["id"]
+
+    response = client.post(
+        "/api/users/import",
+        headers=admin_headers,
+        data={"contest_id": str(contest_id)},
+        files={
+            "file": (
+                "users.json",
+                json.dumps([
+                    {"username": "contest_imported", "password": "secret-pass"},
+                    {"username": "contest_imported_admin", "password": "secret-pass", "role": "admin"},
+                ]),
+                "application/json",
+            )
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["created"] == 2
+    assert response.json()["contest_id"] == contest_id
+    assert response.json()["contest_participants_added"] == 1
+
+    participants = client.get(f"/api/contests/{contest_id}/participants", headers=admin_headers)
+    assert participants.status_code == 200, participants.text
+    assert [participant["username"] for participant in participants.json()] == ["contest_imported"]
 
 
 def test_import_skips_existing_username_duplicates(client: APIClient, admin_headers: dict[str, str]) -> None:

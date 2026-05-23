@@ -7,6 +7,11 @@ import { DEFAULT_SITE_TIMEZONE, browserTimeZone, emptyFlash, errorText } from ".
 import { Login } from "./Login";
 import { Workspace } from "./Workspace";
 
+type Theme = "light" | "dark";
+
+const THEME_STORAGE_KEY = "simple-contester-theme";
+const SIDEBAR_STORAGE_KEY = "simple-contester-sidebar-hidden";
+
 function useToken() {
   const [token, setTokenState] = useState(localStorage.getItem("token") || "");
   const setToken = useCallback((value: string) => {
@@ -26,7 +31,18 @@ export function App() {
   const [me, setMe] = useState<User | null>(null);
   const [siteTimezone, setSiteTimezone] = useState(DEFAULT_SITE_TIMEZONE);
   const [loginError, setLoginError] = useState("");
+  const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem(THEME_STORAGE_KEY) === "dark" ? "dark" : "light"));
+  const [sidebarHidden, setSidebarHidden] = useState(() => localStorage.getItem(SIDEBAR_STORAGE_KEY) === "1");
   const api = useMemo(() => createApiClient(token), [token]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem(THEME_STORAGE_KEY, theme);
+  }, [theme]);
+
+  useEffect(() => {
+    localStorage.setItem(SIDEBAR_STORAGE_KEY, sidebarHidden ? "1" : "0");
+  }, [sidebarHidden]);
 
   useEffect(() => {
     fetch(`${API_BASE}/api/config`)
@@ -61,12 +77,14 @@ export function App() {
           </span>
         </div>
         <div className="topbar-actions">
+          <button type="button" onClick={() => setSidebarHidden((value) => !value)}>{sidebarHidden ? t("layout.showSidebar") : t("layout.hideSidebar")}</button>
+          <button type="button" onClick={() => setTheme((value) => value === "dark" ? "light" : "dark")}>{theme === "dark" ? t("theme.light") : t("theme.dark")}</button>
           <LanguageSwitcher />
           <AccountPanel api={api} me={me} siteTimezone={siteTimezone} detectedTimezone={detectedTimezone} onUserChanged={setMe} />
           <button onClick={clearToken}>{t("login.logout")}</button>
         </div>
       </header>
-      <Workspace api={api} me={me} token={token} siteTimezone={effectiveTimezone} />
+      <Workspace api={api} me={me} token={token} siteTimezone={effectiveTimezone} sidebarHidden={sidebarHidden} />
     </main>
   );
 }

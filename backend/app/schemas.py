@@ -105,6 +105,8 @@ class ImportReport(ApiModel):
     errors: list[str]
     team_id: int | None = None
     team_members_added: int = 0
+    contest_id: int | None = None
+    contest_participants_added: int = 0
 
 
 class AdminUsersStats(ApiModel):

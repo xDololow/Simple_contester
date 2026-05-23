@@ -1247,6 +1247,7 @@ async def import_users(
     file: UploadFile = File(...),
     team_id: int | None = Form(default=None),
     team_name: str | None = Form(default=None),
+    contest_id: int | None = Form(default=None),
     _: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> ImportReport:
@@ -1254,6 +1255,12 @@ async def import_users(
         rows = parse_import_file(file.filename or "", await file.read())
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    target_contest: Contest | None = None
+    if contest_id is not None:
+        target_contest = db.get(Contest, contest_id)
+        if target_contest is None:
+            raise HTTPException(status_code=404, detail="Contest not found")
 
     created = 0
     skipped = 0
@@ -1305,6 +1312,18 @@ async def import_users(
                 target_team.members.append(TeamMember(user_id=user.id))
                 existing_member_ids.add(user.id)
                 team_members_added += 1
+    contest_participants_added = 0
+    if target_contest is not None and created_users:
+        db.flush()
+        existing_participant_ids = set(
+            db.scalars(select(ParticipantContest.user_id).where(ParticipantContest.contest_id == target_contest.id)).all()
+        )
+        for user in created_users:
+            if user.role != UserRole.participant or user.id in existing_participant_ids:
+                continue
+            db.add(ParticipantContest(contest_id=target_contest.id, user_id=user.id))
+            existing_participant_ids.add(user.id)
+            contest_participants_added += 1
     db.commit()
     return ImportReport(
         created=created,
@@ -1312,6 +1331,8 @@ async def import_users(
         errors=errors,
         team_id=target_team.id if target_team is not None else None,
         team_members_added=team_members_added,
+        contest_id=target_contest.id if target_contest is not None else None,
+        contest_participants_added=contest_participants_added,
     )
 
 

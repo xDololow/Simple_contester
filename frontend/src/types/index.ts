@@ -222,6 +222,8 @@ export type ImportReport = {
   errors: string[];
   team_id?: number | null;
   team_members_added?: number;
+  contest_id?: number | null;
+  contest_participants_added?: number;
 };
 
 export type TestArchiveImportReport = {
