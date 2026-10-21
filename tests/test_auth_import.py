@@ -26,7 +26,7 @@ def test_login_and_participant_cannot_access_admin_endpoints(
 
     users = client.get("/api/users", headers=participant_headers)
     assert users.status_code == 403
-    assert users.json()["detail"] == "Admin role required"
+    assert users.json()["detail"] == "Staff role required"
 
     admin_users = client.get("/api/users", headers=admin_headers)
     assert admin_users.status_code == 200
@@ -287,3 +287,57 @@ def test_import_skips_existing_username_duplicates(client: APIClient, admin_head
     assert duplicate.json()["created"] == 0
     assert duplicate.json()["skipped"] == 1
     assert "already exists" in duplicate.json()["errors"][0]
+
+
+def test_moderator_manages_only_assigned_contest(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    auth_headers,
+    create_user,
+    demo_contest: dict,
+) -> None:
+    moderator = create_user(username="moderator", password="mod-pass", role="moderator")
+    other = create_user(username="other-mod", password="mod-pass", role="moderator")
+    headers = auth_headers("moderator", "mod-pass")
+
+    denied = client.get("/api/contests?managed=1", headers=headers)
+    assert denied.status_code == 200, denied.text
+    assert denied.json() == []
+
+    assigned = client.put(
+        f"/api/contests/{demo_contest['id']}/moderators",
+        headers=admin_headers,
+        json={"user_ids": [moderator["id"]]},
+    )
+    assert assigned.status_code == 200, assigned.text
+    assert [user["id"] for user in assigned.json()] == [moderator["id"]]
+
+    managed = client.get("/api/contests?managed=1", headers=headers)
+    assert managed.status_code == 200, managed.text
+    assert [contest["id"] for contest in managed.json()] == [demo_contest["id"]]
+
+    users = client.get("/api/users", headers=headers)
+    assert users.status_code == 200, users.text
+    assert any(user["username"] == "other-mod" for user in users.json())
+
+    created = client.post(
+        "/api/users",
+        headers=headers,
+        json={"username": "nope", "password": "secret", "role": "participant"},
+    )
+    assert created.status_code == 403
+
+    question = client.post(
+        f"/api/contests/{demo_contest['id']}/clarifications",
+        headers=admin_headers,
+        json={"question": "Can we use extra memory?"},
+    )
+    assert question.status_code == 200, question.text
+    answered = client.patch(
+        f"/api/admin/clarifications/{question.json()['id']}",
+        headers=headers,
+        json={"answer": "Yes, within the limit."},
+    )
+    assert answered.status_code == 200, answered.text
+    assert answered.json()["answer"] == "Yes, within the limit."
+    assert answered.json()["status"] == "answered"

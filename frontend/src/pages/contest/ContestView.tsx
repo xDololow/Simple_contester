@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { API_BASE } from "../../api/client";
+import { CodeEditor } from "../../components/CodeEditor";
 import { FlashMessage, Header, SubmissionDetailView } from "../../components/shared";
 import { useI18n } from "../../i18n";
 import type { ApiClient, Clarification, Contest, ContestLiveEvent, ContestRegistration, Flash, Language, ParticipantContest, ScoreboardRow, Submission, SubmissionDetail, Task, User } from "../../types";
@@ -361,12 +362,8 @@ export function ContestView({ api, contest, me, token, siteTimezone }: { api: Ap
                   </button>
                 ))}
               </div>
-              {selectedTask && (
-                <div className="task-detail">
-                  <TaskStatement task={selectedTask} />
-                  <SubmitBox api={api} contestId={contest.id} task={selectedTask} onSubmitted={refreshLiveData} />
-                </div>
-              )}
+              {selectedTask && <TaskStatement task={selectedTask} />}
+              {selectedTask && <SubmitBox api={api} contestId={contest.id} task={selectedTask} onSubmitted={refreshLiveData} />}
             </div>
           ) : (
             <EmptyState title={t("empty.tasksTitle")} text={t("empty.tasksText")} />
@@ -676,7 +673,7 @@ function SubmitBox({ api, contestId, task, onSubmitted }: { api: ApiClient; cont
         </select>
       </label>
       <label>{t("submission.sourceCode")}
-        <textarea className="code submit-code" value={sourceCode} onChange={(event) => updateSourceCode(event.target.value)} />
+        <CodeEditor language={language} value={sourceCode} onChange={updateSourceCode} />
       </label>
       <div className="submit-actions">
         <button type="submit" disabled={!sourceCode.trim()}>{t("submission.submit")}</button>

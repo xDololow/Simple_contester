@@ -1,4 +1,4 @@
-export type Role = "admin" | "participant";
+export type Role = "admin" | "moderator" | "participant";
 export type ContestStatus = "draft" | "scheduled" | "running" | "finished" | "archived";
 export type TimeMode = "fixed" | "individual";
 export type ParticipationMode = "individual" | "team";
@@ -241,12 +241,26 @@ export type PackageImportReport = {
 
 export type Flash = { kind: "ok" | "error"; text: string };
 
+export type AdminUserPresence = {
+  id: number;
+  username: string;
+  display_name: string;
+  role: Role;
+  is_active: boolean;
+  online: boolean;
+  last_seen_at: string | null;
+};
+
 export type AdminStats = {
   users: {
     total: number;
     active: number;
     admin: number;
+    moderator: number;
     participant: number;
+    online: number;
+    offline: number;
+    presence: AdminUserPresence[];
   };
   teams_total: number;
   contests: {

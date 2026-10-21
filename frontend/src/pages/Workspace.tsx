@@ -43,9 +43,9 @@ export function Workspace({
             <button className={view === "contest" ? "active" : ""} onClick={() => setView("contest")} type="button">
               {t("nav.participantWorkspace")}
             </button>
-            {me.role === "admin" && (
+            {(me.role === "admin" || me.role === "moderator") && (
               <button className={view === "admin" ? "active" : ""} onClick={() => setView("admin")} type="button">
-                {t("nav.adminWorkspace")}
+                {me.role === "moderator" ? t("nav.staffWorkspace") : t("nav.adminWorkspace")}
               </button>
             )}
           </nav>
@@ -72,8 +72,8 @@ export function Workspace({
         </aside>
       )}
       <section className="content">
-        {view === "admin" && me.role === "admin" ? (
-          <AdminDashboard api={api} token={token} reloadContests={loadContests} siteTimezone={siteTimezone} />
+        {view === "admin" && (me.role === "admin" || me.role === "moderator") ? (
+          <AdminDashboard api={api} token={token} me={me} reloadContests={loadContests} siteTimezone={siteTimezone} />
         ) : selectedContest ? (
           <ContestView api={api} contest={selectedContest} me={me} token={token} siteTimezone={siteTimezone} />
         ) : (

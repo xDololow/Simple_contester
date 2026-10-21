@@ -93,9 +93,9 @@ def test_judger_health_classifies_stale_and_offline(client: APIClient, admin_hea
     health_by_id = {item["judger_id"]: item["health"] for item in response.json()}
     assert health_by_id == {
         "active-judge": "active",
-        "offline-judge": "offline",
         "stale-judge": "stale",
     }
+    assert "offline-judge" not in health_by_id
 
 
 def test_judger_health_records_stale_and_missed_events(client: APIClient, admin_headers: dict[str, str]) -> None:
@@ -115,6 +115,47 @@ def test_judger_health_records_stale_and_missed_events(client: APIClient, admin_
     assert ("stale-judge", "heartbeat_stale") in events
     assert ("offline-judge", "heartbeat_missed") in events
     assert len(events_response.json()) == 2
+
+
+def test_resolve_judger_id_uses_base_plus_instance(monkeypatch) -> None:
+    monkeypatch.setenv("JUDGER_ID_UNIQUE", "1")
+    monkeypatch.delenv("JUDGER_INSTANCE", raising=False)
+
+    assert worker.resolve_judger_id(base="docker-judger", instance="simple_contester-judger-1") == "docker-judger-simple_contester-judger-1"
+    assert worker.resolve_judger_id(base="docker-judger", instance="simple_contester-judger-2") == "docker-judger-simple_contester-judger-2"
+    assert worker.resolve_judger_id(base="docker-judger", instance="simple_contester-judger-3") == "docker-judger-simple_contester-judger-3"
+
+
+def test_resolve_judger_id_keeps_exact_id_when_disabled(monkeypatch) -> None:
+    monkeypatch.setenv("JUDGER_ID_UNIQUE", "0")
+    monkeypatch.setenv("JUDGER_INSTANCE", "replica-2")
+
+    assert worker.resolve_judger_id(base="docker-judger") == "docker-judger"
+
+
+def test_resolve_judger_id_appends_hostname(monkeypatch) -> None:
+    monkeypatch.setenv("JUDGER_ID_UNIQUE", "1")
+    monkeypatch.delenv("JUDGER_INSTANCE", raising=False)
+    monkeypatch.setattr(worker.socket, "gethostname", lambda: "abc123def456")
+
+    assert worker.resolve_judger_id(base="docker-judger") == "docker-judger-abc123def456"
+
+
+def test_scaled_judger_ids_are_listed_separately(client: APIClient, admin_headers: dict[str, str], monkeypatch) -> None:
+    monkeypatch.setenv("JUDGER_ID_UNIQUE", "1")
+    monkeypatch.delenv("JUDGER_INSTANCE", raising=False)
+    for instance in ("simple_contester-judger-1", "simple_contester-judger-2", "simple_contester-judger-3"):
+        monkeypatch.setattr(worker, "JUDGER_ID", worker.resolve_judger_id(base="docker-judger", instance=instance))
+        worker.register_or_update_judger("idle")
+
+    response = client.get("/api/admin/judgers", headers=admin_headers)
+
+    assert response.status_code == 200, response.text
+    assert [row["judger_id"] for row in response.json()] == [
+        "docker-judger-simple_contester-judger-1",
+        "docker-judger-simple_contester-judger-2",
+        "docker-judger-simple_contester-judger-3",
+    ]
 
 
 def test_worker_heartbeat_upserts_judger(monkeypatch) -> None:

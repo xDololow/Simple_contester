@@ -2,15 +2,16 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { API_BASE } from "../../api/client";
 import { FlashMessage, Header, SubmissionDetailView } from "../../components/shared";
 import { useI18n } from "../../i18n";
-import type { AdminStats, ApiClient, Clarification, ClarificationStatus, ClarificationVisibility, Contest, ContestRegistration, ContestStatus, Flash, ImportReport, JudgerEvent, JudgerWorker, PackageImportReport, ParticipantContestTime, ParticipationMode, Role, ScoringMode, ScoreboardVisibility, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
+import type { AdminStats, AdminUserPresence, ApiClient, Clarification, ClarificationStatus, ClarificationVisibility, Contest, ContestRegistration, ContestStatus, Flash, ImportReport, JudgerEvent, JudgerWorker, PackageImportReport, ParticipantContestTime, ParticipationMode, Role, ScoringMode, ScoreboardVisibility, Submission, SubmissionDetail, Task, TaskTest, Team, TestArchiveImportReport, TimeMode, User } from "../../types";
 import { emptyFlash, errorText, formatDate, formatScore, fromLocalInputValue, toLocalInputValue, verdictClass } from "../../utils/format";
 
 type AdminTab = "status" | "users" | "import" | "teams" | "contests" | "tasks" | "packages" | "tests" | "submissions" | "clarifications";
 const ADMIN_NAV_STORAGE_KEY = "simple-contester-admin-nav-hidden";
 
-export function AdminDashboard({ api, token, reloadContests, siteTimezone }: { api: ApiClient; token: string; reloadContests: () => void; siteTimezone: string }) {
+export function AdminDashboard({ api, token, me, reloadContests, siteTimezone }: { api: ApiClient; token: string; me: User; reloadContests: () => void; siteTimezone: string }) {
   const { t } = useI18n();
-  const [tab, setTab] = useState<AdminTab>("status");
+  const isModerator = me.role === "moderator";
+  const [tab, setTab] = useState<AdminTab>(isModerator ? "contests" : "status");
   const [navHidden, setNavHidden] = useState(() => localStorage.getItem(ADMIN_NAV_STORAGE_KEY) === "1");
 
   useEffect(() => {
@@ -19,32 +20,39 @@ export function AdminDashboard({ api, token, reloadContests, siteTimezone }: { a
 
   return (
     <div className={navHidden ? "admin-shell admin-nav-hidden" : "admin-shell"}>
-      {!navHidden && <AdminNav activeTab={tab} onChange={setTab} onHide={() => setNavHidden(true)} />}
+      {!navHidden && <AdminNav activeTab={tab} onChange={setTab} onHide={() => setNavHidden(true)} moderator={isModerator} />}
       <div className="admin-content">
         {navHidden && <button type="button" className="admin-nav-toggle" onClick={() => setNavHidden(false)}>{t("layout.showAdminMenu")}</button>}
-        {tab === "status" && <StatusAdmin api={api} siteTimezone={siteTimezone} />}
-        {tab === "users" && <UsersAdmin api={api} siteTimezone={siteTimezone} />}
+        {tab === "status" && <StatusAdmin api={api} token={token} siteTimezone={siteTimezone} />}
+        {tab === "users" && <UsersAdmin api={api} siteTimezone={siteTimezone} readOnly={isModerator} />}
         {tab === "import" && <ImportUsersAdmin api={api} token={token} />}
         {tab === "teams" && <TeamsAdmin api={api} siteTimezone={siteTimezone} />}
-        {tab === "contests" && <ContestsAdmin api={api} onChanged={reloadContests} siteTimezone={siteTimezone} />}
+        {tab === "contests" && <ContestsAdmin api={api} onChanged={reloadContests} siteTimezone={siteTimezone} canCreate={!isModerator} />}
         {tab === "tasks" && <TasksAdmin api={api} />}
         {tab === "packages" && <PackagesAdmin api={api} token={token} onChanged={reloadContests} />}
         {tab === "tests" && <TestsAdmin api={api} />}
-        {tab === "submissions" && <SubmissionsAdmin api={api} siteTimezone={siteTimezone} />}
+        {tab === "submissions" && <SubmissionsAdmin api={api} siteTimezone={siteTimezone} canRejudge={!isModerator} />}
         {tab === "clarifications" && <ClarificationsAdmin api={api} siteTimezone={siteTimezone} />}
       </div>
     </div>
   );
 }
 
-function AdminNav({ activeTab, onChange, onHide }: { activeTab: AdminTab; onChange: (tab: AdminTab) => void; onHide: () => void }) {
+function AdminNav({ activeTab, onChange, onHide, moderator }: { activeTab: AdminTab; onChange: (tab: AdminTab) => void; onHide: () => void; moderator: boolean }) {
   const { t } = useI18n();
-  const groups: Array<{ label: string; tabs: AdminTab[] }> = [
-    { label: t("admin.nav.monitoring"), tabs: ["status", "submissions"] },
-    { label: t("admin.nav.accounts"), tabs: ["users", "import", "teams"] },
-    { label: t("admin.nav.content"), tabs: ["contests", "tasks", "packages", "tests"] },
-    { label: t("admin.nav.support"), tabs: ["clarifications"] }
-  ];
+  const groups: Array<{ label: string; tabs: AdminTab[] }> = moderator
+    ? [
+        { label: t("admin.nav.monitoring"), tabs: ["submissions"] },
+        { label: t("admin.nav.accounts"), tabs: ["users"] },
+        { label: t("admin.nav.content"), tabs: ["contests"] },
+        { label: t("admin.nav.support"), tabs: ["clarifications"] }
+      ]
+    : [
+        { label: t("admin.nav.monitoring"), tabs: ["status", "submissions"] },
+        { label: t("admin.nav.accounts"), tabs: ["users", "import", "teams"] },
+        { label: t("admin.nav.content"), tabs: ["contests", "tasks", "packages", "tests"] },
+        { label: t("admin.nav.support"), tabs: ["clarifications"] }
+      ];
   return (
     <nav className="admin-nav" aria-label={t("nav.adminWorkspace")}>
       <button type="button" className="small" onClick={onHide}>{t("layout.hideAdminMenu")}</button>
@@ -120,6 +128,7 @@ type ContestFormState = ContestAccessFields & {
   scoreboard_unfrozen: boolean;
   scoreboard_visibility: ScoreboardVisibility;
   task_ids: number[];
+  moderator_ids: number[];
 };
 
 function accessModeOf(value: Pick<ContestAccessFields, "is_public" | "registration_enabled">): ContestAccessMode {
@@ -190,7 +199,8 @@ function createEmptyContestForm(siteTimezone: string): ContestFormState {
     scoreboard_visibility: "public",
     task_ids: [],
     participant_ids: [],
-    team_ids: []
+    team_ids: [],
+    moderator_ids: []
   };
 }
 
@@ -199,6 +209,7 @@ function contestToForm(
   taskIds: number[],
   participantIds: number[],
   teamIds: number[],
+  moderatorIds: number[],
   siteTimezone: string
 ): ContestFormState {
   return {
@@ -219,7 +230,8 @@ function contestToForm(
     scoreboard_visibility: contest.scoreboard_visibility ?? "public",
     task_ids: taskIds,
     participant_ids: participantIds,
-    team_ids: teamIds
+    team_ids: teamIds,
+    moderator_ids: moderatorIds
   };
 }
 
@@ -261,13 +273,20 @@ function PaginationControls({
   );
 }
 
-function StatusAdmin({ api, siteTimezone }: { api: ApiClient; siteTimezone: string }) {
+type AdminStatusLiveEvent = {
+  stats: AdminStats;
+  judgers: JudgerWorker[];
+  events: JudgerEvent[];
+};
+
+function StatusAdmin({ api, token, siteTimezone }: { api: ApiClient; token: string; siteTimezone: string }) {
   const { t } = useI18n();
   const [stats, setStats] = useState<AdminStats | null>(null);
   const [judgers, setJudgers] = useState<JudgerWorker[]>([]);
   const [judgerEvents, setJudgerEvents] = useState<JudgerEvent[]>([]);
   const [flash, setFlash] = useState<Flash>(emptyFlash);
   const [loading, setLoading] = useState(false);
+  const [live, setLive] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -289,10 +308,49 @@ function StatusAdmin({ api, siteTimezone }: { api: ApiClient; siteTimezone: stri
   }, [api]);
 
   useEffect(() => {
-    load();
-    const interval = window.setInterval(() => load().catch(console.error), 12000);
-    return () => window.clearInterval(interval);
-  }, [load]);
+    let cancelled = false;
+    let eventSource: EventSource | null = null;
+    let fallbackInterval: number | null = null;
+    const startFallback = () => {
+      if (fallbackInterval !== null) return;
+      setLive(false);
+      fallbackInterval = window.setInterval(() => {
+        if (!cancelled) load().catch(console.error);
+      }, 5000);
+    };
+    load().catch(console.error);
+    if (!token || typeof EventSource === "undefined") {
+      startFallback();
+      return () => {
+        cancelled = true;
+        if (fallbackInterval !== null) window.clearInterval(fallbackInterval);
+      };
+    }
+    eventSource = new EventSource(`${API_BASE}/api/admin/status/events?token=${encodeURIComponent(token)}`);
+    eventSource.onopen = () => {
+      if (!cancelled) setLive(true);
+    };
+    eventSource.addEventListener("status", (event) => {
+      if (cancelled) return;
+      const update = JSON.parse((event as MessageEvent).data) as AdminStatusLiveEvent;
+      setStats(update.stats);
+      setJudgers(update.judgers);
+      setJudgerEvents(update.events);
+      setFlash(emptyFlash);
+      setLive(true);
+    });
+    eventSource.onerror = () => {
+      if (cancelled) return;
+      eventSource?.close();
+      eventSource = null;
+      startFallback();
+    };
+    return () => {
+      cancelled = true;
+      eventSource?.close();
+      if (fallbackInterval !== null) window.clearInterval(fallbackInterval);
+    };
+  }, [load, token]);
 
   const verdictRows = stats ? Object.entries(stats.submissions.by_verdict).filter(([, count]) => count > 0) : [];
   const languageRows = stats ? Object.entries(stats.submissions.by_language).filter(([, count]) => count > 0) : [];
@@ -311,28 +369,42 @@ function StatusAdmin({ api, siteTimezone }: { api: ApiClient; siteTimezone: stri
         ) : (
           <span className="pill">{t("status.dbUnknown")}</span>
         )}
-        <span className="muted">{t("status.autoRefresh")}</span>
+        <span className={live ? "pill ok" : "muted"}>{live ? t("status.live") : t("status.autoRefresh")}</span>
       </div>
       <FlashMessage flash={flash} />
       {stats && (
-        <div className="status-grid">
-          <div className="stat"><strong>{stats.users.total}</strong><span>{t("status.usersTotal")}</span></div>
-          <div className="stat"><strong>{stats.users.active}</strong><span>{t("status.usersActive")}</span></div>
-          <div className="stat"><strong>{stats.users.admin}</strong><span>{t("role.admin")}</span></div>
-          <div className="stat"><strong>{stats.users.participant}</strong><span>{t("role.participant")}</span></div>
-          <div className="stat"><strong>{stats.teams_total}</strong><span>{t("tab.teams")}</span></div>
-          <div className="stat"><strong>{stats.contests.total}</strong><span>{t("tab.contests")}</span></div>
-          <div className="stat"><strong>{stats.tasks_total}</strong><span>{t("tab.tasks")}</span></div>
-          <div className="stat"><strong>{stats.tests_total}</strong><span>{t("tab.tests")}</span></div>
-          <div className="stat"><strong>{stats.submissions.total}</strong><span>{t("tab.submissions")}</span></div>
-          <div className="stat"><strong>{stats.submissions.queue_depth}</strong><span>{t("status.queueDepth")}</span></div>
-          <div className="stat"><strong>{stats.submissions.running_count}</strong><span>{t("status.runningCount")}</span></div>
-          <div className="stat"><strong>{stats.submissions.accepted_rate}%</strong><span>{t("status.acceptedRate")}</span></div>
-          <div className="stat"><strong>{formatScore(stats.submissions.average_score)}</strong><span>{t("status.averageScore")}</span></div>
-          <div className="stat"><strong>{stats.submissions.finished_1h}</strong><span>{t("status.finished1h")}</span></div>
-          <div className="stat"><strong>{stats.submissions.finished_24h}</strong><span>{t("status.finished24h")}</span></div>
-          <div className="stat"><strong>{stats.system.app_version}</strong><span>{t("status.appVersion")}</span></div>
+        <div className="status-page">
+          <section className="status-category">
+            <h2>{t("status.category.overview")}</h2>
+            <div className="status-grid">
+              <div className="stat"><strong>{stats.users.total}</strong><span>{t("status.usersTotal")}</span></div>
+              <div className="stat"><strong>{stats.users.online}</strong><span>{t("status.usersOnline")}</span></div>
+              <div className="stat"><strong>{stats.users.offline}</strong><span>{t("status.usersOffline")}</span></div>
+              <div className="stat"><strong>{stats.users.active}</strong><span>{t("status.usersActive")}</span></div>
+              <div className="stat"><strong>{stats.users.admin}</strong><span>{t("role.admin")}</span></div>
+              <div className="stat"><strong>{stats.users.participant}</strong><span>{t("role.participant")}</span></div>
+              <div className="stat"><strong>{stats.teams_total}</strong><span>{t("tab.teams")}</span></div>
+              <div className="stat"><strong>{stats.contests.total}</strong><span>{t("tab.contests")}</span></div>
+              <div className="stat"><strong>{stats.tasks_total}</strong><span>{t("tab.tasks")}</span></div>
+              <div className="stat"><strong>{stats.tests_total}</strong><span>{t("tab.tests")}</span></div>
+              <div className="stat"><strong>{stats.submissions.total}</strong><span>{t("tab.submissions")}</span></div>
+              <div className="stat"><strong>{stats.submissions.accepted_rate}%</strong><span>{t("status.acceptedRate")}</span></div>
+              <div className="stat"><strong>{formatScore(stats.submissions.average_score)}</strong><span>{t("status.averageScore")}</span></div>
+              <div className="stat"><strong>{stats.system.app_version}</strong><span>{t("status.appVersion")}</span></div>
+            </div>
+          </section>
 
+          <section className="status-category">
+            <h2>{t("status.category.users")}</h2>
+            <div className="status-grid">
+              <UserPresenceTable title={t("status.usersOnline")} users={stats.users.presence.filter((user) => user.online)} siteTimezone={siteTimezone} />
+              <UserPresenceTable title={t("status.usersOffline")} users={stats.users.presence.filter((user) => !user.online)} siteTimezone={siteTimezone} />
+            </div>
+          </section>
+
+          <section className="status-category">
+            <h2>{t("status.category.queue")}</h2>
+            <div className="status-grid">
           <div className="status-card">
             <h3>{t("status.queue")}</h3>
             <MetricBar label={t("status.queueDepth")} value={stats.submissions.queue_depth} max={maxQueue} />
@@ -367,7 +439,12 @@ function StatusAdmin({ api, siteTimezone }: { api: ApiClient; siteTimezone: stri
               <span>{t("status.staleRunning")}</span><strong>{stats.submissions.stale_running_count}</strong>
             </div>
           </div>
+            </div>
+          </section>
 
+          <section className="status-category">
+            <h2>{t("status.category.contests")}</h2>
+            <div className="status-grid">
           <div className="status-card">
             <h3>{t("status.contests")}</h3>
             <div className="kv compact-kv">
@@ -383,6 +460,12 @@ function StatusAdmin({ api, siteTimezone }: { api: ApiClient; siteTimezone: stri
 
           <StatusTable title={t("status.byVerdict")} rows={verdictRows.map(([verdict, count]) => [t(`verdict.${verdict}`), count])} empty={t("common.empty")} />
           <StatusTable title={t("status.byLanguage")} rows={languageRows} empty={t("common.empty")} />
+            </div>
+          </section>
+
+          <section className="status-category">
+            <h2>{t("status.category.judgers")}</h2>
+            <div className="status-grid">
           {(stats.judgers.active > 0 || stats.judgers.stale > 0 || stats.judgers.offline > 0) && (
             <StatusTable title={t("status.judgerRegistry")} rows={[[t("status.judgerActive"), stats.judgers.active], [t("status.judgerStale"), stats.judgers.stale], [t("status.judgerOffline"), stats.judgers.offline]]} empty={t("common.empty")} />
           )}
@@ -390,16 +473,57 @@ function StatusAdmin({ api, siteTimezone }: { api: ApiClient; siteTimezone: stri
           <JudgerEventsTable events={judgerEvents} siteTimezone={siteTimezone} />
           <StatusTable title={t("status.runningJudgers")} rows={runningJudgers} empty={t("common.empty")} />
           <StatusTable title={t("status.finishedJudgers24h")} rows={finishedJudgers} empty={t("common.empty")} />
+            </div>
+          </section>
         </div>
       )}
     </section>
   );
 }
 
-function JudgerWorkersTable({ judgers, siteTimezone }: { judgers: JudgerWorker[]; siteTimezone: string }) {
+function UserPresenceTable({ title, users, siteTimezone }: { title: string; users: AdminUserPresence[]; siteTimezone: string }) {
   const { t } = useI18n();
   return (
     <div className="status-card">
+      <h3>{title} ({users.length})</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>{t("table.user")}</th>
+            <th>{t("table.role")}</th>
+            <th>{t("table.lastSeen")}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {users.length ? users.map((user) => (
+            <tr key={user.id}>
+              <td>
+                <div>{user.display_name}</div>
+                <div className="muted">{user.username}</div>
+              </td>
+              <td>{t(`role.${user.role}`)}</td>
+              <td>{user.last_seen_at ? formatDate(user.last_seen_at, siteTimezone) : t("common.none")}</td>
+            </tr>
+          )) : <tr><td colSpan={3} className="muted">{t("common.empty")}</td></tr>}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function judgerHealthRank(health: string): number {
+  if (health === "active") return 0;
+  if (health === "stale") return 1;
+  return 2;
+}
+
+function JudgerWorkersTable({ judgers, siteTimezone }: { judgers: JudgerWorker[]; siteTimezone: string }) {
+  const { t } = useI18n();
+  const ordered = [...judgers].sort((left, right) => (
+    judgerHealthRank(left.health) - judgerHealthRank(right.health) || left.judger_id.localeCompare(right.judger_id)
+  ));
+  return (
+    <div className="status-card status-card-wide">
       <h3>{t("status.judgerWorkers")}</h3>
       <table>
         <thead>
@@ -413,9 +537,12 @@ function JudgerWorkersTable({ judgers, siteTimezone }: { judgers: JudgerWorker[]
           </tr>
         </thead>
         <tbody>
-          {judgers.length ? judgers.map((judger) => (
+          {ordered.length ? ordered.map((judger) => (
             <tr key={judger.id}>
-              <td>{judger.judger_id}</td>
+              <td>
+                <div>{judger.judger_id}</div>
+                {judger.hostname && !judger.judger_id.endsWith(judger.hostname) ? <div className="muted">{judger.hostname}</div> : null}
+              </td>
               <td><span className={judger.health === "active" ? "pill ok" : "pill warn"}>{t(`judger.health.${judger.health}`)}</span></td>
               <td>{t(`judger.status.${judger.status}`)}</td>
               <td>{judger.current_submission_id ?? t("common.none")}</td>
@@ -612,7 +739,7 @@ function EmptyAdminState({ text }: { text: string }) {
   return <div className="empty-state"><span>{text}</span></div>;
 }
 
-function UsersAdmin({ api, siteTimezone }: { api: ApiClient; siteTimezone: string }) {
+function UsersAdmin({ api, siteTimezone, readOnly = false }: { api: ApiClient; siteTimezone: string; readOnly?: boolean }) {
   const { t } = useI18n();
   const [users, setUsers] = useState<User[]>([]);
   const [flash, setFlash] = useState<Flash>(emptyFlash);
@@ -669,62 +796,85 @@ function UsersAdmin({ api, siteTimezone }: { api: ApiClient; siteTimezone: strin
   return (
     <section className="panel">
       <Header title={t("tab.users")} subtitle={t("title.usersCount", { count: users.length })} />
-      <form className="form-grid" onSubmit={createUser}>
-        <label>{t("table.username")}<input value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} required /></label>
-        <label>{t("login.password")}<input value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} required /></label>
-        <label>{t("user.displayName")}<input value={form.display_name} onChange={(event) => setForm({ ...form, display_name: event.target.value })} /></label>
-        <label>{t("table.role")}<select value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value as Role })}><option value="participant">{t("role.participant")}</option><option value="admin">{t("role.admin")}</option></select></label>
-        <button type="submit">{t("common.create")}</button>
-      </form>
+      {!readOnly && (
+        <form className="user-create" onSubmit={createUser}>
+          <label>{t("table.username")}<input value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} required /></label>
+          <label>{t("login.password")}<input type="password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} required /></label>
+          <label>{t("user.displayName")}<input value={form.display_name} onChange={(event) => setForm({ ...form, display_name: event.target.value })} /></label>
+          <label>{t("table.role")}
+            <select value={form.role} onChange={(event) => setForm({ ...form, role: event.target.value as Role })}>
+              <option value="participant">{t("role.participant")}</option>
+              <option value="moderator">{t("role.moderator")}</option>
+              <option value="admin">{t("role.admin")}</option>
+            </select>
+          </label>
+          <button type="submit">{t("common.create")}</button>
+        </form>
+      )}
       <FlashMessage flash={flash} />
       <TableToolbar query={query} onQueryChange={setQuery} total={users.length} filtered={filteredUsers.length} placeholder={t("user.search")} />
-      <div className="table-wrap">
-        <table>
-          <thead><tr><th>ID</th><th>{t("table.username")}</th><th>{t("table.name")}</th><th>{t("table.role")}</th><th>{t("table.active")}</th><th>{t("table.created")}</th><th></th></tr></thead>
-          <tbody>
-            {filteredUsers.map((user) => <UserRow key={user.id} user={user} siteTimezone={siteTimezone} onSave={updateUser} onDelete={deleteUser} />)}
-            {!filteredUsers.length && <tr><td colSpan={7} className="muted">{t("empty.noMatchesText")}</td></tr>}
-          </tbody>
-        </table>
+      <div className="user-card-grid">
+        {filteredUsers.map((user) => (
+          <UserCard key={user.id} user={user} siteTimezone={siteTimezone} readOnly={readOnly} onSave={updateUser} onDelete={deleteUser} />
+        ))}
+        {!filteredUsers.length && <p className="muted">{t("empty.noMatchesText")}</p>}
       </div>
     </section>
   );
 }
 
-function UserRow({ user, siteTimezone, onSave, onDelete }: { user: User; siteTimezone: string; onSave: (user: User, patch: Partial<User> & { password?: string }) => void; onDelete: (user: User) => void }) {
+function UserCard({ user, siteTimezone, readOnly, onSave, onDelete }: { user: User; siteTimezone: string; readOnly: boolean; onSave: (user: User, patch: Partial<User> & { password?: string }) => void; onDelete: (user: User) => void }) {
   const { t } = useI18n();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState({ ...user, password: "" });
 
   useEffect(() => setDraft({ ...user, password: "" }), [user]);
 
-  if (!editing) {
-    return (
-      <tr>
-        <td>{user.id}</td><td>{user.username}</td><td>{user.display_name}</td><td>{t(`role.${user.role}`)}</td><td>{user.is_active ? t("common.yes") : t("common.no")}</td><td>{formatDate(user.created_at, siteTimezone)}</td>
-        <td className="row-actions"><button onClick={() => setEditing(true)}>{t("common.edit")}</button><button className="danger" onClick={() => onDelete(user)}>{t("common.delete")}</button></td>
-      </tr>
-    );
-  }
-
   return (
-    <tr className="editing">
-      <td>{user.id}</td>
-      <td><input value={draft.username} onChange={(event) => setDraft({ ...draft, username: event.target.value })} /></td>
-      <td><input value={draft.display_name} onChange={(event) => setDraft({ ...draft, display_name: event.target.value })} /></td>
-      <td><select value={draft.role} onChange={(event) => setDraft({ ...draft, role: event.target.value as Role })}><option value="participant">{t("role.participant")}</option><option value="admin">{t("role.admin")}</option></select></td>
-      <td><input className="check" type="checkbox" checked={draft.is_active} onChange={(event) => setDraft({ ...draft, is_active: event.target.checked })} /></td>
-      <td><input placeholder={t("user.newPassword")} value={draft.password} onChange={(event) => setDraft({ ...draft, password: event.target.value })} /></td>
-      <td className="row-actions">
-        <button onClick={() => {
-          const patch: Partial<User> & { password?: string } = { username: draft.username, display_name: draft.display_name, role: draft.role, is_active: draft.is_active };
-          if (draft.password) patch.password = draft.password;
-          onSave(user, patch);
-          setEditing(false);
-        }}>{t("common.save")}</button>
-        <button onClick={() => setEditing(false)}>{t("common.cancel")}</button>
-      </td>
-    </tr>
+    <article className="user-card">
+      <div className="user-card-head">
+        <span className="user-avatar">{user.display_name.slice(0, 1).toUpperCase()}</span>
+        <div>
+          <strong>{user.display_name}</strong>
+          <p className="muted">@{user.username} · #{user.id}</p>
+        </div>
+        <span className={`pill role-${user.role}`}>{t(`role.${user.role}`)}</span>
+      </div>
+      <div className="user-card-meta">
+        <span>{user.is_active ? t("table.active") : t("common.no")}</span>
+        <span>{formatDate(user.created_at, siteTimezone)}</span>
+      </div>
+      {!readOnly && !editing && (
+        <div className="row-actions">
+          <button type="button" onClick={() => setEditing(true)}>{t("common.edit")}</button>
+          <button type="button" className="danger" onClick={() => onDelete(user)}>{t("common.delete")}</button>
+        </div>
+      )}
+      {!readOnly && editing && (
+        <div className="user-edit">
+          <label>{t("table.username")}<input value={draft.username} onChange={(event) => setDraft({ ...draft, username: event.target.value })} /></label>
+          <label>{t("user.displayName")}<input value={draft.display_name} onChange={(event) => setDraft({ ...draft, display_name: event.target.value })} /></label>
+          <label>{t("table.role")}
+            <select value={draft.role} onChange={(event) => setDraft({ ...draft, role: event.target.value as Role })}>
+              <option value="participant">{t("role.participant")}</option>
+              <option value="moderator">{t("role.moderator")}</option>
+              <option value="admin">{t("role.admin")}</option>
+            </select>
+          </label>
+          <label className="inline"><input className="check" type="checkbox" checked={draft.is_active} onChange={(event) => setDraft({ ...draft, is_active: event.target.checked })} /> {t("table.active")}</label>
+          <label>{t("user.newPassword")}<input type="password" value={draft.password} onChange={(event) => setDraft({ ...draft, password: event.target.value })} /></label>
+          <div className="row-actions">
+            <button type="button" onClick={() => {
+              const patch: Partial<User> & { password?: string } = { username: draft.username, display_name: draft.display_name, role: draft.role, is_active: draft.is_active };
+              if (draft.password) patch.password = draft.password;
+              onSave(user, patch);
+              setEditing(false);
+            }}>{t("common.save")}</button>
+            <button type="button" onClick={() => setEditing(false)}>{t("common.cancel")}</button>
+          </div>
+        </div>
+      )}
+    </article>
   );
 }
 
@@ -1213,7 +1363,7 @@ function TeamRow({ team, users, siteTimezone, onSave, onDelete }: { team: Team; 
   );
 }
 
-function ContestsAdmin({ api, onChanged, siteTimezone }: { api: ApiClient; onChanged: () => void; siteTimezone: string }) {
+function ContestsAdmin({ api, onChanged, siteTimezone, canCreate = true }: { api: ApiClient; onChanged: () => void; siteTimezone: string; canCreate?: boolean }) {
   const { t } = useI18n();
   const [contests, setContests] = useState<Contest[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -1222,6 +1372,7 @@ function ContestsAdmin({ api, onChanged, siteTimezone }: { api: ApiClient; onCha
   const [contestTaskIds, setContestTaskIds] = useState<Record<number, number[]>>({});
   const [contestParticipantIds, setContestParticipantIds] = useState<Record<number, number[]>>({});
   const [contestTeamIds, setContestTeamIds] = useState<Record<number, number[]>>({});
+  const [contestModeratorIds, setContestModeratorIds] = useState<Record<number, number[]>>({});
   const [registrations, setRegistrations] = useState<ContestRegistration[]>([]);
   const [registrationFilter, setRegistrationFilter] = useState<"pending" | "all">("pending");
   const [flash, setFlash] = useState<Flash>(emptyFlash);
@@ -1250,7 +1401,8 @@ function ContestsAdmin({ api, onChanged, siteTimezone }: { api: ApiClient; onCha
   );
 
   const load = useCallback(async () => {
-    const [nextContests, nextTasks, nextUsers, nextTeams, nextRegistrations] = await Promise.all([api<Contest[]>("/api/contests"), api<Task[]>("/api/tasks"), api<User[]>("/api/users"), api<Team[]>("/api/teams"), api<ContestRegistration[]>(`/api/admin/contest-registrations?status=${registrationFilter}`)]);
+    const contestPath = canCreate ? "/api/contests" : "/api/contests?managed=1";
+    const [nextContests, nextTasks, nextUsers, nextTeams, nextRegistrations] = await Promise.all([api<Contest[]>(contestPath), api<Task[]>("/api/tasks"), api<User[]>("/api/users"), api<Team[]>("/api/teams"), api<ContestRegistration[]>(`/api/admin/contest-registrations?status=${registrationFilter}`)]);
     const nextContestTaskEntries = await Promise.all(
       nextContests.map(async (contest) => {
         const contestTasks = await api<Task[]>(`/api/contests/${contest.id}/tasks`);
@@ -1271,13 +1423,20 @@ function ContestsAdmin({ api, onChanged, siteTimezone }: { api: ApiClient; onCha
     );
     setContests(nextContests);
     setTasks(nextTasks);
-    setUsers(nextUsers.filter((user) => user.role === "participant"));
+    const nextContestModeratorEntries = canCreate
+      ? await Promise.all(nextContests.map(async (contest) => {
+          const moderators = await api<User[]>(`/api/contests/${contest.id}/moderators`);
+          return [contest.id, moderators.map((moderator) => moderator.id)] as const;
+        }))
+      : [];
+    setUsers(nextUsers);
     setTeams(nextTeams);
     setContestTaskIds(Object.fromEntries(nextContestTaskEntries));
     setContestParticipantIds(Object.fromEntries(nextContestParticipantEntries));
     setContestTeamIds(Object.fromEntries(nextContestTeamEntries));
+    setContestModeratorIds(Object.fromEntries(nextContestModeratorEntries));
     setRegistrations(nextRegistrations);
-  }, [api, registrationFilter]);
+  }, [api, canCreate, registrationFilter]);
   useEffect(() => { load().catch((error) => setFlash({ kind: "error", text: errorText(error) })); }, [load]);
 
   function resetContestForm() {
@@ -1299,6 +1458,7 @@ function ContestsAdmin({ api, onChanged, siteTimezone }: { api: ApiClient; onCha
       contestTaskIds[contest.id] ?? [],
       contestParticipantIds[contest.id] ?? [],
       contestTeamIds[contest.id] ?? [],
+      contestModeratorIds[contest.id] ?? [],
       siteTimezone
     ));
     setView("form");
@@ -1317,6 +1477,7 @@ function ContestsAdmin({ api, onChanged, siteTimezone }: { api: ApiClient; onCha
         task_ids: undefined,
         participant_ids: undefined,
         team_ids: undefined,
+        moderator_ids: undefined,
         starts_at: fromLocalInputValue(form.starts_at, siteTimezone),
         ends_at: fromLocalInputValue(form.ends_at, siteTimezone),
         individual_duration_minutes: individualDurationMinutes,
@@ -1338,6 +1499,9 @@ function ContestsAdmin({ api, onChanged, siteTimezone }: { api: ApiClient; onCha
       const teamIds = accessModeOf(form) === "private" ? form.team_ids : [];
       if (teamIds.length || editingContest) {
         await api<Team[]>(`/api/contests/${contest.id}/teams`, { method: "PUT", body: JSON.stringify({ team_ids: teamIds }) });
+      }
+      if (canCreate) {
+        await api<User[]>(`/api/contests/${contest.id}/moderators`, { method: "PUT", body: JSON.stringify({ user_ids: form.moderator_ids }) });
       }
       resetContestForm();
       await load();
@@ -1382,7 +1546,9 @@ function ContestsAdmin({ api, onChanged, siteTimezone }: { api: ApiClient; onCha
           form={form}
           mode={editingContest ? "edit" : "create"}
           tasks={tasks}
-          users={users}
+          users={users.filter((user) => user.role === "participant")}
+          moderators={users.filter((user) => user.role === "moderator")}
+          canAssignModerators={canCreate}
           teams={teams}
           onChange={setForm}
           onCancel={resetContestForm}
@@ -1408,7 +1574,7 @@ function ContestsAdmin({ api, onChanged, siteTimezone }: { api: ApiClient; onCha
           <h3>{t("contest.listTitle")}</h3>
           <span className="muted">{t("title.contestsCount", { count: contests.length })}</span>
         </div>
-        <button type="button" onClick={startContestCreate}>{t("common.create")}</button>
+        {canCreate && <button type="button" onClick={startContestCreate}>{t("common.create")}</button>}
       </div>
       <FlashMessage flash={flash} />
       <PendingRegistrations registrations={registrations} filter={registrationFilter} onFilterChange={setRegistrationFilter} onDecide={decideRegistration} siteTimezone={siteTimezone} />
@@ -1429,7 +1595,7 @@ function ContestsAdmin({ api, onChanged, siteTimezone }: { api: ApiClient; onCha
                 siteTimezone={siteTimezone}
                 isSelected={contest.id === editingContestId}
                 onEdit={editContest}
-                onDelete={deleteContest}
+                onDelete={canCreate ? deleteContest : undefined}
               />
             ))}
             {!filteredContests.length && <tr><td colSpan={17} className="muted">{t("empty.noMatchesText")}</td></tr>}
@@ -1642,6 +1808,8 @@ function ContestForm({
   mode,
   tasks,
   users,
+  moderators = [],
+  canAssignModerators = false,
   teams,
   onChange,
   onCancel,
@@ -1651,6 +1819,8 @@ function ContestForm({
   mode: "create" | "edit";
   tasks: Task[];
   users: User[];
+  moderators?: User[];
+  canAssignModerators?: boolean;
   teams: Team[];
   onChange: React.Dispatch<React.SetStateAction<ContestFormState>>;
   onCancel?: () => void;
@@ -1756,6 +1926,9 @@ function ContestForm({
         ) : (
           <p className="access-disabled-note">{t("contest.accessListsDisabled")}</p>
         )}
+        {canAssignModerators && (
+          <SearchPicker label={t("contest.allowedModerators")} items={userPickerItems(moderators)} selectedIds={form.moderator_ids} onChange={(moderator_ids) => onChange({ ...form, moderator_ids })} placeholder={t("contest.searchModerators")} emptyText={t("common.none")} />
+        )}
       </fieldset>
       {scoringHelpOpen && <ScoringHelpModal onClose={() => setScoringHelpOpen(false)} />}
     </form>
@@ -1807,7 +1980,7 @@ function ContestTableRow({
   siteTimezone: string;
   isSelected: boolean;
   onEdit: (contest: Contest) => void;
-  onDelete: (contest: Contest) => void;
+  onDelete?: (contest: Contest) => void;
 }) {
   const { t } = useI18n();
   const participantNames = formatUserIds(participantIds, users);
@@ -1817,7 +1990,7 @@ function ContestTableRow({
       <td>{contest.id}</td><td>{contest.title}</td><td>{t(`status.${contest.status}`)}</td><td>{contest.is_public ? t("contest.public") : contest.registration_enabled ? t("registration.enabledShort") : t("contest.private")}</td><td>{t(`common.${contest.participation_mode}`)}</td><td>{t(`scoring.${contest.scoring_mode ?? "ioi"}`)}</td><td>{t(`common.${contest.time_mode}`)}</td>
       <td>{formatDate(contest.starts_at, siteTimezone)}</td><td>{formatDate(contest.ends_at, siteTimezone)}</td><td>{durationMinutesToClock(contest.individual_duration_minutes) || "-"}</td><td>{formatDate(contest.scoreboard_freeze_at, siteTimezone)}</td><td>{t(`scoreboard.visibility.${contest.scoreboard_visibility ?? "public"}`)}</td><td>{contest.scoreboard_unfrozen ? t("common.yes") : t("common.no")}</td>
       <td>{taskIds.length}</td><td>{participantNames || t("common.none")}</td><td>{teamNames || t("common.none")}</td>
-      <td className="row-actions"><button onClick={() => onEdit(contest)}>{t("common.edit")}</button><button className="danger" onClick={() => onDelete(contest)}>{t("common.delete")}</button></td>
+      <td className="row-actions"><button onClick={() => onEdit(contest)}>{t("common.edit")}</button>{onDelete && <button className="danger" onClick={() => onDelete(contest)}>{t("common.delete")}</button>}</td>
     </tr>
   );
 }
@@ -2491,7 +2664,7 @@ function TestRow({ test, onSave, onDelete }: { test: TaskTest; onSave: (test: Ta
   );
 }
 
-function SubmissionsAdmin({ api, siteTimezone }: { api: ApiClient; siteTimezone: string }) {
+function SubmissionsAdmin({ api, siteTimezone, canRejudge = true }: { api: ApiClient; siteTimezone: string; canRejudge?: boolean }) {
   const { t } = useI18n();
   const [contests, setContests] = useState<Contest[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -2606,15 +2779,17 @@ function SubmissionsAdmin({ api, siteTimezone }: { api: ApiClient; siteTimezone:
                 <tr key={submission.id} className={submission.id === selectedSubmissionId ? "selected" : ""} onClick={() => setSelectedSubmissionId(submission.id)}>
                   <td>#{submission.id}</td>
                   <td className="row-actions">
-                    <button
-                      type="button"
-                      className="small icon-button"
-                      title={t("submission.rejudge")}
-                      aria-label={t("submission.rejudge")}
-                      onClick={(event) => { event.stopPropagation(); rejudgeSubmission(submission.id); }}
-                    >
-                      {t("submission.rejudgeShort")}
-                    </button>
+                    {canRejudge && (
+                      <button
+                        type="button"
+                        className="small icon-button"
+                        title={t("submission.rejudge")}
+                        aria-label={t("submission.rejudge")}
+                        onClick={(event) => { event.stopPropagation(); rejudgeSubmission(submission.id); }}
+                      >
+                        {t("submission.rejudgeShort")}
+                      </button>
+                    )}
                   </td>
                   <td>{contestLabel(submission.contest_id)}</td><td>{taskLabel(submission.task_id)}</td><td>{userLabel(submission.user_id)}</td><td>{submission.language}</td>
                   <td><span className={verdictClass(submission.verdict)}>{t(`verdict.${submission.verdict}`)}</span></td><td>{formatScore(submission.score)}</td><td>{formatDate(submission.created_at, siteTimezone)}</td>
@@ -2625,7 +2800,7 @@ function SubmissionsAdmin({ api, siteTimezone }: { api: ApiClient; siteTimezone:
           </table>
         </div>
         <div className="detail-stack">
-          {detail && (
+          {canRejudge && detail && (
             <button type="button" className="icon-button" title={t("submission.rejudge")} aria-label={t("submission.rejudge")} onClick={() => rejudgeSubmission(detail.id)}>
               {t("submission.rejudgeShort")}
             </button>

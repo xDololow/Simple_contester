@@ -7,6 +7,79 @@ from app.models import Language, Submission, SubmissionVerdict
 from conftest import APIClient
 
 
+def test_admin_status_events_requires_admin(client: APIClient, participant_headers: dict[str, str]) -> None:
+    missing = client.get("/api/admin/status/events")
+    assert missing.status_code == 401
+
+    token = participant_headers["Authorization"].split(" ", 1)[1]
+    denied = client.get(f"/api/admin/status/events?token={token}")
+    assert denied.status_code == 403
+    assert denied.json()["detail"] == "Admin role required"
+
+
+def test_admin_status_fingerprint_changes_with_judger(client: APIClient, admin_headers: dict[str, str]) -> None:
+    from app.main import admin_status_fingerprint, admin_status_payload
+    from app.models import Judger, User
+
+    with SessionLocal() as db:
+        admin = db.scalar(select(User).where(User.username == "admin"))
+        assert admin is not None
+        before = admin_status_fingerprint(db)
+        payload = admin_status_payload(db, admin)
+    stats = client.get("/api/admin/stats", headers=admin_headers)
+    assert stats.status_code == 200, stats.text
+    assert payload["stats"]["users"]["total"] == stats.json()["users"]["total"]
+    assert payload["judgers"] == []
+    assert payload["events"] == []
+
+    now = datetime.utcnow()
+    with SessionLocal() as db:
+        db.add(
+            Judger(
+                judger_id="live-judge",
+                hostname="live.local",
+                version="test",
+                supported_languages="[]",
+                sandbox_mode="subprocess",
+                capabilities="{}",
+                status="idle",
+                current_submission_id=None,
+                registered_at=now,
+                last_seen_at=now,
+                last_state_change_at=now,
+                enabled=True,
+            )
+        )
+        db.commit()
+        after = admin_status_fingerprint(db)
+    assert before != after
+
+
+def test_admin_stats_splits_online_and_offline_users(
+    client: APIClient,
+    admin_headers: dict[str, str],
+    create_user,
+) -> None:
+    from app.models import User
+
+    create_user(username="offline-user", password="secret")
+    stale = datetime.utcnow() - timedelta(minutes=10)
+    with SessionLocal() as db:
+        user = db.scalar(select(User).where(User.username == "offline-user"))
+        assert user is not None
+        user.last_seen_at = stale
+        db.commit()
+
+    response = client.get("/api/admin/stats", headers=admin_headers)
+
+    assert response.status_code == 200, response.text
+    presence = {row["username"]: row for row in response.json()["users"]["presence"]}
+    assert presence["admin"]["online"] is True
+    assert presence["offline-user"]["online"] is False
+    assert response.json()["users"]["online"] == 1
+    assert response.json()["users"]["offline"] == 1
+
+
 def test_participant_cannot_fetch_admin_stats(client: APIClient, participant_headers: dict[str, str]) -> None:
     response = client.get("/api/admin/stats", headers=participant_headers)
 

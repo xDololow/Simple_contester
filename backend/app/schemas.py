@@ -109,11 +109,25 @@ class ImportReport(ApiModel):
     contest_participants_added: int = 0
 
 
+class AdminUserPresence(ApiModel):
+    id: int
+    username: str
+    display_name: str
+    role: UserRole
+    is_active: bool
+    online: bool
+    last_seen_at: datetime | None = None
+
+
 class AdminUsersStats(ApiModel):
     total: int
     active: int
     admin: int
+    moderator: int = 0
     participant: int
+    online: int = 0
+    offline: int = 0
+    presence: list[AdminUserPresence] = Field(default_factory=list)
 
 
 class AdminContestsStats(ApiModel):
@@ -224,6 +238,10 @@ class ContestTeamsUpdate(ApiModel):
 
 
 class ContestParticipantsUpdate(ApiModel):
+    user_ids: list[int] = Field(default_factory=list)
+
+
+class ContestModeratorsUpdate(ApiModel):
     user_ids: list[int] = Field(default_factory=list)
 
 

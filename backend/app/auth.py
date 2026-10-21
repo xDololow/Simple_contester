@@ -14,6 +14,7 @@ from .models import User, UserRole
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+LAST_SEEN_WRITE_SECONDS = 30
 
 
 def hash_password(password: str) -> str:
@@ -30,6 +31,18 @@ def create_access_token(user: User) -> str:
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
 
+def touch_last_seen(user: User, db: Session) -> None:
+    now = datetime.utcnow()
+    last_seen = user.last_seen_at
+    if last_seen is not None:
+        if last_seen.tzinfo is not None:
+            last_seen = last_seen.astimezone(timezone.utc).replace(tzinfo=None)
+        if (now - last_seen).total_seconds() < LAST_SEEN_WRITE_SECONDS:
+            return
+    user.last_seen_at = now
+    db.commit()
+
+
 def get_user_from_token(token: str, db: Session) -> User:
     try:
         payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
@@ -43,10 +56,18 @@ def get_user_from_token(token: str, db: Session) -> User:
 
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
-    return get_user_from_token(token, db)
+    user = get_user_from_token(token, db)
+    touch_last_seen(user, db)
+    return user
 
 
 def require_admin(user: User = Depends(get_current_user)) -> User:
     if user.role != UserRole.admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required")
+    return user
+
+
+def require_staff(user: User = Depends(get_current_user)) -> User:
+    if user.role not in {UserRole.admin, UserRole.moderator}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Staff role required")
     return user

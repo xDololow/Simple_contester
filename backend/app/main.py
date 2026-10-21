@@ -18,7 +18,16 @@ from sqlalchemy import and_, delete, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from .auth import create_access_token, get_current_user, get_user_from_token, hash_password, require_admin, verify_password
+from .auth import (
+    create_access_token,
+    get_current_user,
+    get_user_from_token,
+    hash_password,
+    require_admin,
+    require_staff,
+    touch_last_seen,
+    verify_password,
+)
 from .config import settings
 from .database import SessionLocal, engine, get_db
 from .models import (
@@ -27,6 +36,7 @@ from .models import (
     ClarificationStatus,
     ClarificationVisibility,
     ContestParticipationMode,
+    ContestModerator,
     ContestRegistration,
     ContestRegistrationStatus,
     ContestStatus,
@@ -58,6 +68,7 @@ from .schemas import (
     AdminStatsOut,
     AdminSubmissionsStats,
     AdminSystemStats,
+    AdminUserPresence,
     AdminUsersStats,
     AdminParticipantContestTimeOut,
     AppConfigOut,
@@ -65,6 +76,7 @@ from .schemas import (
     ClarificationCreate,
     ClarificationOut,
     ContestCreate,
+    ContestModeratorsUpdate,
     ContestParticipantsUpdate,
     ContestRegistrationDetailOut,
     ContestRegistrationOut,
@@ -112,6 +124,7 @@ PACKAGE_MAX_FILE_BYTES = 5 * 1024 * 1024
 STALE_RUNNING_SECONDS = 10 * 60
 JUDGER_ACTIVE_SECONDS = 15
 JUDGER_OFFLINE_SECONDS = 60
+USER_ONLINE_SECONDS = 120
 LOGIN_ATTEMPTS: dict[str, list[float]] = {}
 LOGIN_LOCKED_UNTIL: dict[str, float] = {}
 
@@ -161,8 +174,29 @@ def normalize_dt(value: datetime) -> datetime:
     return value.astimezone(timezone.utc).replace(tzinfo=None)
 
 
-def is_scoreboard_frozen_for_user(contest: Contest, user: User, current: datetime | None = None) -> bool:
-    if user.role == UserRole.admin or contest.scoreboard_unfrozen or contest.scoreboard_freeze_at is None:
+def managed_contest_ids(db: Session, user: User) -> set[int] | None:
+    if user.role == UserRole.admin:
+        return None
+    if user.role != UserRole.moderator:
+        return set()
+    return set(db.scalars(select(ContestModerator.contest_id).where(ContestModerator.user_id == user.id)))
+
+
+def user_manages_contest(db: Session, user: User, contest_id: int) -> bool:
+    contest_ids = managed_contest_ids(db, user)
+    return contest_ids is None or contest_id in contest_ids
+
+
+def assert_contest_manager(db: Session, contest: Contest, user: User) -> None:
+    if user_manages_contest(db, user, contest.id):
+        return
+    raise HTTPException(status_code=403, detail="Contest is not available")
+
+
+def is_scoreboard_frozen_for_user(contest: Contest, user: User, current: datetime | None = None, db: Session | None = None) -> bool:
+    if user.role == UserRole.admin or (db is not None and user_manages_contest(db, user, contest.id)):
+        return False
+    if contest.scoreboard_unfrozen or contest.scoreboard_freeze_at is None:
         return False
     return normalize_dt(current or now_utc()) >= normalize_dt(contest.scoreboard_freeze_at)
 
@@ -848,7 +882,7 @@ def participant_has_team_contest_access(db: Session, contest: Contest, user_id: 
 
 
 def assert_contest_access(db: Session, contest: Contest, user: User) -> None:
-    if user.role == UserRole.admin:
+    if user.role == UserRole.admin or user_manages_contest(db, user, contest.id):
         return
     if contest.is_public:
         return
@@ -861,8 +895,8 @@ def assert_contest_access(db: Session, contest: Contest, user: User) -> None:
     raise HTTPException(status_code=403, detail="Contest is not available")
 
 
-def assert_contest_started(contest: Contest, user: User) -> None:
-    if user.role == UserRole.admin:
+def assert_contest_started(contest: Contest, user: User, db: Session | None = None) -> None:
+    if user.role == UserRole.admin or (db is not None and user_manages_contest(db, user, contest.id)):
         return
     if normalize_dt(now_utc()) < normalize_dt(contest.starts_at):
         raise HTTPException(status_code=403, detail="Contest has not started")
@@ -1086,7 +1120,9 @@ def assert_contest_allows_submission(db: Session, contest: Contest, user: User) 
 def get_sse_user(token: str | None, db: Session) -> User:
     if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    return get_user_from_token(token, db)
+    user = get_user_from_token(token, db)
+    touch_last_seen(user, db)
+    return user
 
 
 def login_rate_limit_key(request: Request, username: str) -> str:
@@ -1133,6 +1169,7 @@ def login(data: LoginIn, request: Request, db: Session = Depends(get_db)) -> Tok
         record_login_failure(rate_limit_key)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     record_login_success(rate_limit_key)
+    touch_last_seen(user, db)
     return TokenOut(access_token=create_access_token(user))
 
 
@@ -1164,7 +1201,7 @@ def update_preferences(
 
 
 @app.get("/api/users", response_model=list[UserOut])
-def list_users(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> list[User]:
+def list_users(_: User = Depends(require_staff), db: Session = Depends(get_db)) -> list[User]:
     return list(db.scalars(select(User).order_by(User.username)))
 
 
@@ -1381,6 +1418,29 @@ def normalize_optional_string(value: object | None) -> str | None:
     return str(value).strip() or None
 
 
+def user_is_online(last_seen_at: datetime | None, is_active: bool, current: datetime) -> bool:
+    if not is_active or last_seen_at is None:
+        return False
+    return (current - normalize_dt(last_seen_at)).total_seconds() <= USER_ONLINE_SECONDS
+
+
+def user_presence_rows(db: Session, current: datetime) -> list[AdminUserPresence]:
+    users = db.scalars(select(User).order_by(User.username)).all()
+    rows = [
+        AdminUserPresence(
+            id=user.id,
+            username=user.username,
+            display_name=user.display_name,
+            role=user.role,
+            is_active=user.is_active,
+            online=user_is_online(user.last_seen_at, user.is_active, current),
+            last_seen_at=user.last_seen_at,
+        )
+        for user in users
+    ]
+    return sorted(rows, key=lambda row: (not row.online, row.username))
+
+
 def judger_health(judger: Judger, current: datetime) -> str:
     if not judger.enabled or judger.status == "offline":
         return "offline"
@@ -1431,6 +1491,20 @@ def to_admin_judger_event_out(event: JudgerEvent) -> AdminJudgerEventOut:
         payload=decode_event_payload(event.payload),
         created_at=event.created_at,
     )
+
+
+def prune_offline_judgers(db: Session, judgers: list[Judger], current: datetime) -> list[Judger]:
+    kept: list[Judger] = []
+    removed_ids: list[int] = []
+    for judger in judgers:
+        if judger_health(judger, current) == "offline":
+            removed_ids.append(judger.id)
+        else:
+            kept.append(judger)
+    if removed_ids:
+        db.execute(delete(Judger).where(Judger.id.in_(removed_ids)))
+        db.commit()
+    return kept
 
 
 def record_judger_health_events(db: Session, judgers: list[Judger], current: datetime) -> None:
@@ -1542,18 +1616,25 @@ def admin_stats(_: User = Depends(require_admin), db: Session = Depends(get_db))
         db.execute(text("SELECT 1")).scalar()
     except Exception:
         database_ok = False
-    registered_judgers = db.scalars(select(Judger)).all()
-    record_judger_health_events(db, list(registered_judgers), current)
+    registered_judgers = list(db.scalars(select(Judger)).all())
+    record_judger_health_events(db, registered_judgers, current)
+    registered_judgers = prune_offline_judgers(db, registered_judgers, current)
     judger_health_counts = {"active": 0, "stale": 0, "offline": 0}
     for judger in registered_judgers:
         judger_health_counts[judger_health(judger, current)] += 1
 
+    presence = user_presence_rows(db, current)
+    online_count = sum(1 for row in presence if row.online)
     return AdminStatsOut(
         users=AdminUsersStats(
             total=count_rows(db, User),
             active=db.scalar(select(func.count()).select_from(User).where(User.is_active.is_(True))) or 0,
             admin=users_by_role.get(UserRole.admin, 0),
+            moderator=users_by_role.get(UserRole.moderator, 0),
             participant=users_by_role.get(UserRole.participant, 0),
+            online=online_count,
+            offline=len(presence) - online_count,
+            presence=presence,
         ),
         teams_total=count_rows(db, Team),
         contests=AdminContestsStats(
@@ -1602,8 +1683,9 @@ def admin_stats(_: User = Depends(require_admin), db: Session = Depends(get_db))
 @app.get("/api/admin/judgers", response_model=list[AdminJudgerOut])
 def list_admin_judgers(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> list[AdminJudgerOut]:
     current = now_utc()
-    judgers = db.scalars(select(Judger).order_by(Judger.judger_id)).all()
-    record_judger_health_events(db, list(judgers), current)
+    judgers = list(db.scalars(select(Judger).order_by(Judger.judger_id)).all())
+    record_judger_health_events(db, judgers, current)
+    judgers = prune_offline_judgers(db, judgers, current)
     return [to_admin_judger_out(judger, current) for judger in judgers]
 
 
@@ -1634,7 +1716,7 @@ def list_admin_judger_events_for_judger(
 
 
 @app.get("/api/teams", response_model=list[TeamOut])
-def list_teams(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> list[TeamOut]:
+def list_teams(_: User = Depends(require_staff), db: Session = Depends(get_db)) -> list[TeamOut]:
     teams = db.scalars(select(Team).options(selectinload(Team.members)).order_by(Team.name)).all()
     return [to_team_out(team) for team in teams]
 
@@ -2219,9 +2301,17 @@ def delete_team(team_id: int, _: User = Depends(require_admin), db: Session = De
 
 
 @app.get("/api/contests", response_model=list[ContestOut])
-def list_contests(db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list[ContestOut]:
+def list_contests(
+    managed: bool = False,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[ContestOut]:
     stmt = select(Contest).order_by(Contest.starts_at.desc())
-    if user.role != UserRole.admin:
+    if managed:
+        contest_ids = managed_contest_ids(db, user)
+        if contest_ids is not None:
+            stmt = stmt.where(Contest.id.in_(contest_ids or {-1}))
+    elif user.role != UserRole.admin:
         accessible_contests = select(ParticipantContest.contest_id).where(ParticipantContest.user_id == user.id)
         registered_contests = select(ContestRegistration.contest_id).where(
             ContestRegistration.user_id == user.id,
@@ -2240,12 +2330,14 @@ def list_contests(db: Session = Depends(get_db), user: User = Depends(get_curren
                 ContestRegistration.status == ContestRegistrationStatus.approved,
             )
         )
+        assigned_moderator_contests = select(ContestModerator.contest_id).where(ContestModerator.user_id == user.id)
         stmt = stmt.where(
             or_(
                 Contest.is_public.is_(True),
                 Contest.registration_enabled.is_(True),
                 Contest.id.in_(accessible_contests),
                 Contest.id.in_(registered_contests),
+                Contest.id.in_(assigned_moderator_contests),
                 and_(Contest.participation_mode == ContestParticipationMode.team, Contest.id.in_(accessible_team_contests)),
                 and_(Contest.participation_mode == ContestParticipationMode.team, Contest.id.in_(registered_team_contests)),
             )
@@ -2301,10 +2393,11 @@ def get_contest(contest_id: int, db: Session = Depends(get_db), user: User = Dep
 def update_contest(
     contest_id: int,
     data: ContestUpdate,
-    _: User = Depends(require_admin),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ContestOut:
     contest = get_contest_or_404(db, contest_id)
+    assert_contest_manager(db, contest, user)
     updates = data.model_dump(exclude_unset=True)
     for key in ("starts_at", "ends_at", "scoreboard_freeze_at"):
         if key in updates and updates[key] is not None:
@@ -2526,10 +2619,15 @@ def request_contest_registration(
 @app.get("/api/admin/contest-registrations", response_model=list[ContestRegistrationDetailOut])
 def list_admin_contest_registrations(
     status_filter: str | None = Query(default=ContestRegistrationStatus.pending.value, alias="status"),
-    _: User = Depends(require_admin),
+    user: User = Depends(require_staff),
     db: Session = Depends(get_db),
 ) -> list[ContestRegistrationDetailOut]:
     stmt = select(ContestRegistration).order_by(ContestRegistration.requested_at.desc(), ContestRegistration.id.desc())
+    managed_ids = managed_contest_ids(db, user)
+    if managed_ids is not None:
+        if not managed_ids:
+            return []
+        stmt = stmt.where(ContestRegistration.contest_id.in_(managed_ids))
     if status_filter not in {None, "", "all"}:
         try:
             parsed_status = ContestRegistrationStatus(status_filter)
@@ -2544,7 +2642,7 @@ def list_admin_contest_registrations(
 def decide_admin_contest_registration(
     registration_id: int,
     decision: ContestRegistrationStatus = Query(...),
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_staff),
     db: Session = Depends(get_db),
 ) -> ContestRegistrationDetailOut:
     if decision not in {ContestRegistrationStatus.approved, ContestRegistrationStatus.rejected}:
@@ -2552,6 +2650,8 @@ def decide_admin_contest_registration(
     registration = db.get(ContestRegistration, registration_id)
     if registration is None:
         raise HTTPException(status_code=404, detail="Contest registration not found")
+    contest = get_contest_or_404(db, registration.contest_id)
+    assert_contest_manager(db, contest, admin)
     registration.status = decision
     registration.decided_at = now_utc()
     registration.decided_by_user_id = admin.id
@@ -2563,10 +2663,11 @@ def decide_admin_contest_registration(
 @app.get("/api/contests/{contest_id}/participants", response_model=list[UserOut])
 def list_contest_participants(
     contest_id: int,
-    _: User = Depends(require_admin),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[User]:
-    get_contest_or_404(db, contest_id)
+    contest = get_contest_or_404(db, contest_id)
+    assert_contest_manager(db, contest, user)
     return list(
         db.scalars(
             select(User)
@@ -2581,20 +2682,64 @@ def list_contest_participants(
 def set_contest_participants(
     contest_id: int,
     data: ContestParticipantsUpdate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[User]:
+    contest = get_contest_or_404(db, contest_id)
+    assert_contest_manager(db, contest, user)
+    return replace_contest_participants(db, contest, data.user_ids)
+
+
+def replace_contest_moderators(db: Session, contest: Contest, user_ids: list[int]) -> list[User]:
+    unique_ids = list(dict.fromkeys(user_ids))
+    users = list(db.scalars(select(User).where(User.id.in_(unique_ids))).all()) if unique_ids else []
+    if len(users) != len(unique_ids):
+        raise HTTPException(status_code=400, detail="Unknown user id")
+    if any(user.role != UserRole.moderator for user in users):
+        raise HTTPException(status_code=400, detail="Only moderator users can be assigned")
+    db.execute(delete(ContestModerator).where(ContestModerator.contest_id == contest.id))
+    for user in users:
+        db.add(ContestModerator(contest_id=contest.id, user_id=user.id))
+    db.commit()
+    return sorted(users, key=lambda user: user.username)
+
+
+@app.get("/api/contests/{contest_id}/moderators", response_model=list[UserOut])
+def list_contest_moderators(
+    contest_id: int,
+    _: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> list[User]:
+    get_contest_or_404(db, contest_id)
+    return list(
+        db.scalars(
+            select(User)
+            .join(ContestModerator, ContestModerator.user_id == User.id)
+            .where(ContestModerator.contest_id == contest_id)
+            .order_by(User.username)
+        )
+    )
+
+
+@app.put("/api/contests/{contest_id}/moderators", response_model=list[UserOut])
+def set_contest_moderators(
+    contest_id: int,
+    data: ContestModeratorsUpdate,
     _: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ) -> list[User]:
     contest = get_contest_or_404(db, contest_id)
-    return replace_contest_participants(db, contest, data.user_ids)
+    return replace_contest_moderators(db, contest, data.user_ids)
 
 
 @app.get("/api/contests/{contest_id}/teams", response_model=list[TeamOut])
 def list_contest_teams(
     contest_id: int,
-    _: User = Depends(require_admin),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[TeamOut]:
-    get_contest_or_404(db, contest_id)
+    contest = get_contest_or_404(db, contest_id)
+    assert_contest_manager(db, contest, user)
     teams = db.scalars(
         select(Team)
         .join(ContestTeam, ContestTeam.team_id == Team.id)
@@ -2609,10 +2754,11 @@ def list_contest_teams(
 def set_contest_teams(
     contest_id: int,
     data: ContestTeamsUpdate,
-    _: User = Depends(require_admin),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[TeamOut]:
     contest = get_contest_or_404(db, contest_id)
+    assert_contest_manager(db, contest, user)
     return replace_contest_teams(db, contest, data.team_ids)
 
 
@@ -2624,7 +2770,7 @@ def list_contest_clarifications(
 ) -> list[ClarificationOut]:
     contest = get_contest_or_404(db, contest_id)
     assert_contest_access(db, contest, user)
-    assert_contest_started(contest, user)
+    assert_contest_started(contest, user, db)
     assert_individual_attempt_started(db, contest, user)
     clarifications = list_clarifications_for_contest(db, contest, user)
     return [to_clarification_out(db, clarification) for clarification in clarifications]
@@ -2639,7 +2785,7 @@ def create_contest_clarification(
 ) -> ClarificationOut:
     contest = get_contest_or_404(db, contest_id)
     assert_contest_access(db, contest, user)
-    assert_contest_started(contest, user)
+    assert_contest_started(contest, user, db)
     assert_individual_attempt_started(db, contest, user)
     if data.task_id is not None and not task_belongs_to_contest(db, contest_id, data.task_id):
         raise HTTPException(status_code=404, detail="Contest task not found")
@@ -2662,12 +2808,17 @@ def create_contest_clarification(
 
 @app.get("/api/admin/clarifications", response_model=list[ClarificationOut])
 def list_admin_clarifications(
-    _: User = Depends(require_admin),
+    user: User = Depends(require_staff),
     db: Session = Depends(get_db),
     status_filter: ClarificationStatus | None = Query(default=None, alias="status"),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> list[ClarificationOut]:
     stmt = select(Clarification).order_by(Clarification.created_at.desc(), Clarification.id.desc()).limit(limit)
+    managed_ids = managed_contest_ids(db, user)
+    if managed_ids is not None:
+        if not managed_ids:
+            return []
+        stmt = stmt.where(Clarification.contest_id.in_(managed_ids))
     if status_filter is not None:
         stmt = stmt.where(Clarification.status == status_filter)
     clarifications = db.scalars(stmt).all()
@@ -2678,12 +2829,14 @@ def list_admin_clarifications(
 def update_admin_clarification(
     clarification_id: int,
     data: ClarificationAdminUpdate,
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_staff),
     db: Session = Depends(get_db),
 ) -> ClarificationOut:
     clarification = db.get(Clarification, clarification_id)
     if clarification is None:
         raise HTTPException(status_code=404, detail="Clarification not found")
+    contest = get_contest_or_404(db, clarification.contest_id)
+    assert_contest_manager(db, contest, admin)
     updates = data.model_dump(exclude_unset=True)
     if "visibility" in updates and updates["visibility"] is not None:
         clarification.visibility = updates["visibility"]
@@ -2712,7 +2865,7 @@ def update_admin_clarification(
 def list_tasks(contest_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list[TaskOut]:
     contest = get_contest_or_404(db, contest_id)
     assert_contest_access(db, contest, user)
-    assert_contest_started(contest, user)
+    assert_contest_started(contest, user, db)
     assert_individual_attempt_started(db, contest, user)
     return list_contest_tasks(db, contest_id)
 
@@ -2721,15 +2874,16 @@ def list_tasks(contest_id: int, db: Session = Depends(get_db), user: User = Depe
 def set_contest_tasks(
     contest_id: int,
     data: ContestTasksUpdate,
-    _: User = Depends(require_admin),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[TaskOut]:
     contest = get_contest_or_404(db, contest_id)
+    assert_contest_manager(db, contest, user)
     return replace_contest_tasks(db, contest, data.task_ids)
 
 
 @app.get("/api/tasks", response_model=list[TaskOut])
-def list_all_tasks(_: User = Depends(require_admin), db: Session = Depends(get_db)) -> list[TaskOut]:
+def list_all_tasks(_: User = Depends(require_staff), db: Session = Depends(get_db)) -> list[TaskOut]:
     tasks = db.scalars(
         select(Task).options(selectinload(Task.tests), selectinload(Task.contests), selectinload(Task.versions)).order_by(Task.id)
     ).all()
@@ -2799,7 +2953,7 @@ def get_task(task_id: int, db: Session = Depends(get_db), user: User = Depends(g
         for contest in contests:
             try:
                 assert_contest_access(db, contest, user)
-                assert_contest_started(contest, user)
+                assert_contest_started(contest, user, db)
                 assert_individual_attempt_started(db, contest, user)
                 has_access = True
                 break
@@ -2989,10 +3143,17 @@ def list_submissions(
     if contest_id is not None:
         contest = get_contest_or_404(db, contest_id)
         assert_contest_access(db, contest, user)
-        assert_contest_started(contest, user)
+        assert_contest_started(contest, user, db)
         assert_individual_attempt_started(db, contest, user)
         filters.append(Submission.contest_id == contest_id)
-    if user.role != UserRole.admin:
+    sees_all_submissions = user.role == UserRole.admin or (
+        contest_id is not None and user_manages_contest(db, user, contest_id)
+    )
+    if user.role == UserRole.moderator and contest_id is None:
+        managed_ids = managed_contest_ids(db, user) or set()
+        filters.append(Submission.contest_id.in_(managed_ids or {-1}))
+        sees_all_submissions = True
+    if not sees_all_submissions:
         team_ids: list[int] = []
         if contest_id is not None:
             contest = get_contest_or_404(db, contest_id)
@@ -3044,9 +3205,9 @@ def get_submission(submission_id: int, db: Session = Depends(get_db), user: User
         raise HTTPException(status_code=404, detail="Submission not found")
     contest = get_contest_or_404(db, submission.contest_id)
     assert_contest_access(db, contest, user)
-    assert_contest_started(contest, user)
+    assert_contest_started(contest, user, db)
     assert_individual_attempt_started(db, contest, user)
-    if user.role != UserRole.admin:
+    if user.role != UserRole.admin and not user_manages_contest(db, user, contest.id):
         team_ids = get_accessible_team_ids_for_user(db, contest.id, user.id) if contest.participation_mode == ContestParticipationMode.team else []
         if submission.user_id != user.id and (submission.team_id is None or submission.team_id not in team_ids):
             raise HTTPException(status_code=403, detail="Submission is not available")
@@ -3056,7 +3217,7 @@ def get_submission(submission_id: int, db: Session = Depends(get_db), user: User
 @app.get("/api/admin/submissions/{submission_id}", response_model=SubmissionAdminDetailOut)
 def get_admin_submission_detail(
     submission_id: int,
-    _: User = Depends(require_admin),
+    user: User = Depends(require_staff),
     db: Session = Depends(get_db),
 ) -> Submission:
     submission = db.scalar(
@@ -3064,6 +3225,8 @@ def get_admin_submission_detail(
     )
     if submission is None:
         raise HTTPException(status_code=404, detail="Submission not found")
+    contest = get_contest_or_404(db, submission.contest_id)
+    assert_contest_manager(db, contest, user)
     return submission
 
 
@@ -3120,7 +3283,7 @@ def sse_event(event: str, data: object) -> str:
 def contest_events_payload(db: Session, contest_id: int, user: User) -> dict[str, object]:
     contest = get_contest_or_404(db, contest_id)
     assert_contest_access(db, contest, user)
-    assert_contest_started(contest, user)
+    assert_contest_started(contest, user, db)
     assert_individual_attempt_started(db, contest, user)
     submissions = [
         SubmissionOut.model_validate(submission).model_dump(mode="json")
@@ -3130,7 +3293,7 @@ def contest_events_payload(db: Session, contest_id: int, user: User) -> dict[str
     return {
         "submissions": submissions,
         "scoreboard": rows,
-        "scoreboard_frozen": is_scoreboard_frozen_for_user(contest, user),
+        "scoreboard_frozen": is_scoreboard_frozen_for_user(contest, user, db=db),
         "scoreboard_visibility": contest_scoreboard_visibility(contest).value,
     }
 
@@ -3181,7 +3344,7 @@ def contest_events_fingerprint(db: Session, contest_id: int) -> str:
 def scoreboard(contest_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)) -> list[ScoreboardRow]:
     contest = get_contest_or_404(db, contest_id)
     assert_contest_access(db, contest, user)
-    assert_contest_started(contest, user)
+    assert_contest_started(contest, user, db)
     assert_individual_attempt_started(db, contest, user)
     tasks = db.scalars(
         select(Task)
@@ -3208,7 +3371,7 @@ def scoreboard(contest_id: int, db: Session = Depends(get_db), user: User = Depe
         teams = sorted(teams_by_id.values(), key=lambda team: team.name)
         team_ids = [team.id for team in teams]
         submission_stmt = select(Submission).where(Submission.contest_id == contest_id).order_by(Submission.created_at)
-        if is_scoreboard_frozen_for_user(contest, user):
+        if is_scoreboard_frozen_for_user(contest, user, db=db):
             submission_stmt = submission_stmt.where(Submission.created_at < contest.scoreboard_freeze_at)
         submissions = db.scalars(submission_stmt.where(Submission.team_id.in_(team_ids))).all() if team_ids else []
 
@@ -3258,7 +3421,7 @@ def scoreboard(contest_id: int, db: Session = Depends(get_db), user: User = Depe
     users = db.scalars(user_stmt).all()
     user_ids = [participant.id for participant in users]
     submission_stmt = select(Submission).where(Submission.contest_id == contest_id).order_by(Submission.created_at)
-    if is_scoreboard_frozen_for_user(contest, user):
+    if is_scoreboard_frozen_for_user(contest, user, db=db):
         submission_stmt = submission_stmt.where(Submission.created_at < contest.scoreboard_freeze_at)
     if user_ids:
         submission_stmt = submission_stmt.where(Submission.user_id.in_(user_ids))
@@ -3298,13 +3461,137 @@ def contest_live_snapshot(contest_id: int, db: Session = Depends(get_db), user: 
     return contest_events_payload(db, contest_id, user)
 
 
+def admin_status_fingerprint(db: Session) -> str:
+    current = now_utc()
+    verdict_rows = db.execute(
+        select(Submission.verdict, func.count(), func.coalesce(func.sum(Submission.score), 0), func.max(Submission.id), func.max(Submission.finished_at))
+        .group_by(Submission.verdict)
+        .order_by(Submission.verdict)
+    ).all()
+    running_rows = db.execute(
+        select(Submission.id, Submission.judger_id, Submission.started_at)
+        .where(Submission.verdict == SubmissionVerdict.running)
+        .order_by(Submission.id)
+    ).all()
+    queued_oldest = db.scalar(select(func.min(Submission.created_at)).where(Submission.verdict == SubmissionVerdict.queued))
+    judger_rows = db.execute(
+        select(
+            Judger.judger_id,
+            Judger.status,
+            Judger.current_submission_id,
+            Judger.last_seen_at,
+            Judger.last_error,
+            Judger.enabled,
+        ).order_by(Judger.judger_id)
+    ).all()
+    latest_event_id = db.scalar(select(func.max(JudgerEvent.id))) or 0
+    contests = db.scalars(select(Contest).order_by(Contest.id)).all()
+    return json.dumps(
+        {
+            "counts": [count_rows(db, User), count_rows(db, Team), count_rows(db, Task), count_rows(db, TaskTest)],
+            "users": [
+                [
+                    row.id,
+                    row.is_active,
+                    user_is_online(row.last_seen_at, row.is_active, current),
+                    row.last_seen_at.isoformat() if row.last_seen_at else None,
+                ]
+                for row in db.execute(select(User.id, User.is_active, User.last_seen_at).order_by(User.id)).all()
+            ],
+            "verdicts": [
+                [
+                    row[0].value if hasattr(row[0], "value") else row[0],
+                    row[1],
+                    float(row[2] or 0),
+                    row[3],
+                    row[4].isoformat() if row[4] else None,
+                ]
+                for row in verdict_rows
+            ],
+            "running": [[row.id, row.judger_id, row.started_at.isoformat() if row.started_at else None] for row in running_rows],
+            "queue_tick": int(current.timestamp()) if queued_oldest is not None else None,
+            "queued_oldest": queued_oldest.isoformat() if queued_oldest else None,
+            "judgers": [
+                [
+                    row.judger_id,
+                    row.status,
+                    row.current_submission_id,
+                    row.last_seen_at.isoformat() if row.last_seen_at else None,
+                    row.last_error,
+                    judger_health_from_row(row.enabled, row.status, row.last_seen_at, current),
+                ]
+                for row in judger_rows
+            ],
+            "latest_event_id": latest_event_id,
+            "contests": [
+                [
+                    contest.id,
+                    effective_contest_status(contest.status, contest.starts_at, contest.ends_at, current).value,
+                    contest.is_public,
+                    contest.participation_mode.value,
+                ]
+                for contest in contests
+            ],
+        },
+        separators=(",", ":"),
+    )
+
+
+def judger_health_from_row(enabled: bool, status_value: str, last_seen_at: datetime, current: datetime) -> str:
+    if not enabled or status_value == "offline":
+        return "offline"
+    age_seconds = (current - normalize_dt(last_seen_at)).total_seconds()
+    if age_seconds <= JUDGER_ACTIVE_SECONDS:
+        return "active"
+    if age_seconds <= JUDGER_OFFLINE_SECONDS:
+        return "stale"
+    return "offline"
+
+
+def admin_status_payload(db: Session, user: User) -> dict[str, object]:
+    return {
+        "stats": admin_stats(user, db).model_dump(mode="json"),
+        "judgers": [judger.model_dump(mode="json") for judger in list_admin_judgers(user, db)],
+        "events": [event.model_dump(mode="json") for event in list_admin_judger_events(user, db, limit=20)],
+    }
+
+
+@app.get("/api/admin/status/events")
+async def admin_status_events(request: Request, token: str | None = None) -> StreamingResponse:
+    with SessionLocal() as db:
+        user = get_sse_user(token, db)
+        if user.role != UserRole.admin:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required")
+
+    async def stream():
+        last_fingerprint: str | None = None
+        while not await request.is_disconnected():
+            with SessionLocal() as db:
+                user = get_sse_user(token, db)
+                if user.role != UserRole.admin:
+                    break
+                fingerprint = admin_status_fingerprint(db)
+                if fingerprint != last_fingerprint:
+                    yield sse_event("status", admin_status_payload(db, user))
+                    last_fingerprint = fingerprint
+                else:
+                    yield ": heartbeat\n\n"
+            await asyncio.sleep(1)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/api/contests/{contest_id}/events")
 async def contest_events(contest_id: int, request: Request, token: str | None = None) -> StreamingResponse:
     with SessionLocal() as db:
         user = get_sse_user(token, db)
         contest = get_contest_or_404(db, contest_id)
         assert_contest_access(db, contest, user)
-        assert_contest_started(contest, user)
+        assert_contest_started(contest, user, db)
         assert_individual_attempt_started(db, contest, user)
 
     async def stream():
@@ -3314,7 +3601,7 @@ async def contest_events(contest_id: int, request: Request, token: str | None = 
                 user = get_sse_user(token, db)
                 contest = get_contest_or_404(db, contest_id)
                 assert_contest_access(db, contest, user)
-                assert_contest_started(contest, user)
+                assert_contest_started(contest, user, db)
                 assert_individual_attempt_started(db, contest, user)
                 fingerprint = contest_events_fingerprint(db, contest_id)
                 if fingerprint != last_fingerprint:

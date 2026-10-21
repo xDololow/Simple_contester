@@ -16,6 +16,7 @@ def test_alembic_upgrade_creates_current_schema(tmp_path, monkeypatch) -> None:
     try:
         inspector = inspect(engine)
         tables = set(inspector.get_table_names())
+        user_columns = {column["name"]: column for column in inspector.get_columns("users")}
         contest_columns = {column["name"]: column for column in inspector.get_columns("contests")}
         registration_columns = {column["name"]: column for column in inspector.get_columns("contest_registrations")}
         task_test_columns = {column["name"]: column for column in inspector.get_columns("task_tests")}
@@ -42,7 +43,10 @@ def test_alembic_upgrade_creates_current_schema(tmp_path, monkeypatch) -> None:
         "judgers",
         "judger_events",
         "clarifications",
+        "contest_moderators",
     }.issubset(tables)
+    assert "last_seen_at" in user_columns
+    assert user_columns["last_seen_at"]["nullable"] is True
     assert "is_public" in contest_columns
     assert "registration_enabled" in contest_columns
     assert "registration_requires_approval" in contest_columns

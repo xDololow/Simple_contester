@@ -1,4 +1,5 @@
 import os
+import sys
 import asyncio
 from contextlib import asynccontextmanager
 from collections.abc import Callable, Generator
@@ -69,8 +70,18 @@ class APIClient:
         return self.request("PATCH", url, **kwargs)
 
 
+def dispose_worker_engine() -> None:
+    worker_module = sys.modules.get("worker")
+    if worker_module is None:
+        return
+    worker_engine = getattr(worker_module, "engine", None)
+    if worker_engine is not None:
+        worker_engine.dispose()
+
+
 @pytest.fixture(autouse=True)
 def clean_database() -> Generator[None, None, None]:
+    dispose_worker_engine()
     engine.dispose()
     if TEST_DB_PATH.exists():
         TEST_DB_PATH.unlink()
@@ -81,6 +92,7 @@ def clean_database() -> Generator[None, None, None]:
     LOGIN_ATTEMPTS.clear()
     LOGIN_LOCKED_UNTIL.clear()
     yield
+    dispose_worker_engine()
     Base.metadata.drop_all(bind=engine)
     engine.dispose()
     if TEST_DB_PATH.exists():

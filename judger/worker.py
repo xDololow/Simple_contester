@@ -1,6 +1,7 @@
 import atexit
 import json
 import os
+import re
 import signal
 import socket
 import tempfile
@@ -29,8 +30,60 @@ from runners import (
 )
 
 
+JUDGER_ID_MAX_LENGTH = 120
+
+
+def sanitize_instance(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-._")[:64]
+
+
+def running_in_container() -> bool:
+    if Path("/.dockerenv").exists() or Path("/run/.containerenv").exists():
+        return True
+    return "127.0.0.11" in read_resolv_conf()
+
+
+def unique_ids_enabled() -> bool:
+    flag = os.getenv("JUDGER_ID_UNIQUE", "").strip().lower()
+    if flag in {"0", "false", "no", "off"}:
+        return False
+    if flag in {"1", "true", "yes", "on"}:
+        return True
+    return running_in_container()
+
+
+def read_resolv_conf() -> str:
+    try:
+        return Path("/etc/resolv.conf").read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def join_judger_id(base: str, suffix: str) -> str:
+    cleaned = sanitize_instance(suffix)
+    marker = f"-{cleaned}"
+    if not cleaned or base == cleaned or (base.endswith(marker) and "-" in base[: -len(marker)]):
+        return base[:JUDGER_ID_MAX_LENGTH]
+    room = JUDGER_ID_MAX_LENGTH - len(cleaned) - 1
+    if room < 1:
+        return cleaned[:JUDGER_ID_MAX_LENGTH]
+    return f"{base[:room]}-{cleaned}"
+
+
+def resolve_judger_id(base: str | None = None, instance: str | None = None) -> str:
+    raw_base = (base if base is not None else os.getenv("JUDGER_ID", "local-judger")).strip() or "local-judger"
+    if not unique_ids_enabled():
+        return raw_base[:JUDGER_ID_MAX_LENGTH]
+    if instance is None:
+        instance = os.getenv("JUDGER_INSTANCE", "")
+    suffix = sanitize_instance(instance) or sanitize_instance(socket.gethostname())
+    if not suffix:
+        return raw_base[:JUDGER_ID_MAX_LENGTH]
+    return join_judger_id(raw_base, suffix)
+
+
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./simple_contester.db")
-JUDGER_ID = os.getenv("JUDGER_ID", "local-judger")
+JUDGER_ID = resolve_judger_id()
 JUDGER_VERSION = os.getenv("JUDGER_VERSION", os.getenv("APP_VERSION", "unknown"))
 JUDGER_SANDBOX_MODE = os.getenv("JUDGER_SANDBOX_MODE", "subprocess")
 JUDGER_WORK_ROOT = os.getenv("JUDGER_WORK_ROOT")

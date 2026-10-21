@@ -384,7 +384,9 @@ Compose reads `.env` automatically. Start from `.env.example`; the defaults keep
 | `LOGIN_RATE_LIMIT_ATTEMPTS` | `8` | Failed login attempts allowed within the rate-limit window before lockout. |
 | `LOGIN_RATE_LIMIT_WINDOW_SECONDS` | `60` | Sliding window for failed login attempts. |
 | `LOGIN_RATE_LIMIT_LOCKOUT_SECONDS` | `300` | Temporary lockout duration after too many failed login attempts. |
-| `JUDGER_ID` | `docker-judger` | Worker ID written to claimed submissions. |
+| `JUDGER_ID` | `docker-judger` | Base worker ID. Replicas append a unique suffix, so scaled workers register separately. |
+| `JUDGER_ID_UNIQUE` | `1` | Set to `0` to keep `JUDGER_ID` exact. Do not scale workers in that mode. |
+| `JUDGER_INSTANCE` | empty | Optional suffix. Empty uses the container hostname, which is unique for each scaled replica. |
 | `JUDGER_VERSION` | `local` | Version string reported in judger events/status. |
 | `JUDGER_SANDBOX_MODE` | `subprocess` | Judger execution backend: `subprocess` keeps the compatible in-container runner, `docker` runs compile/run commands in per-invocation Docker containers. |
 | `JUDGER_WORK_ROOT` | `/tmp/simple-contester-judger-work` in `.env.example` | Parent directory for judger workspaces. Required for Docker sandbox so the host Docker daemon can bind-mount the same path. |
@@ -623,6 +625,8 @@ details.
 ## Scale Judgers
 
 Judger workers use row locking with `SKIP LOCKED`, so several workers can poll the same queue. A worker claim also writes a unique `claim_token`, `claimed_at`, `claim_expires_at`, `attempt_number`, and `judger_id` to the submission row.
+
+Each replica registers as `{JUDGER_ID}-{instance}`. The instance is `JUDGER_INSTANCE` when set, otherwise the container hostname, which Docker sets to a unique container id. The admin Status page lists every registered id as its own row. Set `JUDGER_ID_UNIQUE=0` only when a single worker must keep the exact `JUDGER_ID`.
 
 ```bash
 docker compose up --build --scale judger=3

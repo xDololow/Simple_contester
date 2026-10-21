@@ -13,6 +13,7 @@ def utc_now() -> datetime:
 
 class UserRole(str, Enum):
     admin = "admin"
+    moderator = "moderator"
     participant = "participant"
 
 
@@ -113,6 +114,7 @@ class User(Base):
     role: Mapped[UserRole] = mapped_column(SAEnum(UserRole), default=UserRole.participant)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     timezone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     teams: Mapped[list["TeamMember"]] = relationship(back_populates="user", cascade="all, delete-orphan")
@@ -168,6 +170,20 @@ class Contest(Base):
     tasks: Mapped[list["ContestTask"]] = relationship(back_populates="contest", cascade="all, delete-orphan")
     teams: Mapped[list["ContestTeam"]] = relationship(back_populates="contest", cascade="all, delete-orphan")
     registrations: Mapped[list["ContestRegistration"]] = relationship(back_populates="contest", cascade="all, delete-orphan")
+    moderators: Mapped[list["ContestModerator"]] = relationship(back_populates="contest", cascade="all, delete-orphan")
+
+
+class ContestModerator(Base):
+    __tablename__ = "contest_moderators"
+    __table_args__ = (UniqueConstraint("contest_id", "user_id", name="uq_contest_moderator"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    contest_id: Mapped[int] = mapped_column(ForeignKey("contests.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    contest: Mapped[Contest] = relationship(back_populates="moderators")
+    user: Mapped[User] = relationship()
 
 
 class ContestTeam(Base):
