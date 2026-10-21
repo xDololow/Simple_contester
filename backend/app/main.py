@@ -810,7 +810,7 @@ def replace_contest_teams(db: Session, contest: Contest, team_ids: list[int]) ->
     for team_id in unique_team_ids:
         db.add(ContestTeam(contest_id=contest.id, team_id=team_id))
     db.commit()
-    return list_contest_teams(contest.id, db=db)
+    return query_contest_teams(db, contest.id)
 
 
 def participant_has_contest_access(db: Session, contest_id: int, user_id: int) -> bool:
@@ -965,7 +965,7 @@ def replace_contest_participants(db: Session, contest: Contest, user_ids: list[i
         if user_id not in existing:
             db.add(ParticipantContest(contest_id=contest.id, user_id=user_id))
     db.commit()
-    return list_contest_participants(contest.id, db=db)
+    return query_contest_participants(db, contest.id)
 
 
 def to_registration_detail_out(db: Session, registration: ContestRegistration, user: User | None = None) -> ContestRegistrationDetailOut:
@@ -2660,14 +2660,7 @@ def decide_admin_contest_registration(
     return to_registration_detail_out(db, registration)
 
 
-@app.get("/api/contests/{contest_id}/participants", response_model=list[UserOut])
-def list_contest_participants(
-    contest_id: int,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> list[User]:
-    contest = get_contest_or_404(db, contest_id)
-    assert_contest_manager(db, contest, user)
+def query_contest_participants(db: Session, contest_id: int) -> list[User]:
     return list(
         db.scalars(
             select(User)
@@ -2676,6 +2669,17 @@ def list_contest_participants(
             .order_by(User.username)
         )
     )
+
+
+@app.get("/api/contests/{contest_id}/participants", response_model=list[UserOut])
+def list_contest_participants(
+    contest_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[User]:
+    contest = get_contest_or_404(db, contest_id)
+    assert_contest_manager(db, contest, user)
+    return query_contest_participants(db, contest_id)
 
 
 @app.put("/api/contests/{contest_id}/participants", response_model=list[UserOut])
@@ -2732,14 +2736,7 @@ def set_contest_moderators(
     return replace_contest_moderators(db, contest, data.user_ids)
 
 
-@app.get("/api/contests/{contest_id}/teams", response_model=list[TeamOut])
-def list_contest_teams(
-    contest_id: int,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> list[TeamOut]:
-    contest = get_contest_or_404(db, contest_id)
-    assert_contest_manager(db, contest, user)
+def query_contest_teams(db: Session, contest_id: int) -> list[TeamOut]:
     teams = db.scalars(
         select(Team)
         .join(ContestTeam, ContestTeam.team_id == Team.id)
@@ -2748,6 +2745,17 @@ def list_contest_teams(
         .order_by(Team.name)
     ).all()
     return [to_team_out(team) for team in teams]
+
+
+@app.get("/api/contests/{contest_id}/teams", response_model=list[TeamOut])
+def list_contest_teams(
+    contest_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[TeamOut]:
+    contest = get_contest_or_404(db, contest_id)
+    assert_contest_manager(db, contest, user)
+    return query_contest_teams(db, contest_id)
 
 
 @app.put("/api/contests/{contest_id}/teams", response_model=list[TeamOut])
